@@ -115,5 +115,221 @@ if (explicit === null) {
   }
 }
 
+// ── 流访问控制 ──────────────────────────────────────────────────────────
+//
+// 这一段全是纯函数与内存对象，不需要设备也不需要 webServer，
+// 因此永远会跑。围栏是这套插件唯一的安全边界，必须有回归保护。
+
+console.log("\n流访问控制");
+
+const {
+  StreamAccessController,
+  prepareStreamAccessKey,
+  checkTransportFence,
+  isLoopbackRemoteAddress,
+  isSameOriginRequest,
+  parseTrustedAuthority,
+} = await import("./lib/stream-access.js");
+
+await test("loopback 判定覆盖 IPv4 / IPv6 / mapped / 非本机", () => {
+  for (const addr of ["127.0.0.1", "::1", "::ffff:127.0.0.1", "127.0.0.53"]) {
+    assert.ok(isLoopbackRemoteAddress(addr), `${addr} 应判为 loopback`);
+  }
+  for (const addr of ["192.168.1.5", "10.0.0.1", "", undefined]) {
+    assert.ok(!isLoopbackRemoteAddress(addr), `${addr} 不应判为 loopback`);
+  }
+});
+
+await test("trustedAuthority 解析：host / host:port / scheme://host:port", () => {
+  assert.deepEqual(parseTrustedAuthority("example.com"), { host: "example.com", port: null, scheme: null });
+  assert.deepEqual(parseTrustedAuthority("example.com:8443"), { host: "example.com", port: 8443, scheme: null });
+  assert.deepEqual(parseTrustedAuthority("https://example.com:8443"), { host: "example.com", port: 8443, scheme: "https" });
+});
+
+await test("trustedAuthority 拒绝带路径 / 查询 / 凭证的写法", () => {
+  assert.equal(parseTrustedAuthority("example.com/path"), null);
+  assert.equal(parseTrustedAuthority("https://user:pass@example.com"), null);
+  assert.equal(parseTrustedAuthority("example.com?a=1"), null);
+});
+
+const accessKey = prepareStreamAccessKey();
+
+await test("签名密钥为 32 字节，且落盘后稳定", () => {
+  assert.ok(Buffer.isBuffer(accessKey), "应为 Buffer");
+  assert.equal(accessKey.length, 32);
+  // 再读一次必须拿到同一把：否则页面刷新会让已发出的 token 全失效
+  assert.deepEqual(prepareStreamAccessKey(), accessKey);
+});
+
+const access = new StreamAccessController({ key: accessKey });
+
+await test("token 往返并把设备绑定进签名", () => {
+  const verified = access.verify(access.mint("dev-A"));
+  assert.ok(verified.ok);
+  assert.equal(verified.deviceId, "dev-A");
+});
+
+await test("篡改载荷中的设备名 → 签名不符", () => {
+  const token = access.mint("dev-A");
+  const [payloadB64, mac] = token.split(".");
+  const payload = Buffer.from(payloadB64, "base64url").toString("utf8");
+  const forged = Buffer.from(payload.replace("dev-A", "dev-B"), "utf8").toString("base64url");
+  assert.ok(!access.verify(`${forged}.${mac}`).ok, "篡改后必须失败");
+});
+
+await test("过期 token 被拒", () => {
+  const shortLived = new StreamAccessController({ key: accessKey, ttlMs: -1 });
+  assert.ok(!shortLived.verify(shortLived.mint("d")).ok);
+});
+
+await test("缺失 / 畸形 token 被拒", () => {
+  for (const bad of [undefined, "", "nodot", "a.b", "...."]) {
+    assert.ok(!access.verify(bad).ok, `${String(bad)} 应被拒`);
+  }
+});
+
+await test("别的 DSH_HOME 签出的 token 无效", () => {
+  const other = new StreamAccessController({ key: Buffer.alloc(32, 7) });
+  assert.ok(!other.verify(access.mint("d")).ok);
+});
+
+/** 造一个最小的请求对象给围栏用。 */
+const fakeRequest = (remote, host, origin) => ({
+  socket: { remoteAddress: remote },
+  headers: { host, ...(origin === undefined ? {} : { origin }) },
+});
+
+await test("围栏：非 loopback 对端一律拒（TCP 层事实，伪造不了）", () => {
+  const result = checkTransportFence(fakeRequest("10.0.0.9", "127.0.0.1:3080"));
+  assert.ok(!result.ok);
+  assert.match(result.reason, /non-loopback/);
+});
+
+await test("围栏：loopback 对端 + loopback Host 放行", () => {
+  assert.ok(checkTransportFence(fakeRequest("127.0.0.1", "127.0.0.1:3080")).ok);
+  assert.ok(checkTransportFence(fakeRequest("::1", "localhost:3080")).ok);
+  assert.ok(checkTransportFence(fakeRequest("127.0.0.1", "[::1]:3080")).ok);
+});
+
+await test("围栏：DNS rebinding（loopback 对端 + 外域 Host）被拒", () => {
+  assert.ok(!checkTransportFence(fakeRequest("127.0.0.1", "evil.com")).ok);
+});
+
+await test("围栏：trustedAuthorities 放行已配置的 authority", () => {
+  const trusted = [parseTrustedAuthority("dsh.example.com")];
+  assert.ok(checkTransportFence(fakeRequest("127.0.0.1", "dsh.example.com"), trusted).ok);
+  assert.ok(checkTransportFence(fakeRequest("127.0.0.1", "dsh.example.com:8443"), trusted).ok, "未钉端口时应任意端口");
+});
+
+await test("围栏：配置钉了端口则其它端口被拒", () => {
+  const trusted = [parseTrustedAuthority("dsh.example.com:8443")];
+  assert.ok(!checkTransportFence(fakeRequest("127.0.0.1", "dsh.example.com:9999"), trusted).ok);
+});
+
+await test("围栏：配置钉了 scheme 则 Origin 必须匹配", () => {
+  const trusted = [parseTrustedAuthority("https://dsh.example.com:8443")];
+  assert.ok(checkTransportFence(fakeRequest("127.0.0.1", "dsh.example.com:8443", "https://dsh.example.com:8443"), trusted).ok);
+  assert.ok(!checkTransportFence(fakeRequest("127.0.0.1", "dsh.example.com:8443", "http://dsh.example.com:8443"), trusted).ok);
+});
+
+await test("围栏：缺 Host 头被拒", () => {
+  assert.ok(!checkTransportFence({ socket: { remoteAddress: "127.0.0.1" }, headers: {} }).ok);
+});
+
+await test("同源校验：跨站 POST 被拒，无 Origin 交给围栏兜底", () => {
+  assert.ok(isSameOriginRequest({ headers: { host: "a.com", origin: "http://a.com" } }));
+  assert.ok(!isSameOriginRequest({ headers: { host: "a.com", origin: "http://b.com" } }));
+  assert.ok(isSameOriginRequest({ headers: { host: "a.com" } }));
+});
+
+// ── 流格式嗅探 ──────────────────────────────────────────────────────────
+//
+// 格式不能靠"我们请求了什么"来判断：iOS 模拟器上 `--format avc` 会静默
+// 降级成 MJPEG（实测），所以必须从首块字节认。
+
+console.log("\n流格式嗅探");
+
+const { sniffStreamFormat } = await import("./lib/stream-session.js");
+
+await test("识别 H.264 Annex B（4 字节起始码）", () => {
+  const head = Buffer.from([0, 0, 0, 1, 0x67, 0x42, 0x00, 0x1e]);
+  assert.equal(sniffStreamFormat(head).kind, "h264");
+  assert.equal(sniffStreamFormat(head).contentType, "video/h264");
+});
+
+await test("识别 H.264 Annex B（3 字节起始码）", () => {
+  assert.equal(sniffStreamFormat(Buffer.from([0, 0, 1, 0x67])).kind, "h264");
+});
+
+await test("识别 MJPEG 并提取 boundary", () => {
+  const head = Buffer.from("--myboundary\r\nContent-Type: image/jpeg\r\n\r\n\xff\xd8\xff", "latin1");
+  const format = sniffStreamFormat(head);
+  assert.equal(format.kind, "mjpeg");
+  assert.equal(format.contentType, "multipart/x-mixed-replace; boundary=myboundary");
+});
+
+await test("空 / 未知数据不误判", () => {
+  assert.equal(sniffStreamFormat(Buffer.alloc(0)).kind, "unknown");
+  assert.equal(sniffStreamFormat(Buffer.from([0x7b, 0x22])).kind, "unknown");
+  assert.equal(sniffStreamFormat(null).kind, "unknown");
+});
+
+// ── 交互输入校验 ────────────────────────────────────────────────────────
+
+console.log("\n交互输入校验");
+
+const { validateInput } = await import("./lib/stream-routes.js");
+
+await test("tap 要求数值型坐标", () => {
+  assert.ok(validateInput("tap", { x: 10, y: 20 }).ok);
+  assert.ok(!validateInput("tap", { x: "10", y: 20 }).ok, "字符串坐标应被拒");
+  assert.ok(!validateInput("tap", { x: Number.NaN, y: 20 }).ok, "NaN 应被拒");
+  assert.ok(!validateInput("tap", {}).ok);
+});
+
+await test("坐标取整（设备只认整数）", () => {
+  assert.equal(validateInput("tap", { x: 10.6, y: 20.2 }).input.x, 11);
+});
+
+await test("swipe 要求四个坐标", () => {
+  assert.ok(validateInput("swipe", { x1: 0, y1: 0, x2: 1, y2: 1 }).ok);
+  assert.ok(!validateInput("swipe", { x1: 0, y1: 0, x2: 1 }).ok);
+});
+
+await test("text 要求非空字符串", () => {
+  assert.ok(validateInput("text", { text: "hi" }).ok);
+  assert.ok(!validateInput("text", { text: "" }).ok);
+  assert.ok(!validateInput("text", { text: 42 }).ok);
+});
+
+await test("button 限定白名单", () => {
+  assert.ok(validateInput("button", { name: "home" }).ok, "应接受小写并归一化");
+  assert.equal(validateInput("button", { name: "home" }).input.name, "HOME");
+  assert.ok(!validateInput("button", { name: "rm -rf /" }).ok);
+});
+
+await test("未知 action 被拒", () => {
+  assert.ok(!validateInput("launch_missiles", {}).ok);
+});
+
+// ── 路由匹配 ────────────────────────────────────────────────────────────
+
+console.log("\n路由匹配");
+
+const { matchRouteName } = await import("./lib/stream-routes.js");
+const PREFIX = "/_dsh/dsh-client-ui-sidebar-mobile";
+
+await test("匹配已知路由", () => {
+  assert.equal(matchRouteName(`${PREFIX}/stream/abc`, PREFIX), "stream");
+  assert.equal(matchRouteName(`${PREFIX}/grant`, PREFIX), "grant");
+  assert.equal(matchRouteName(`${PREFIX}/status?x=1`, PREFIX), "status");
+});
+
+await test("拒绝未知路由与裸前缀", () => {
+  assert.equal(matchRouteName(`${PREFIX}/nope`, PREFIX), null);
+  assert.equal(matchRouteName(PREFIX, PREFIX), null);
+  assert.equal(matchRouteName("/other/stream", PREFIX), null);
+});
+
 console.log(`\n结果：${passed} 通过，${failed} 失败`);
 process.exit(failed === 0 ? 0 : 1);
