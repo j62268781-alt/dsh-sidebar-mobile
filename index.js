@@ -137,8 +137,11 @@ export function apply(ctx, config = {}) {
   };
 
   // 把 client.runJson 包一层：每次调用前确认二进制存在
+  //
+  // ⚠️ 不用 `{...client}` 展开。class 的方法在原型上、私有字段（#deviceCache）
+  // 不在自有属性里，展开都拿不到 —— 展开出来的对象看着像 client，实际只有
+  // 几个数据字段。这里显式列出要转发的方法，语义清楚也不会悄悄漏掉。
   const guardedClient = {
-    ...client,
     runJson: (args, options) => {
       ensureBinary();
       return client.runJson(args, options);
@@ -147,6 +150,8 @@ export function apply(ctx, config = {}) {
       ensureBinary();
       return client.listDevices(options);
     },
+    /** 设备缓存失效：切换设备、设备动作后调用，避免读到过期列表。 */
+    invalidateDevices: () => client.invalidateDevices(),
     daemonStatus: () => client.daemonStatus(), // 诊断接口不拦
   };
 

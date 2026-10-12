@@ -150,6 +150,23 @@ if (explicit === null) {
         console.log(`       · ${d.name} [${d.platform}/${d.type}] ${d.state}`);
       }
     });
+
+    // 设备列表缓存：一次点击原本要付 381ms 的 devices 查询，缓存后同秒内复用。
+    // 但**失败的查询不能进缓存** —— 否则一次抖动会让面板长时间显示错误状态。
+    await test("listDevices 命中缓存（第二次不再 spawn）", async () => {
+      const fresh = new Mobilecli({ binary: explicit, home: null });
+      const first = await fresh.listDevices();
+      const t0 = Date.now();
+      const second = await fresh.listDevices();
+      const elapsed = Date.now() - t0;
+      assert.deepEqual(second, first, "缓存内容应与首次一致");
+      // 命中缓存应该是"立刻返回"量级；真跑一次要几百毫秒
+      assert.ok(elapsed < 50, `命中缓存应很快，实际 ${elapsed}ms`);
+      // fresh:true 必须绕过缓存
+      const forced = await fresh.listDevices({ fresh: true });
+      assert.ok(Array.isArray(forced));
+      fresh.invalidateDevices();
+    });
   }
 }
 
