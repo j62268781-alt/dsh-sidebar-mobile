@@ -52,6 +52,23 @@ export const inject = ["tools"];
 const DEFAULT_ROUTE_PREFIX = "/_dsh/dsh-sidebar-mobile";
 
 /**
+ * AVC 默认码率（bps）。
+ *
+ * mobilecli 的 `--bitrate` 默认值很低，实测 1080×2400 静止仅 0.98 Mbps。
+ * 8 Mbps 是 1080p 实时画面的常见取值，远低于 USB 实际吞吐。
+ * mobilecli 允许的范围是 100000–10000000。
+ */
+const DEFAULT_BITRATE_BPS = 8_000_000;
+
+/**
+ * 默认帧率上限。
+ *
+ * 不设限时实测会冲到 88fps（滑动中），远超需要，并把解码队列拖垮。
+ * 30fps 足够镜像操作，且能同时缓解延迟累积与主线程卡顿。
+ */
+const DEFAULT_MAX_FPS = 30;
+
+/**
  * 插件入口。
  *
  * @param {object} ctx Cordis 上下文
@@ -201,11 +218,45 @@ export function apply(ctx, config = {}) {
       // MJPEG（实测 --format avc 会被静默降级）。Host 侧从字节嗅探真实格式，
       // 所以这里无需分支。
       const args = ["screencapture", "--device", deviceId, "--format", "avc"];
+
+      /**
+       * ⚠️ 码率必须显式指定。
+       *
+       * mobilecli 不传 `--bitrate` 时的默认值很低：实测 1080×2400 的
+       * Xiaomi 15 Pro，静止 0.98 Mbps、滑动 2.15 Mbps。而同一台设备传
+       * `--bitrate 8000000` 后滑动能到 4.88 Mbps —— 这就是"画面糊"的主因
+       * （大范围运动时码率不够，编码器只能糊掉细节）。
+       *
+       * 1080p 级别的实时画面给 8 Mbps 是常见取值，也远低于 USB/adb 的
+       * 实际吞吐（实测 adb 上跑 5 Mbps 毫无压力）。
+       */
+      const bitrate = toPositiveInt(streamConfig.bitrate, DEFAULT_BITRATE_BPS);
+      args.push("--bitrate", String(bitrate));
+
+      /**
+       * ⚠️ `--fps` 实测**无效**，但仍然传。
+       *
+       * 复测（Xiaomi 15 Pro / 1080×2400 / mobilecli 1.0.19）：
+       *
+       *     不传 --fps   → 120.6 fps
+       *     --fps 30     → 105.5 fps
+       *     --fps 15     → 100.7 fps
+       *
+       * 传什么都是 ~120fps，所以**限流不能指望这个参数**。真正起作用的是
+       * 客户端渲染侧：每帧都解码（保住 H.264 参考链，不花屏），但只按
+       * 30fps 绘制（见 client.js 的 TARGET_RENDER_FPS）。
+       *
+       * 这里仍然传上去有两个理由：① 上游哪天修好了就自动生效；
+       * ② 它出现在命令行里，排查时一眼能看到我们期望的帧率。
+       */
+      const fps = toPositiveInt(streamConfig.maxFps, DEFAULT_MAX_FPS);
+      args.push("--fps", String(fps));
+
       const scale = streamConfig.defaultScale;
       if (typeof scale === "number" && scale > 0 && scale !== 1) {
         args.push("--scale", String(scale));
       }
-      log("info", `启动流：${deviceId}`);
+      log("info", `启动流：${deviceId}（${bitrate / 1e6}Mbps / ${fps}fps）`);
       return client.spawnStream(args);
     },
   });
