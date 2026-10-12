@@ -109,6 +109,25 @@ if (explicit === null) {
     );
   });
 
+  // ── 回归：错误信息绝不能是空字符串 ──────────────────────────────────
+  //
+  // 曾经写成 `parsed?.error ?? stderr.trim() ?? error?.message ?? "…"`。
+  // 没有 stderr 时 `stderr.trim()` 是**空字符串**，而空串不是 nullish，
+  // `??` 不会跳过它 → 整个表达式得到 ""，工具就报出一个 `Error: `
+  // （冒号后面什么都没有）。用户和模型都拿不到任何线索。
+  await test("失败时错误信息非空（空 stderr 不能吞掉 message）", async () => {
+    await assert.rejects(
+      () => mc.runJson(["definitely-not-a-command"]),
+      (error) => {
+        assert.ok(
+          typeof error.message === "string" && error.message.trim() !== "",
+          `错误信息不能为空，实际：${JSON.stringify(error.message)}`,
+        );
+        return true;
+      },
+    );
+  });
+
   await test("daemonStatus() 永不抛错，失败降级为 running:false", async () => {
     const status = await mc.daemonStatus();
     assert.equal(typeof status, "object");
@@ -133,6 +152,48 @@ if (explicit === null) {
     });
   }
 }
+
+// ── 回归：错误信息绝不能是空字符串（无需设备的纯逻辑）──────────────────
+//
+// 这条守着一个真实踩到的坑：曾经写成
+//     parsed?.error ?? stderr.trim() ?? error?.message ?? "mobilecli command failed"
+// 没有 stderr 时 `stderr.trim()` 是**空字符串**，而空串不是 nullish ——
+// `??` 不会跳过它，整个表达式就得到 ""。表现为工具报一个 `Error: `
+// （冒号后什么都没有），用户和模型都拿不到线索。用不存在的二进制来复现：
+// spawn 失败本身就可能没有 stderr。
+
+console.log("\n错误信息非空（回归）");
+
+await test("二进制不存在时，错误信息必须非空且可读", async () => {
+  const broken = new Mobilecli({ binary: "/nonexistent/mobilecli-binary-xyz", home: null });
+  await assert.rejects(
+    () => broken.runJson(["devices"]),
+    (error) => {
+      assert.equal(error.name, "MobilecliError");
+      assert.ok(
+        typeof error.message === "string" && error.message.trim() !== "",
+        `错误信息不能为空，实际：${JSON.stringify(error.message)}`,
+      );
+      return true;
+    },
+  );
+});
+
+await test("命令失败时错误信息非空（空 stderr 不能吞掉原因）", async () => {
+  // 用系统上一定存在的可执行文件跑一个非法参数，制造"非零退出但无 stderr"
+  const bin = process.platform === "win32" ? "C:\\Windows\\System32\\cmd.exe" : "/bin/sh";
+  const mc2 = new Mobilecli({ binary: bin, home: null });
+  await assert.rejects(
+    () => mc2.runJson(["--this-flag-does-not-exist-xyz"]),
+    (error) => {
+      assert.ok(
+        typeof error.message === "string" && error.message.trim() !== "",
+        `错误信息不能为空，实际：${JSON.stringify(error.message)}`,
+      );
+      return true;
+    },
+  );
+});
 
 // ── 流访问控制 ──────────────────────────────────────────────────────────
 //
