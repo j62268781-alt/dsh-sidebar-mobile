@@ -395,6 +395,25 @@ await test("swipe 要求四个坐标", () => {
   assert.ok(!validateInput("swipe", { x1: 0, y1: 0, x2: 1 }).ok);
 });
 
+// duration 必须能穿过 Host 校验层。丢了它，mobilecli 就会用平台默认的
+// 1000ms —— 实测每次滑动 1074ms 而不是 374ms，客户端算出的时长白算了。
+await test("swipe 透传 duration，并夹取到安全区间", () => {
+  const withDuration = validateInput("swipe", { x1: 0, y1: 0, x2: 1, y2: 1, duration: 250 });
+  assert.ok(withDuration.ok);
+  assert.equal(withDuration.input.duration, 250);
+
+  // 不传时不硬塞（由 sendInput 决定默认值）
+  const without = validateInput("swipe", { x1: 0, y1: 0, x2: 1, y2: 1 });
+  assert.ok(without.ok);
+  assert.equal(without.input.duration, undefined);
+
+  // 畸形值不能把设备端卡住
+  assert.equal(validateInput("swipe", { x1: 0, y1: 0, x2: 1, y2: 1, duration: 99999 }).input.duration, 2000);
+  assert.equal(validateInput("swipe", { x1: 0, y1: 0, x2: 1, y2: 1, duration: 1 }).input.duration, 80);
+  // 非数值直接忽略，而不是变成 NaN 传给 mobilecli
+  assert.equal(validateInput("swipe", { x1: 0, y1: 0, x2: 1, y2: 1, duration: "fast" }).input.duration, undefined);
+});
+
 await test("text 要求非空字符串", () => {
   assert.ok(validateInput("text", { text: "hi" }).ok);
   assert.ok(!validateInput("text", { text: "" }).ok);
@@ -1122,7 +1141,8 @@ await test("concatBytes 在 subarray 上工作（真实调用场景）", () => {
 
 console.log("\n流会话");
 
-const { StreamSession, StreamSessionPool } = await import("./lib/stream-session.js");
+const { StreamSession, StreamSessionPool, DEFAULT_SWIPE_DURATION_MS } =
+  await import("./lib/stream-session.js");
 
 /** 造一个可控的假流进程。 */
 function fakeStream() {
@@ -1318,14 +1338,23 @@ await test("sendInput 拼出的命令形状正确", async () => {
   await session.sendInput(run, { action: "tap", x: 10, y: 20 });
   assert.deepEqual(seen[0], ["io", "tap", "--device", "dev-1", "10,20"]);
 
+  // swipe 必须带 --duration。不传时 mobilecli 用平台默认的 1000ms，
+  // 实测每次滑动要 1074ms（传 300 只需 374ms）—— 这是"滑动很慢"的直接原因。
   await session.sendInput(run, { action: "swipe", x1: 1, y1: 2, x2: 3, y2: 4 });
-  assert.deepEqual(seen[1], ["io", "swipe", "--device", "dev-1", "1,2,3,4"]);
+  assert.deepEqual(
+    seen[1],
+    ["io", "swipe", "--device", "dev-1", "1,2,3,4", "--duration", String(DEFAULT_SWIPE_DURATION_MS)],
+  );
+
+  // 显式传 duration 时用它自己的值，不要被默认值覆盖
+  await session.sendInput(run, { action: "swipe", x1: 1, y1: 2, x2: 3, y2: 4, duration: 150 });
+  assert.deepEqual(seen[2], ["io", "swipe", "--device", "dev-1", "1,2,3,4", "--duration", "150"]);
 
   await session.sendInput(run, { action: "longpress", x: 5, y: 6, duration: 800 });
-  assert.deepEqual(seen[2], ["io", "longpress", "--device", "dev-1", "5,6", "--duration", "800"]);
+  assert.deepEqual(seen[3], ["io", "longpress", "--device", "dev-1", "5,6", "--duration", "800"]);
 
   await session.sendInput(run, { action: "button", name: "HOME" });
-  assert.deepEqual(seen[3], ["io", "button", "--device", "dev-1", "HOME"]);
+  assert.deepEqual(seen[4], ["io", "button", "--device", "dev-1", "HOME"]);
 
   await assert.rejects(() => session.sendInput(run, { action: "nope" }), /不支持的操作/);
   session.stop();
