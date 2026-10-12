@@ -50,6 +50,39 @@ npm install -g mobilecli@latest
 mobilecli devices          # 确认能看到设备
 ```
 
+### 前置：adb（Android 必需）
+
+**Android 设备必须装 adb** —— mobilecli 不自己实现 adb 协议，它调用外部 `adb`。
+而 **adb 缺失时 mobilecli 不报错**：
+
+```json
+{"status":"ok","data":{"devices":[]}}     // exit code 0，完全看不出问题
+```
+
+真相只在 daemon 日志里：`Failed running 'adb devices', is ANDROID_HOME set correctly?`。
+所以手机明明插着、驱动也正常，设备列表却是空的 —— 大概率就是缺 adb。
+
+```bash
+# 1) 下载 platform-tools
+#    https://developer.android.com/tools/releases/platform-tools
+# 2) 让 adb 可被找到：加进 PATH，或设 ANDROID_HOME 指向 platform-tools 的**上一级**
+# 3) 重启 DSH，然后让 daemon 重新读取环境
+mobilecli daemon stop
+```
+
+> ⚠️ **两个都会踩的坑**
+>
+> **① 环境变量是"启动时快照"。** 装完 adb 后**必须重启 DSH** —— 已运行的进程
+> 看不到新写的 PATH / ANDROID_HOME。插件会区分这两种情况：确认 adb 装了但当前
+> 进程看不到时，提示的是"重启 DSH"而不是"去装 adb"。
+>
+> **② daemon 也会缓存环境。** mobilecli 的 daemon 是常驻进程，继承**启动那一刻**
+> 的环境。所以即使 DSH 的环境对了，旧的 daemon 仍会报"没有设备" —— 必须
+> `mobilecli daemon stop`（或等它空闲 30 分钟自动退出）。
+
+面板在"一台设备都没有"时会显示一条可照做的诊断（含 adb 路径与下一条动作），
+而不是只显示"未发现设备"。
+
 iOS 真机还需要在设备上装 agent（**本插件不会自动装**）：
 
 ```bash
@@ -181,7 +214,10 @@ mobilecli 仓库里的 playbook（`SKILL.md` + `reference.md`）被原样打包�
 ## 已知边界
 
 - **⚠️ mobilecli 会独占设备的 UiAutomation**。上游源码注释原文：*"While it runs it holds the device's only UiAutomation, which kills every other UiAutomator client (`uiautomator dump`, Appium)."* **实测确认**：daemon 运行时 `adb shell uiautomator dump` 静默失败（文件根本不生成），`mobilecli daemon stop` 后立刻恢复。受影响的是 Appium、UiAutomator、以及任何依赖 `uiautomator dump` 的工具；不受影响的是 `adb shell input`、`screencap`、以及**进程内的 Flutter 测试**（`integration_test` / `patrol` 的 Dart 部分不碰 UiAutomation）。
-- **⚠️ `--fps` 参数当前不生效**。实测请求 15 与 30 都得到 ~104fps。想降带宽只能用 `--scale`。
+- **⚠️ Android 必须有 adb，且 mobilecli 不会为此报错**。缺 adb 时 `devices` 返回空列表 + exit code 0，看起来跟"没插手机"一模一样。插件会主动体检并区分这两种情况（见[前置：adb](#前置adbandroid-必需)）。
+- **⚠️ `--fps` 参数不生效**。复测（Xiaomi 15 Pro / 1080×2400 / mobilecli 1.0.19）：不传 → 120.6fps，`--fps 30` → 105.5fps，`--fps 15` → 100.7fps，传什么都是 ~120fps。所以限流只能在**客户端渲染侧**做：插件每帧都解码（保住 H.264 参考链 —— 丢 P 帧会花屏），但只按 30fps 绘制。想降带宽只能用 `--scale` 或 `--bitrate`。
+- **⚠️ swipe 不传 `--duration` 时会跑满 1000ms**。实测 `io swipe` 不带该参数耗时 1074ms，带 `--duration 300` 只需 374ms。插件按手指按住时长自动计算并透传。
+- **⚠️ `--bitrate` 默认值偏低**。实测 1080×2400 静止仅 0.98 Mbps、滑动 2.15 Mbps（大范围运动时明显发糊）。插件默认传 8 Mbps，同场景实测可达 6.6 Mbps。
 - **⚠️ iOS 的 `--format avc` 会被静默降级成 MJPEG**。这也是本插件从首块字节嗅探格式、而不相信请求参数的原因。
 - **⚠️ Flutter render tree 需要 debug 构建**。JVMTI 只能 attach 可调试的应用；release/profile 会退回无障碍树。
 - **iOS 真机的 Flutter 支持未验证**。已知的 Flutter 实现在模拟器路径上；真机走 WDA + LLDB 注入。
@@ -191,12 +227,12 @@ mobilecli 仓库里的 playbook（`SKILL.md` + `reference.md`）被原样打包�
 ## 自测
 
 ```bash
-npm test          # 43 项，无设备也能跑完（有设备时额外验证真实调用）
+npm test          # 86 项，无设备也能跑完（有设备时额外验证真实调用）
 npm run check     # 语法检查
 npm run verify    # 两者都跑
 ```
 
-自测覆盖：二进制四级解析、错误归一化、令牌签名与篡改检测、loopback 围栏（含 DNS rebinding）、流格式嗅探、交互输入校验、路由匹配、skill frontmatter 剥离。
+自测覆盖：二进制四级解析（含 Windows shim 回归）、adb 体检与六类失败诊断、错误归一化、令牌签名与篡改检测、loopback 围栏（含 DNS rebinding）、流格式嗅探、交互输入校验（含 swipe duration 透传）、路由匹配、skill frontmatter 剥离。
 
 ## 更多文档
 
