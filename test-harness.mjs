@@ -331,5 +331,61 @@ await test("拒绝未知路由与裸前缀", () => {
   assert.equal(matchRouteName("/other/stream", PREFIX), null);
 });
 
+// ── 技能注册 ────────────────────────────────────────────────────────────
+//
+// 打包上游的 mobilecli playbook，所以 frontmatter 剥离必须正确：
+// 它是 Claude Code 的约定，混进正文会被当作内容喂给模型。
+
+console.log("\n技能注册");
+
+const { parseFrontmatter, loadBundledSkill } = await import("./lib/skills.js");
+
+await test("frontmatter 解析：标量 + 折叠块 + 正文切分", () => {
+  const { attributes, body } = parseFrontmatter(
+    "---\nname: t\ndescription: >-\n  a long\n  folded desc\nallowed-tools: Bash(x)\n---\n# Body\nhi",
+  );
+  assert.equal(attributes.name, "t");
+  assert.equal(attributes.description, "a long folded desc", "折叠块应拼成一行");
+  assert.equal(attributes["allowed-tools"], "Bash(x)");
+  assert.ok(body.startsWith("# Body"), "正文应从分隔符之后开始");
+});
+
+await test("无 frontmatter 时原样返回", () => {
+  const { attributes, body } = parseFrontmatter("# Just markdown");
+  assert.deepEqual(attributes, {});
+  assert.equal(body, "# Just markdown");
+});
+
+await test("未闭合的 frontmatter 不吞掉正文", () => {
+  const { body } = parseFrontmatter("---\nname: x\n# no closing");
+  assert.ok(body.includes("# no closing"), "找不到结束符时应原样返回");
+});
+
+const bundled = loadBundledSkill();
+
+await test("加载打包的 skill 成功", () => {
+  assert.ok(bundled !== null, "应能读到 skills/mobilecli/SKILL.md");
+  assert.equal(typeof bundled.content, "string");
+  assert.ok(bundled.content.length > 5000, `正文过短：${bundled.content.length}`);
+});
+
+await test("skill name 符合 DSH 的命名规则", () => {
+  // DSH: SKILL_NAME = /^[a-z0-9]+(?:-[a-z0-9]+)*$/
+  assert.match(bundled.name, /^[a-z0-9]+(?:-[a-z0-9]+)*$/);
+});
+
+await test("description 非空（DSH 会拒绝空描述）", () => {
+  assert.ok(typeof bundled.description === "string" && bundled.description.length > 0);
+});
+
+await test("正文里没有 frontmatter 残留", () => {
+  assert.ok(!bundled.content.includes("allowed-tools"), "frontmatter 字段泄漏进正文");
+  assert.ok(!bundled.content.startsWith("---"), "正文不该以分隔符开头");
+});
+
+await test("reference.md 作为附录并入正文", () => {
+  assert.ok(bundled.content.includes("命令速查"), "缺少 reference 附录");
+});
+
 console.log(`\n结果：${passed} 通过，${failed} 失败`);
 process.exit(failed === 0 ? 0 : 1);
