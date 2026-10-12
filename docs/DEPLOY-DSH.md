@@ -33,13 +33,41 @@ dsh web
 
 ## 从源码（开发）
 
+### ⚠️ 必须用真实目录，不能用软链
+
+本插件的 Host 半 import 宿主包（`@deepseek-ai/dsh-tools`），而那些包**由 DSH 运行时提供、不在 profile 的 `node_modules` 里**。DSH 用自己的私有解析器把这类 import 路由到运行时。
+
+**软链会破坏这个解析**：Node 的 ESM 解析默认 `preserveSymlinks=false`，会以软链的**真实路径**为基准往上找 `node_modules`。源码目录在 `~/Documents/...` 下，那里没有 `@deepseek-ai/*`，于是报：
+
+```
+dsh-sidebar-mobile (@j62268781-alt/dsh-sidebar-mobile): failed to import
+```
+
+**实测对照**（同一个插件）：
+
+| 安装方式 | 结果 |
+|---|---|
+| `ln -s` 软链 | ❌ `failed to import` |
+| 真实目录复制 | ✅ 正常加载 |
+
+同一个 profile 里 `dsh-hindsight-bank-router` 用软链没问题，是因为它 `inject = []`、不 import 任何宿主包——**软链本身不是问题，"软链 + import 宿主包"才是**。
+
+### 正确做法
+
 ```bash
 git clone https://github.com/j62268781-alt/dsh-sidebar-mobile.git
 cd dsh-sidebar-mobile
 
-# 链进 profile（不需要 npm install——本包零依赖）
+# 用 pnpm 的 link: 协议（它建的是硬链接/复制，不是软链）
+dsh plugin --profile web add "link:$PWD"
+```
+
+若上面的方式仍报 `failed to import`，直接复制成真实目录：
+
+```bash
 PROFILE=~/.dsh/profiles/web
-ln -s "$PWD" "$PROFILE/node_modules/@j62268781-alt/dsh-sidebar-mobile"
+mkdir -p "$PROFILE/node_modules/@j62268781-alt"
+cp -R "$PWD" "$PROFILE/node_modules/@j62268781-alt/dsh-sidebar-mobile"
 ```
 
 然后把包名追加进 `$PROFILE/package.json` 的 `dsh.profile.bundles`：
@@ -58,7 +86,23 @@ ln -s "$PWD" "$PROFILE/node_modules/@j62268781-alt/dsh-sidebar-mobile"
 }
 ```
 
+改完源码要重新复制一次（`cp -R` 覆盖）：
+
+```bash
+cp -R "$PWD" "$PROFILE/node_modules/@j62268781-alt/dsh-sidebar-mobile"
+```
+
 重启 `dsh web`。Host 侧改动需要重启；客户端改动**刷新页面即可**（单文件、无构建步骤）。
+
+> 发到 npm 之后走 `dsh plugin --profile web add @j62268781-alt/dsh-sidebar-mobile@latest` 不受此影响——pnpm 装的是真实目录。
+
+### 从源码时的自查
+
+```bash
+dsh web --port 3091 --no-open 2>&1 | grep -E "sidebar-mobile|failed"
+```
+
+出现 `sidebar-mobile ... failed to import` 就是软链的问题；正常加载时这一行**不会出现**。
 
 ## 配置
 
@@ -146,3 +190,5 @@ mobilecli daemon stop
 | 点击位置偏移 | 检查是否在画面黑边上点（黑边事件被忽略）。若整个画面偏移，说明缩放计算有问题 |
 | 工具全报「mobilecli 不可用」 | 装它：`npm i -g mobilecli@latest`，或配 `binaryPath` |
 | `uiautomator dump` 失效 | 这是已知边界：mobilecli 独占 UiAutomation。`mobilecli daemon stop` 后恢复 |
+| 启动日志出现 `failed to import` | 从源码装时用了软链。改用真实目录复制，见[从源码](#从源码开发) |
+| 启动日志出现 `1 entry did not activate` | 同上——就是本插件没激活。这条警告是它的表现 |

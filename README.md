@@ -169,6 +169,7 @@ mobilecli 仓库里的 playbook（`SKILL.md` + `reference.md`）被原样打包�
 - **⚠️ Flutter render tree 需要 debug 构建**。JVMTI 只能 attach 可调试的应用；release/profile 会退回无障碍树。
 - **iOS 真机的 Flutter 支持未验证**。已知的 Flutter 实现在模拟器路径上；真机走 WDA + LLDB 注入。
 - **多个 DSH 进程不能共用同一个 daemon**。需要并行时给每个 profile 配不同的 `homeDir`。
+- **⚠️ 从源码装时不能用软链**。本插件的 Host 半 import 宿主包（`@deepseek-ai/dsh-tools`），而 Node 的 ESM 解析会以软链的**真实路径**为基准去找 `node_modules`——源码目录下没有那些包，于是启动日志报 `failed to import`（伴随 `1 entry did not activate`）。**实测对照**：同一个插件软链失败、真实目录成功。用 `dsh plugin add "link:$PWD"` 或 `cp -R` 成真实目录，见 [docs/DEPLOY-DSH.md](docs/DEPLOY-DSH.md)。发到 npm 后不受影响。
 
 ## 自测
 
