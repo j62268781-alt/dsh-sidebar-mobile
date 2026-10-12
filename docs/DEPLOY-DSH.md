@@ -52,23 +52,42 @@ dsh-sidebar-mobile (@j62268781-alt/dsh-sidebar-mobile): failed to import
 
 同一个 profile 里 `dsh-hindsight-bank-router` 用软链没问题，是因为它 `inject = []`、不 import 任何宿主包——**软链本身不是问题，"软链 + import 宿主包"才是**。
 
-### 正确做法
+### 正确做法：用 `file:` 协议
 
 ```bash
 git clone https://github.com/j62268781-alt/dsh-sidebar-mobile.git
 cd dsh-sidebar-mobile
 
-# 用 pnpm 的 link: 协议（它建的是硬链接/复制，不是软链）
-dsh plugin --profile web add "link:$PWD"
+dsh plugin --profile web add "file:$PWD"
 ```
 
-若上面的方式仍报 `failed to import`，直接复制成真实目录：
+`file:` 让 pnpm **复制**目录（真实目录），而 `link:` 建的是**软链**——后者正是会触发 `failed to import` 的那种。
+
+**实测验证**（`file:` 装上后跑 `CI=true pnpm install --no-frozen-lockfile` 重建）：
+
+| 协议 | pnpm 重建后 | 结果 |
+|---|---|---|
+| `link:` | 软链 | ❌ `failed to import` |
+| `file:` | 真实目录 | ✅ 正常加载 |
+
+`file:` 装出来的是干净的副本：文件完整、不含 `.git`、lockfile 记录正确。
+
+### 改完源码后
+
+```bash
+cd ~/Documents/dsh-plugins/dsh-sidebar-mobile
+dsh plugin --profile web add "file:$PWD"     # 重新复制
+```
+
+或在 profile 里直接覆盖（更快）：
 
 ```bash
 PROFILE=~/.dsh/profiles/web
-mkdir -p "$PROFILE/node_modules/@j62268781-alt"
-cp -R "$PWD" "$PROFILE/node_modules/@j62268781-alt/dsh-sidebar-mobile"
+cp -R ~/Documents/dsh-plugins/dsh-sidebar-mobile/. \
+      "$PROFILE/node_modules/@j62268781-alt/dsh-sidebar-mobile/"
 ```
+
+> 若用 `cp -R` 且源目录带 `.git`，只读的 git 对象会报 `Permission denied`——**不影响插件**（那些是版本控制元数据，运行时用不到）。想避免噪音就在复制时排除：`cp -R` 前先 `git archive` 导出干净树，或用 `file:` 协议。
 
 然后把包名追加进 `$PROFILE/package.json` 的 `dsh.profile.bundles`：
 
