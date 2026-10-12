@@ -59,6 +59,24 @@ await test("MOBILECLI_PATH 指向不存在的文件时被忽略", () => {
   }
 });
 
+// Windows 上 npm -g 会生成三个 shim，其中两个跑不起来：
+//   mobilecli      → POSIX sh 脚本，execFile 报 ENOENT（无扩展名不是合法映像）
+//   mobilecli.cmd  → execFile 报 EINVAL（Node 为 CVE-2024-27980 拒绝 .cmd）
+// 曾经的 findOnPath 只看裸名字，命中的正是那个 sh 脚本 —— 于是所有命令都
+// ENOENT，插件在 Windows 上完全不可用。这个测试锁住"绝不返回 .cmd/.bat"。
+await test("解析结果绝不是跑不起来的 shell shim（Windows 回归）", () => {
+  const resolved = resolveBinary(null);
+  if (resolved === null) return; // 没装 mobilecli 是允许的状态
+  const lower = resolved.toLowerCase();
+  assert.ok(!lower.endsWith(".cmd"), `.cmd 无法被 execFile 执行：${resolved}`);
+  assert.ok(!lower.endsWith(".bat"), `.bat 无法被 execFile 执行：${resolved}`);
+  assert.ok(!lower.endsWith(".ps1"), `.ps1 不是可执行映像：${resolved}`);
+  // Windows 上必须是真正的 .exe 映像
+  if (process.platform === "win32") {
+    assert.ok(lower.endsWith(".exe"), `Windows 上应解析到 .exe，实际：${resolved}`);
+  }
+});
+
 const explicit = process.env.MOBILECLI_BIN ?? resolveBinary(null);
 
 // ── 无二进制时的降级 ────────────────────────────────────────────────────
