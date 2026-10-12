@@ -24,6 +24,7 @@
  */
 
 import { Mobilecli, resolveBinary } from "./lib/mobilecli.js";
+import { AdbProbe, findAdb } from "./lib/android-toolchain.js";
 import { registerSkills } from "./lib/skills.js";
 import { StreamSessionPool } from "./lib/stream-session.js";
 import {
@@ -155,6 +156,39 @@ export function apply(ctx, config = {}) {
     daemonStatus: () => client.daemonStatus(), // 诊断接口不拦
   };
 
+  // ── Android 工具链（adb）体检 ────────────────────────────────────────
+  //
+  // ⚠️ 这一步是必需的，不是锦上添花。mobilecli 不自己实现 adb 协议，它调外部
+  // adb；而 adb 缺失时它的行为是**静默降级**，不是报错：
+  //
+  //     实测 mobilecli 1.0.19（手机已连、驱动正常、仅缺 adb）：
+  //       devices  →  {"status":"ok","data":{"devices":[]}}    exit code 0
+  //
+  // 返回值完全正常，只是列表是空的。于是插件会把"没装 adb"报告成
+  // "没有在线设备"，把用户指向换数据线/翻开发者选项 —— 全是错的方向。
+  //
+  // 所以启动时先体检一次 adb 并在日志里讲清楚；路由侧还会在"空设备列表"
+  // 时再查一次（用 AdbProbe 的缓存，不会重复 spawn）。
+  const adbProbe = new AdbProbe({ log });
+
+  void adbProbe
+    .get()
+    .then((probe) => {
+      if (probe.reason === "ok") {
+        log("info", `adb 就绪：${probe.path}（${probe.usable} 台可用设备）`);
+        return;
+      }
+      if (probe.available) {
+        log("info", `adb 已找到：${probe.path}（${probe.reason}）`);
+      } else {
+        log("warn", `未找到 adb（Android 设备将无法被发现）：${findAdb() ?? "不在 PATH / ANDROID_HOME 下"}`);
+        log("warn", "装上 platform-tools 并把 adb 放进 PATH（或设 ANDROID_HOME），然后重启 DSH");
+      }
+    })
+    .catch((error) => {
+      log("warn", `adb 体检失败（不影响加载）：${error?.message ?? error}`);
+    });
+
   // ── 流会话池 ────────────────────────────────────────────────────────
 
   const pool = new StreamSessionPool({
@@ -184,6 +218,7 @@ export function apply(ctx, config = {}) {
     pool,
     access,
     trustedAuthorities,
+    adbProbe,
     log,
   });
 

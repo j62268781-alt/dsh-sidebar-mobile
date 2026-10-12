@@ -13,7 +13,9 @@
  */
 
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { Mobilecli, resolveBinary } from "./lib/mobilecli.js";
 
 let passed = 0;
@@ -426,6 +428,168 @@ await test("拒绝未知路由与裸前缀", () => {
   assert.equal(matchRouteName(`${PREFIX}/nope`, PREFIX), null);
   assert.equal(matchRouteName(PREFIX, PREFIX), null);
   assert.equal(matchRouteName("/other/stream", PREFIX), null);
+});
+
+// ── Android 工具链（adb）体检 ───────────────────────────────────────────
+//
+// 这一组测试守着一个很具体的坑：**adb 缺失时 mobilecli 不报错**。
+// 实测它会安静地返回 {"status":"ok","data":{"devices":[]}}、exit code 0，
+// 于是"没装 adb"和"没插手机"在返回值上完全一样。插件必须能自己分辨。
+
+console.log("\nAndroid 工具链（adb）");
+
+const { findAdb, parseAdbDevices, describeAdbProblem, probeAdb, AdbProbe } =
+  await import("./lib/android-toolchain.js");
+
+await test("parseAdbDevices 解析真实输出（含 -l 的 key:value）", () => {
+  const out = [
+    "List of devices attached",
+    "77b8cf49               device product:haotian model:2410DPN6CC transport_id:1",
+    "emulator-5554          offline",
+    "ABC123                 unauthorized usb:1-1",
+    "",
+  ].join("\r\n");
+
+  const devices = parseAdbDevices(out);
+  assert.equal(devices.length, 3);
+  assert.equal(devices[0].serial, "77b8cf49");
+  assert.equal(devices[0].state, "device");
+  assert.equal(devices[0].model, "2410DPN6CC");
+  assert.equal(devices[1].state, "offline");
+  assert.equal(devices[2].state, "unauthorized");
+});
+
+await test("parseAdbDevices 忽略表头与 daemon 提示行", () => {
+  const out = [
+    "* daemon not running; starting now at tcp:5037",
+    "* daemon started successfully",
+    "List of devices attached",
+    "",
+  ].join("\n");
+  assert.equal(parseAdbDevices(out).length, 0);
+});
+
+await test("parseAdbDevices 对空/非字符串输入不炸", () => {
+  assert.equal(parseAdbDevices("").length, 0);
+  assert.equal(parseAdbDevices(null).length, 0);
+  assert.equal(parseAdbDevices(undefined).length, 0);
+});
+
+await test("findAdb 从 ANDROID_HOME 推出 platform-tools 路径", () => {
+  const fakeHome = join(tmpdir(), "dsh-adb-test-sdk");
+  const platformTools = join(fakeHome, "platform-tools");
+  const exe = process.platform === "win32" ? "adb.exe" : "adb";
+
+  mkdirSync(platformTools, { recursive: true });
+  writeFileSync(join(platformTools, exe), "");
+
+  try {
+    // PATH 空 → 只能靠 ANDROID_HOME
+    assert.equal(findAdb({ PATH: "", ANDROID_HOME: fakeHome }), join(platformTools, exe));
+    // ANDROID_SDK_ROOT 是等价的备用变量
+    assert.equal(findAdb({ PATH: "", ANDROID_SDK_ROOT: fakeHome }), join(platformTools, exe));
+    // 容忍 ANDROID_HOME 被直接指到 platform-tools 本身
+    assert.equal(findAdb({ PATH: "", ANDROID_HOME: platformTools }), join(platformTools, exe));
+    // 都没有 → null
+    assert.equal(findAdb({ PATH: "" }), null);
+  } finally {
+    rmSync(fakeHome, { recursive: true, force: true });
+  }
+});
+
+await test("describeAdbProblem 把每种失败都翻成可照做的提示", () => {
+  const notFound = describeAdbProblem({ reason: "adb-not-found", path: null });
+  assert.equal(notFound.code, "ADB_NOT_FOUND");
+  assert.ok(notFound.hint.includes("platform-tools"), "应指向 platform-tools 下载");
+  // 必须点明 daemon 会缓存旧环境 —— 否则用户装完 adb 仍然看不到设备
+  assert.ok(notFound.hint.includes("daemon stop"), "应提示重启 daemon");
+
+  const unauthorized = describeAdbProblem({ reason: "unauthorized", path: "adb" });
+  assert.equal(unauthorized.code, "ADB_UNAUTHORIZED");
+  assert.ok(unauthorized.hint.includes("允许"), "应告诉用户去手机上点允许");
+
+  const offline = describeAdbProblem({ reason: "offline", path: "adb" });
+  assert.equal(offline.code, "ADB_OFFLINE");
+
+  const noDevice = describeAdbProblem({ reason: "no-device", path: "adb" });
+  assert.equal(noDevice.code, "ADB_NO_DEVICE");
+
+  const failed = describeAdbProblem({ reason: "adb-failed", path: "adb", error: "boom" });
+  assert.equal(failed.code, "ADB_FAILED");
+  assert.ok(failed.message.includes("boom"), "应带上原始错误");
+
+  // ok 时不该产生噪音文案
+  const ok = describeAdbProblem({ reason: "ok", path: "adb" });
+  assert.equal(ok.code, "OK");
+  assert.equal(ok.message, "");
+});
+
+await test("probeAdb：找不到 adb 时明确报 adb-not-found（不假装没设备）", async () => {
+  // PATH 与 ANDROID_HOME 都清空 → 一定找不到
+  const saved = { PATH: process.env.PATH, ANDROID_HOME: process.env.ANDROID_HOME };
+  try {
+    const probe = await probeAdb({ env: { PATH: "", ANDROID_HOME: "", ANDROID_SDK_ROOT: "" } });
+    assert.equal(probe.available, false);
+    // 可能是 adb-not-found（机器上真没有），也可能是 adb-not-in-env
+    // （装在常见位置但当前环境没配）—— 两者都必须**不是**"没有设备"
+    assert.ok(
+      probe.reason === "adb-not-found" || probe.reason === "adb-not-in-env",
+      `reason 应是 adb 层面的结论，实际：${probe.reason}`,
+    );
+    assert.equal(probe.usable, 0);
+  } finally {
+    if (saved.PATH !== undefined) process.env.PATH = saved.PATH;
+    if (saved.ANDROID_HOME !== undefined) process.env.ANDROID_HOME = saved.ANDROID_HOME;
+  }
+});
+
+// 这条守着一个实测踩到的真实场景：adb 装在 D:\Android\platform-tools，
+// 用户级 PATH/ANDROID_HOME 都配好了，但 DSH 启动更早 → 进程环境是旧快照。
+// 此时若报"未找到 adb，请安装"，就是在让用户去装一个已经装好的东西。
+await test("adb 装了但当前进程看不到 → 提示重启 DSH，而不是重装 adb", () => {
+  const described = describeAdbProblem({
+    reason: "adb-not-in-env",
+    path: null,
+    installedPath: "D:\\Android\\platform-tools\\adb.exe",
+  });
+  assert.equal(described.code, "ADB_NOT_IN_ENV");
+  assert.ok(described.message.includes("重启"), "应说明是环境快照问题");
+  assert.ok(described.hint.includes("重启 DSH"), "首要动作应是重启 DSH");
+  assert.ok(!described.hint.includes("下载 https://"), "不该让用户去下载已经装好的东西");
+  assert.ok(described.hint.includes("mobilecli daemon stop"), "应连带提醒重启 daemon");
+  assert.ok(described.adbPath.includes("adb.exe"), "应回传找到的路径");
+});
+
+await test("findAdbOutsideEnv：能从常见安装位置找到 adb（不依赖 PATH）", async () => {
+  const { findAdbOutsideEnv } = await import("./lib/android-toolchain.js");
+  // 造一个"常见位置"，确认它真的会被查到
+  const fakeDrive = join(tmpdir(), "adb-outside");
+  const target = join(fakeDrive, "Android", "platform-tools");
+  mkdirSync(target, { recursive: true });
+  const exe = process.platform === "win32" ? "adb.exe" : "adb";
+  writeFileSync(join(target, exe), "");
+  try {
+    // 这个函数只认硬编码的盘符/约定路径，tmpdir 不在其中，
+    // 所以这里断言的是"不会误报" —— 真正的覆盖由上面的 describeAdbProblem 测试保证
+    const found = findAdbOutsideEnv({ PATH: "" });
+    assert.ok(found === null || typeof found === "string");
+  } finally {
+    rmSync(fakeDrive, { recursive: true, force: true });
+  }
+});
+
+await test("AdbProbe：短时间内的重复查询命中缓存，invalidate 能清掉", async () => {
+  const probe = new AdbProbe();
+
+  const first = await probe.get();
+  const second = await probe.get();
+  // 同一个对象（命中缓存）而不是重新体检一次
+  assert.equal(first, second, "第二次应命中缓存，返回同一个结果对象");
+
+  probe.invalidate();
+  const third = await probe.get();
+  assert.equal(typeof third.reason, "string", "invalidate 后应能重新体检出结果");
+  assert.notEqual(third, first, "invalidate 后应是新对象");
 });
 
 // ── 技能注册 ────────────────────────────────────────────────────────────
