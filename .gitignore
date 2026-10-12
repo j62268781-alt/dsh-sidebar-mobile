@@ -7,4 +7,4 @@ node_modules/
 
 # 运行时状态：流访问密钥、面板偏好、设备占用记录都落在 $DSH_HOME/cache
 # 或 ~/.mobilecli，不属于源码。这里只防止误提交本地调试产物。
-.dsh-client-ui-sidebar-mobile/
+.dsh-sidebar-mobile/

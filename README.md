@@ -1,6 +1,6 @@
 <div align="center">
 
-# dsh-client-ui-sidebar-mobile
+# dsh-sidebar-mobile
 
 **把手机装进 DSH 的右侧边栏 —— 实时画面 + 直接点击，一套 API 同时覆盖 iOS 与 Android**
 
@@ -62,14 +62,14 @@ iOS 模拟器同样需要装一次 agent，否则取流会报 `agent is not inst
 ### 装插件
 
 ```bash
-dsh plugin --profile web add @j62268781-alt/dsh-client-ui-sidebar-mobile@latest
+dsh plugin --profile web add @j62268781-alt/dsh-sidebar-mobile@latest
 dsh web
 ```
 
 或作为已有 profile 包的依赖：
 
 ```bash
-pnpm add @j62268781-alt/dsh-client-ui-sidebar-mobile
+pnpm add @j62268781-alt/dsh-sidebar-mobile
 ```
 
 装完刷新页面，右侧边栏出现「移动设备」tab。
@@ -78,14 +78,14 @@ pnpm add @j62268781-alt/dsh-client-ui-sidebar-mobile
 
 ## 配置
 
-全部配置在 profile 的 `cordis.patch.yml` 里，挂在 `dsh-client-ui-sidebar-mobile` 这一行下：
+全部配置在 profile 的 `cordis.patch.yml` 里，挂在 `dsh-sidebar-mobile` 这一行下：
 
 | 键 | 默认 | 说明 |
 |---|---|---|
 | `enabled` | `true` | 总开关。关掉后插件仍加载，但不挂路由、不注册工具与技能 |
 | `binaryPath` | `null` | mobilecli 路径。`null` 走四级自动解析（见下） |
 | `homeDir` | `null` | `MOBILECLI_HOME`。`null` 用 mobilecli 默认的 `~/.mobilecli` |
-| `routePrefix` | `/_dsh/dsh-client-ui-sidebar-mobile` | 路由前缀 |
+| `routePrefix` | `/_dsh/dsh-sidebar-mobile` | 路由前缀 |
 | `registerSkills` | `true` | 是否把 mobilecli 的 skill 注册给模型 |
 | `stream.idleStopSeconds` | `300` | 无消费者后多久停流 |
 | `stream.restartDelayMs` | `5000` | 流崩溃后的重启延迟 |
@@ -148,7 +148,7 @@ mobilecli 仓库里的 playbook（`SKILL.md` + `reference.md`）被原样打包�
 **浏览器从不接触 mobilecli 的端口**（它监听 localhost 且没有鉴权）。所有字节只经 DSH 自己的 web 源：
 
 ```
-<img src="/_dsh/dsh-client-ui-sidebar-mobile/stream/<token>">
+<img src="/_dsh/dsh-sidebar-mobile/stream/<token>">
      → 围栏校验 → Host 转发到 mobilecli → 回传
 ```
 

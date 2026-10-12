@@ -51,5 +51,5 @@
 - iOS 真机的 Flutter render tree 支持未验证（已知实现在模拟器路径上）
 - Flutter render tree 需要 debug 构建（JVMTI 只能 attach 可调试应用）
 
-[未发布]: https://github.com/j62268781-alt/dsh-client-ui-sidebar-mobile/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/j62268781-alt/dsh-client-ui-sidebar-mobile/releases/tag/v0.1.0
+[未发布]: https://github.com/j62268781-alt/dsh-sidebar-mobile/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/j62268781-alt/dsh-sidebar-mobile/releases/tag/v0.1.0

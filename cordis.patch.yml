@@ -1,4 +1,4 @@
-# dsh-client-ui-sidebar-mobile 的挂载层。
+# dsh-sidebar-mobile 的挂载层。
 #
 # 本插件把 mobilecli 二进制封装成 DSH 的移动设备层：Host 侧负责进程/流/工具/技能，
 # Client 侧在右侧边栏开一个「移动设备」tab，渲染实时画面并转发点击。
@@ -6,8 +6,8 @@
 # 它不依赖 @deepseek-ai/dsh-mcp-client —— mobilecli 不是 MCP server，而是一个
 # 自带 JSON-RPC 接口的 Go 二进制。Host 半个自己管它的生命周期。
 - insert:
-    - id: dsh-client-ui-sidebar-mobile
-      name: '@j62268781-alt/dsh-client-ui-sidebar-mobile'
+    - id: dsh-sidebar-mobile
+      name: '@j62268781-alt/dsh-sidebar-mobile'
       config:
         # 部署层总开关。关掉后插件仍会加载，但不挂流路由、不注册工具与技能。
         enabled: true
@@ -24,8 +24,8 @@
         # ⚠️ 同一个 daemon 同时只能服务一个 DSH 进程，详见 README「已知边界」。
         homeDir: null
 
-        # 流路由的挂载前缀（`/_dsh/dsh-client-ui-sidebar-mobile/*`）。改动通常没有必要。
-        routePrefix: '/_dsh/dsh-client-ui-sidebar-mobile'
+        # 流路由的挂载前缀（`/_dsh/dsh-sidebar-mobile/*`）。改动通常没有必要。
+        routePrefix: '/_dsh/dsh-sidebar-mobile'
 
         # 是否把 mobilecli 自带的 skill（skills/mobilecli/*.md）注册给模型。
         # 关掉只影响「模型知不知道这套命令」，不影响面板与工具本身。

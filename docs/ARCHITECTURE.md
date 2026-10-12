@@ -9,7 +9,7 @@
   │  只经 DSH 自己的 web 源，从不接触 mobilecli 的端口
   ▼
 lib/client.js            tab 类型 + 正文组件；两条渲染路径（H.264 / MJPEG）
-  │  fetch POST /_dsh/dsh-client-ui-sidebar-mobile/{grant,control,device-action,status}
+  │  fetch POST /_dsh/dsh-sidebar-mobile/{grant,control,device-action,status}
   │  <img|canvas> GET …/stream/<token>
   ▼
 lib/stream-routes.js     路由分发、body 解析、错误收敛

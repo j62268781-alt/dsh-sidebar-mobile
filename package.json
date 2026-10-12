@@ -1,5 +1,5 @@
 {
-  "name": "@j62268781-alt/dsh-client-ui-sidebar-mobile",
+  "name": "@j62268781-alt/dsh-sidebar-mobile",
   "version": "0.1.0",
   "type": "module",
   "description": "DSH 右侧边栏的移动设备面板：把 mobilecli 封装成实时画面 + 直接操作，一套 API 同时覆盖 iOS 与 Android，并把 mobilecli 自带的 skill 一并注册给模型。A mobile device panel for the DeepSeek Harness right sidebar — wraps mobilecli as a live screen with direct interaction, one API for iOS and Android, plus the bundled mobilecli skill registered for the model.",
@@ -24,11 +24,11 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/j62268781-alt/dsh-client-ui-sidebar-mobile.git"
+    "url": "git+https://github.com/j62268781-alt/dsh-sidebar-mobile.git"
   },
-  "homepage": "https://github.com/j62268781-alt/dsh-client-ui-sidebar-mobile#readme",
+  "homepage": "https://github.com/j62268781-alt/dsh-sidebar-mobile#readme",
   "bugs": {
-    "url": "https://github.com/j62268781-alt/dsh-client-ui-sidebar-mobile/issues"
+    "url": "https://github.com/j62268781-alt/dsh-sidebar-mobile/issues"
   },
   "main": "index.js",
   "exports": {

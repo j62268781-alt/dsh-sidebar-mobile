@@ -67,7 +67,7 @@ npm pack --dry-run
 市场条目是独立的 YAML 文件，提到 `awesome-dsh-plugin` 仓库。模板见 [market-entry.yml](market-entry.yml)，原样复制到：
 
 ```
-awesome-dsh-plugin/data/plugins/j62268781-alt__dsh-client-ui-sidebar-mobile.yml
+awesome-dsh-plugin/data/plugins/j62268781-alt__dsh-sidebar-mobile.yml
 ```
 
 文件名规则 `<owner>__<repo>.yml`。校验器只认 `url` / `name` / `category` / `description`，**多写键会被拒**。

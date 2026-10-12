@@ -19,7 +19,7 @@
 ```bash
 npm install -g mobilecli@latest
 
-dsh plugin --profile web add @j62268781-alt/dsh-client-ui-sidebar-mobile@latest
+dsh plugin --profile web add @j62268781-alt/dsh-sidebar-mobile@latest
 dsh web
 ```
 
@@ -29,17 +29,17 @@ dsh web
 
 `desktop` profile 由桌面应用独占，宿主 CLI 的 `dsh plugin --profile desktop` **会被直接拒绝**。桌面端走：
 
-**设置 → 插件市场** → 搜 `dsh-client-ui-sidebar-mobile` → 安装 → 刷新。
+**设置 → 插件市场** → 搜 `dsh-sidebar-mobile` → 安装 → 刷新。
 
 ## 从源码（开发）
 
 ```bash
-git clone https://github.com/j62268781-alt/dsh-client-ui-sidebar-mobile.git
-cd dsh-client-ui-sidebar-mobile
+git clone https://github.com/j62268781-alt/dsh-sidebar-mobile.git
+cd dsh-sidebar-mobile
 
 # 链进 profile（不需要 npm install——本包零依赖）
 PROFILE=~/.dsh/profiles/web
-ln -s "$PWD" "$PROFILE/node_modules/@j62268781-alt/dsh-client-ui-sidebar-mobile"
+ln -s "$PWD" "$PROFILE/node_modules/@j62268781-alt/dsh-sidebar-mobile"
 ```
 
 然后把包名追加进 `$PROFILE/package.json` 的 `dsh.profile.bundles`：
@@ -51,7 +51,7 @@ ln -s "$PWD" "$PROFILE/node_modules/@j62268781-alt/dsh-client-ui-sidebar-mobile"
       "bundles": [
         "@deepseek-ai/dsh-base",
         "@deepseek-ai/dsh-web-app",
-        "@j62268781-alt/dsh-client-ui-sidebar-mobile"
+        "@j62268781-alt/dsh-sidebar-mobile"
       ]
     }
   }
@@ -65,7 +65,7 @@ ln -s "$PWD" "$PROFILE/node_modules/@j62268781-alt/dsh-client-ui-sidebar-mobile"
 在 profile 的 `cordis.patch.yml` 里：
 
 ```yaml
-- id: dsh-client-ui-sidebar-mobile
+- id: dsh-sidebar-mobile
   config:
     enabled: true
     binaryPath: null        # 自动解析；解析不到时工具会给安装提示
@@ -117,7 +117,7 @@ ln -s "$PWD" "$PROFILE/node_modules/@j62268781-alt/dsh-client-ui-sidebar-mobile"
 ## 卸载
 
 ```bash
-dsh plugin --profile web remove @j62268781-alt/dsh-client-ui-sidebar-mobile
+dsh plugin --profile web remove @j62268781-alt/dsh-sidebar-mobile
 ```
 
 插件卸载时：

@@ -1,5 +1,5 @@
 /**
- * dsh-client-ui-sidebar-mobile — DSH 右侧边栏的移动设备面板。
+ * dsh-sidebar-mobile — DSH 右侧边栏的移动设备面板。
  *
  * 把 mobilecli 封装成 DSH 的移动设备层：Host 侧管进程/流/工具/技能，
  * Client 侧在右侧边栏渲染实时画面并转发点击。
@@ -20,7 +20,7 @@
  * 以及后台的流子进程。disposer 顺序与注册顺序相反，保证先停流再摘路由，
  * 避免摘掉路由后仍有响应在往已卸载的处理器里写。
  *
- * @module dsh-client-ui-sidebar-mobile
+ * @module dsh-sidebar-mobile
  */
 
 import { Mobilecli, resolveBinary } from "./lib/mobilecli.js";
@@ -36,7 +36,7 @@ import { StreamRoutes, mountRoutes } from "./lib/stream-routes.js";
 import { TOOL_NAMES, createTools } from "./lib/tools.js";
 
 /** Cordis 插件名，也是挂载 id。 */
-export const name = "dsh-client-ui-sidebar-mobile";
+export const name = "dsh-sidebar-mobile";
 
 /**
  * 需要的服务。
@@ -48,7 +48,7 @@ export const name = "dsh-client-ui-sidebar-mobile";
 export const inject = ["tools"];
 
 /** 默认路由前缀。与 cordis.patch.yml 的 routePrefix 保持一致。 */
-const DEFAULT_ROUTE_PREFIX = "/_dsh/dsh-client-ui-sidebar-mobile";
+const DEFAULT_ROUTE_PREFIX = "/_dsh/dsh-sidebar-mobile";
 
 /**
  * 插件入口。
@@ -65,9 +65,9 @@ export function apply(ctx, config = {}) {
     try {
       const logger = ctx.logger;
       if (logger && typeof logger[level] === "function") {
-        logger[level](`dsh-client-ui-sidebar-mobile: ${message}`);
+        logger[level](`dsh-sidebar-mobile: ${message}`);
       } else if (level === "error" || level === "warn") {
-        console.error(`dsh-client-ui-sidebar-mobile: ${message}`);
+        console.error(`dsh-sidebar-mobile: ${message}`);
       }
     } catch {
       // 忽略
@@ -194,7 +194,7 @@ export function apply(ctx, config = {}) {
       log("warn", "webServer 没有 register 接口，侧边栏面板不可用（工具仍可用）");
       return;
     }
-    wsCtx.effect(() => cleanup, "dsh-client-ui-sidebar-mobile:routes");
+    wsCtx.effect(() => cleanup, "dsh-sidebar-mobile:routes");
     log("info", `流路由已挂载：${routePrefix}/{${Object.values(ROUTES).join(",")}}`);
   });
   disposers.push(() => {
@@ -215,7 +215,7 @@ export function apply(ctx, config = {}) {
     disposers.push(
       ctx.effect(
         () => ctx.tools.register(definition),
-        `dsh-client-ui-sidebar-mobile:tool:${toolName}`,
+        `dsh-sidebar-mobile:tool:${toolName}`,
       ),
     );
   }
@@ -246,7 +246,7 @@ export function apply(ctx, config = {}) {
       log("warn", `停止流失败：${error?.message ?? error}`);
     }
     log("info", "已卸载");
-  }, "dsh-client-ui-sidebar-mobile:teardown");
+  }, "dsh-sidebar-mobile:teardown");
 }
 
 /**

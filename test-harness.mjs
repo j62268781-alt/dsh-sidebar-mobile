@@ -9,7 +9,7 @@
  *   node test-harness.mjs
  *   MOBILECLI_TEST_HOME=/tmp/mclihome node test-harness.mjs
  *
- * @module dsh-client-ui-sidebar-mobile/test-harness
+ * @module dsh-sidebar-mobile/test-harness
  */
 
 import assert from "node:assert/strict";
@@ -317,7 +317,7 @@ await test("未知 action 被拒", () => {
 console.log("\n路由匹配");
 
 const { matchRouteName } = await import("./lib/stream-routes.js");
-const PREFIX = "/_dsh/dsh-client-ui-sidebar-mobile";
+const PREFIX = "/_dsh/dsh-sidebar-mobile";
 
 await test("匹配已知路由", () => {
   assert.equal(matchRouteName(`${PREFIX}/stream/abc`, PREFIX), "stream");
