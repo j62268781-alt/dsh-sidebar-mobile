@@ -5,6 +5,77 @@
 
 ## [未发布]
 
+### 修复
+
+- **H.264 画面全黑（Android 实测）**：两个叠加的 bug，都会让解码器一帧都出不来。
+  1. `codecStringFromSps` 忘了跳过起始码，从 `nal[1..3]` 读到的是 `00 00 01`，
+     算出无效的 `avc1.000001`。Chrome 判为 "Unknown or ambiguous codec name."
+     并**异步**把解码器置为 closed，于是每次 `decode()` 都抛
+     `Cannot call 'decode' on a closed codec` —— 就是面板上那条报错。
+     修正后为 `avc1.640032`。
+  2. 参数集（SPS/PPS）单独成 chunk 喂给解码器时会被丢弃，整段流解不出帧
+     **且不报错**。实测对比：独立喂 → 0 帧；拼进关键帧 → 1338 帧。
+     现在缓存参数集，只在关键帧处拼接。
+  另外：解码器崩溃后改为**用缓存的 codec 立即重建**（实测整段流只有一个 SPS，
+  等下一个 SPS 永远等不到 → 画面永久卡死）。
+
+  实测证据：用出货代码解真实抓取的 369KB 流 → **2991 帧 / 0 报错**。
+  自测新增 6 条用例，直接从 `client.js` 源码抽函数求值（不是手抄副本），
+  含真机 SPS 字节的回归断言。
+
+- **面板没有任何入口**：tab 类型是"页类型"（不声明 `patterns`），只能被
+  `openTab(kind)` 显式打开，而此前没注册任何入口 —— 面板注册成功却没人能打开。
+  现在注册一条 `guide` 入口，在右侧边栏「开始」页出现「移动设备」胶囊。
+  自测用桩 loader 求值 `lib/client.js`，直接断言注册出去的定义
+  （含快捷键校验、blocked/handled 两条分支、以及宿主未提供 `shortcuts`
+  时的优雅降级）。
+
+- **工具栏按钮看起来不像按钮、也偏小**：原先自绘 26px 方块 + 1px 边框、无 hover 填充。
+  改用平台 seed 模块 `@deepseek-ai/dsh-client-ui-primitives` 的官方
+  `Button`（`size="sm"` = 28px、`variant="ghost"` 自带 hover 填充、focus ring、
+  disabled 透明度）与 `Tooltip`，图标也从 "⌂/▢/◯" 字符换成官方规格的 SVG
+  （字符的字重与基线跟旁边图标对不齐）。
+- **设备下拉左右间距不对称**：原生 `<select>` 的下拉箭头会吃掉右侧内边距
+  （左 8px / 右 0）。现在 `appearance: none` 关掉原生箭头，右侧自绘官方 chevron，
+  左右视觉一致。保留 `<select>` 本身是为了键盘与无障碍。
+- **tab 标签里的手机图标比旁边的文件夹/地球小一圈**：根因不是 `size`，
+  而是官方对同一图形有**两套留白比例** —— guide artwork 占 viewBox 56.4%，
+  tab 图标占 76.1%。同样 16px 下按 guide 比例只画出 9.0px，而官方是 12.2px。
+  现在 `MobileArtwork` 按场合切换（`dense`），实测渲染高度 12.18px，与官方一致。
+  同时去掉标签图标多余的 `margin-right`（dockkit 的 `.tabTitle` 已有 `gap:5px`，
+  叠加会变成 9px，官方「文件」是 5px）。
+
+### 新增
+
+- **tab 标签图标**：注册 `sidebar.right.pane.tab.title`，标签上显示手机图标 + 标题
+  （官方 files/browser/terminal 都注册了这个 seat）。图标跟随标签前景色
+  （`currentColor`），与官方 `IconGlobeOutlineRegular` 一致，暗色主题下不会突兀。
+- **快捷键**：`⌘⇧M`（桌面）/ `⌘⌥M`（浏览器）打开移动设备面板。
+  键位与 DSH 自带的 8 条绑定无冲突，桌面端刻意避开 `⌘M`
+  （macOS 系统「最小化」占用，原生菜单会先吃掉）。
+  可在 **设置 → 快捷键** 里改。
+- **入口图标**：自绘一幅手机 artwork，颜色（`#539CFA`）与尺寸契约
+  （`viewBox 0 0 36 36`、默认 36、`aria-hidden`）与官方
+  `GuideArtworkBrowser` 一致，纵向边缘逐像素对齐。
+  官方没有手机图标（`primitives` 的 378 个 `Icon*` 里没有 phone/mobile），
+  所以自绘而不是去引入第三方图标集。
+
+### 说明
+
+- 自测新增 4 条外观用例（按钮尺寸与变体、下拉内边距对称、标签图标不重复加间距、
+  图标 aria-label），并把图标的填充比例与描边宽度改成断言「有效值」而非写死的常数。
+- `shortcuts` / `sidebarRight` 都是**可选**注入：宿主没提供时插件其余部分照常工作，
+  面板仍从「开始」页入口打开，只是没有快捷键与徽标。
+  `@deepseek-ai/dsh-client-ui-primitives` 则**不需要**注入声明 —— 它是 web shell 的
+  平台 seed 模块，永远可 require（官方 terminal 插件同样这么用）。
+
+### 已知副作用（上游行为，非本插件 bug）
+
+- 「开始」页的副标题会消失。DSH 有 `MAX_DESCRIBED_ENTRIES = 4`：胶囊超过 4 个，
+  上游关掉**所有**胶囊的副标题（不是只关第 5 个）。官方 3 个 + `dsh-context` 1 个
+  已经是 4 个，本插件必然是第 5 个。已确认接受该代价以换取入口；
+  要恢复副标题只能把入口挪到 `conversation.session.header.utilities`。
+
 ## [0.1.0] - 2026-10-12
 
 首个版本：把 mobilecli 封装成 DSH 右侧边栏的移动设备面板。

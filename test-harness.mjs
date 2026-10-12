@@ -13,6 +13,7 @@
  */
 
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { Mobilecli, resolveBinary } from "./lib/mobilecli.js";
 
 let passed = 0;
@@ -385,6 +386,471 @@ await test("正文里没有 frontmatter 残留", () => {
 
 await test("reference.md 作为附录并入正文", () => {
   assert.ok(bundled.content.includes("命令速查"), "缺少 reference 附录");
+});
+
+// ── 客户端 tab 注册 ────────────────────────────────────────────────────
+//
+// 锁住的是"面板装了但找不到入口"这个 bug：本插件的 tab 是**页类型**
+// （不声明 patterns，不认领任何 dsh-resource:// 地址），所以它只能被显式打开；
+// 而显式打开的唯一用户可达路径，是右栏「开始」页上的 guide 入口胶囊。
+// guide 一丢，tab 仍然注册成功、仍然能渲染——只是没人能打开它。
+// 这里用桩 loader 把 client.js 求值一遍，直接检查注册出去的定义。
+
+console.log("\n客户端 tab 注册");
+
+/**
+ * 在桩环境里求值 lib/client.js，返回它注册出去的东西。
+ *
+ * client.js 是经典脚本（走 window.__ModuleLoader__，不能用 import 求值），
+ * 所以这里手工搭一个最小的 window + ctx 替身。
+ *
+ * @param {{commandTarget?: () => object|undefined}} [options]
+ *   commandTarget 决定「有没有会话」——用来覆盖快捷键的 blocked / handled 两条分支。
+ * @returns {{types: object[], slots: object[], shortcuts: object[], opened: object[], id: string}}
+ */
+async function loadClientRegistrations(options = {}) {
+  let loaded = null;
+  globalThis.window = { __ModuleLoader__: { load: (spec) => { loaded = spec; } } };
+  // 查询参数让 ESM 缓存失效，避免和别的用例互相干扰
+  await import(`./lib/client.js?t=${Date.now()}`);
+  if (loaded === null) throw new Error("client.js 没有调用 __ModuleLoader__.load");
+
+  const plugin = loaded.factory((spec) => {
+    if (spec === "react") {
+      // 极简 createElement 替身：保留 type/props/children，够断言 SVG 契约
+      return {
+        createElement: (type, props, ...children) => ({
+          type,
+          props: { ...(props ?? {}), children },
+        }),
+      };
+    }
+    if (spec === "@deepseek-ai/dsh-client-ui-primitives") {
+      // primitives 是平台 seed 模块（web shell 的 staticModules），永远可 require。
+      // 测试里桩成透明透传组件：只保留 props，便于断言调用方传了什么。
+      const passthrough = (name) => {
+        const Component = (props) =>
+          ({ type: name, props: { ...(props ?? {}) } });
+        Component.displayName = name;
+        return Component;
+      };
+      return { Button: passthrough("Button"), Tooltip: passthrough("Tooltip"), Input: passthrough("Input") };
+    }
+    throw new Error(`require 了没注入的模块：${spec}`);
+  });
+
+  const types = [];
+  const slots = [];
+  const shortcuts = [];
+  const opened = [];
+  const ctx = {
+    effect: (fn) => fn(),
+    // 可选注入：回调立即执行，桩出 shortcuts / sidebarRight
+    inject: (_names, cb) => cb(ctx),
+    sidebarRightTabs: { register: (def) => { types.push(def); return () => {}; } },
+    slots: { register: (def) => { slots.push(def); return () => {}; } },
+    shortcuts: { register: (def) => { shortcuts.push(def); return () => {}; } },
+    sidebarRight: {
+      commandTarget: options.commandTarget ?? (() => ({ sessionId: "s1", paneId: "p1", host: "dock" })),
+      openTabFromTarget: (kind, target) => opened.push({ kind, target }),
+    },
+  };
+  plugin.apply(ctx);
+  return { types, slots, shortcuts, opened, id: loaded.id };
+}
+
+const client = await loadClientRegistrations();
+const mobileType = client.types.find((t) => t.kind === "mobile");
+
+await test("注册了 kind=mobile 的 tab 类型与正文 slot", () => {
+  assert.ok(mobileType !== undefined, "没有注册 kind=mobile 的类型");
+  assert.ok(
+    client.slots.some((s) => s.name === "sidebar.right.pane.tab" && s.key === mobileType.id),
+    "正文 slot 的 key 必须等于类型 id，否则 tab 打开是空白",
+  );
+});
+
+await test("tab 类型带 guide 入口（否则用户找不到面板）", () => {
+  assert.ok(Array.isArray(mobileType.guide), "页类型没有 guide 入口就永远打不开");
+  assert.equal(mobileType.guide.length, 1);
+
+  const entry = mobileType.guide[0];
+  assert.ok(entry.id, "入口缺 id");
+  assert.equal(typeof entry.order, "number", "入口缺 order，排序会不稳定");
+  assert.equal(typeof entry.title, "function", "title 必须是函数（随语言变化）");
+  assert.ok(entry.title().length > 0, "入口标题不能为空");
+  assert.equal(
+    new Set(mobileType.guide.map((e) => e.id)).size,
+    mobileType.guide.length,
+    "guide 入口 id 必须唯一，重复会被 registry 抛错",
+  );
+});
+
+await test("注册了 tab 标签 slot（否则标签上没有图标）", () => {
+  const title = client.slots.find((s) => s.name === "sidebar.right.pane.tab.title");
+  assert.ok(title !== undefined, "没注册 sidebar.right.pane.tab.title，标签只有纯文字");
+  assert.equal(title.key, mobileType.id, "标题 slot 的 key 必须等于类型 id");
+});
+
+// ── 面板外观 ────────────────────────────────────────────────────────────
+//
+// 这一段锁的是用户直接看到、且改样式时最容易改坏的东西：
+// 按钮尺寸、下拉内边距对称、标签图标不重复加间距。
+
+console.log("\n面板外观");
+
+/** 把 client.js 里的 CSS 模板取出来做断言。 */
+function panelCss() {
+  const source = readFileSync(new URL("./lib/client.js", import.meta.url), "utf8");
+  const match = source.match(/const CSS = `([\s\S]*?)`;/u);
+  if (match === null) throw new Error("client.js 里找不到 CSS 模板");
+  return match[1];
+}
+
+await test("工具栏按钮用官方 Button（28px），而不是自绘的 26px 小方块", () => {
+  const source = readFileSync(new URL("./lib/client.js", import.meta.url), "utf8");
+  // 官方 Button 的 sm 规格是 height 28；自绘要自己写高度，很容易写成 26
+  assert.ok(source.includes('size: "sm"'), "工具栏未使用官方 Button 的 sm 尺寸");
+  assert.ok(
+    source.includes('variant: "ghost"'),
+    "ghost 变体提供 hover 填充；缺它按钮看起来不像按钮",
+  );
+  // 旧的 mbm-btn 自绘样式必须已经删干净
+  assert.ok(!source.includes("mbm-btn"), "残留了旧的 mbm-btn 自绘按钮样式");
+  assert.ok(!/\.mbm-btn\s*\{/u.test(source), "残留了 .mbm-btn 规则");
+});
+
+await test("设备下拉：关掉原生箭头并自绘，左右内边距才对称", () => {
+  const css = panelCss();
+  // 原生箭头会吃掉右侧内边距（左 8 / 右 0），必须 appearance:none
+  assert.ok(
+    /\.mbm-select\s*\{[^}]*appearance:\s*none/u.test(css),
+    "未关掉原生 select 箭头，右侧内边距会不对称",
+  );
+  // 关掉原生箭头后必须自己画一个，否则没有可点的提示
+  assert.ok(css.includes(".mbm-selectCaret"), "关掉了原生箭头却没有自绘箭头");
+  assert.ok(/\.mbm-selectWrap\s*\{[^}]*position:\s*relative/u.test(css), "自绘箭头需要定位上下文");
+  // 右侧 padding 要留出箭头的位置
+  const padding = css.match(/\.mbm-select\s*\{[^}]*padding:\s*([^;]+);/u)?.[1] ?? "";
+  assert.ok(padding.length > 0, "下拉框没有 padding");
+  const [top, right, bottom, left] = padding.split(/\s+/u);
+  assert.equal(top, bottom, `上下内边距应相等：${padding}`);
+  assert.notEqual(right, "0", `右侧必须给箭头留位：${padding}`);
+  assert.equal(left, "8px", `左侧内边距应为 8px：${padding}`);
+});
+
+await test("标签图标不再自带 margin（dockkit 已给 gap:5px）", () => {
+  const css = panelCss();
+  const rule = css.match(/\.mbm-title-icon\s*\{([^}]*)\}/u)?.[1] ?? "";
+  assert.ok(rule.includes("flex: none"), "标签图标必须 flex:none，否则标题长时被压扁");
+  assert.ok(
+    !rule.includes("margin-right"),
+    "dockkit 的 .tabTitle 已有 gap:5px，再加 margin-right 会变成 9px（官方「文件」是 5px）",
+  );
+});
+
+await test("工具栏按钮走官方 Tooltip，且每个都有可读的 aria-label", () => {
+  const source = readFileSync(new URL("./lib/client.js", import.meta.url), "utf8");
+  // 本文件不用 JSX，走 h(Tooltip, ...) 工厂
+  assert.ok(/\bh\(\s*Tooltip\b/u.test(source), "工具栏按钮没有 Tooltip");
+  assert.ok(source.includes('"aria-label": label'), "图标按钮必须有 aria-label，否则读屏只剩空按钮");
+});
+
+await test("guide 入口是第 5 个胶囊 —— 副标题消失是预期行为，不是 bug", () => {
+  // DSH 的「开始」页：const MAX_DESCRIBED_ENTRIES = 4;
+  //   const described = entries.length <= MAX_DESCRIBED_ENTRIES;
+  // 胶囊超过 4 个，上游会关掉**所有**胶囊的副标题（不是只关第 5 个）。
+  //
+  // 官方 3 个（files 10 / terminal 20 / browser 30）+ dsh-context（20）已经是 4 个，
+  // 所以本插件必然是第 5 个 —— 装上后「工作区文件/上下文/新建终端/浏览器」的
+  // 副标题会一起消失。那是上游的取舍，插件侧无法只为自己豁免；已确认接受。
+  //
+  // 这条用例把该事实钉住：以后看到副标题没了，先去改入口位置，
+  // 不要当成回归去动 description 或去"修" guide。
+  assert.equal(mobileType.guide[0].order, 40, "应排在 dsh-context（20）之后，做第 5 个胶囊");
+});
+
+await test("guide 入口会被 registry 绑到 kind=mobile（openTab 才找得到）", () => {
+  // 复刻 DSH registry 的 refresh()：guideEntries 由 guide 派生并补上 kind
+  const entries = client.types.flatMap((d) =>
+    (d.guide ?? []).map((e) => ({ ...e, kind: d.kind })),
+  );
+  const mine = entries.find((e) => e.kind === "mobile");
+  assert.ok(mine !== undefined, "registry 派生出的入口里没有 mobile");
+  assert.equal(mine.title(), "移动设备");
+});
+
+await test("guide 入口带 icon，且尺寸/颜色契约与官方 artwork 一致", () => {
+  const icon = mobileType.guide[0].icon;
+  assert.equal(typeof icon, "function", "入口缺 icon，胶囊会退回灰色立方体占位图");
+
+  // 官方 artwork 契约：收 { size, className }，默认 36，viewBox 0 0 36 36，aria-hidden
+  const tree = icon({ size: 26, className: "x" });
+  assert.equal(tree.props.width, 26, "size 必须透传到 width（guide 传 26 或 22）");
+  assert.equal(tree.props.height, 26);
+  assert.equal(tree.props.viewBox, "0 0 36 36", "viewBox 必须与官方 artwork 一致");
+  assert.equal(tree.props["aria-hidden"], "true", "纯装饰图标必须对读屏隐藏");
+
+  // 颜色要跟「浏览器」胶囊一致：官方 artwork 用固定色 #539CFA，不是 currentColor
+  const strokes = [];
+  const collect = (node) => {
+    if (node === null || typeof node !== "object") return;
+    if (node.props?.stroke !== undefined) strokes.push(node.props.stroke);
+    for (const child of [].concat(node.props?.children ?? [])) collect(child);
+  };
+  collect(tree);
+  assert.ok(strokes.length > 0, "图标没有任何描边");
+  assert.ok(
+    strokes.every((s) => s === "#539CFA"),
+    `描边色应统一为浏览器胶囊的 #539CFA，实际：${strokes.join(", ")}`,
+  );
+
+  // 描边宽度按场合归一：官方 guide artwork 是 2/36，官方 tab 图标是 1/16。
+  // 断言的是「有效描边」而非某个写死的数，这样改 viewBox 也不会假绿。
+  const widths = [];
+  const collectW = (node) => {
+    if (node === null || typeof node !== "object") return;
+    if (node.props?.strokeWidth !== undefined) widths.push(node.props.strokeWidth);
+    for (const child of [].concat(node.props?.children ?? [])) collectW(child);
+  };
+  collectW(tree);
+  assert.ok(widths.length > 0, "图标没有描边宽度");
+  // guide 场合：26px 显示下应约等于官方 guide artwork 的观感（2/36 * 26 ≈ 1.44px）
+  const guideEffective = (widths[0] * 26) / 36;
+  assert.ok(
+    Math.abs(guideEffective - (2 / 36) * 26) < 0.01,
+    `guide 场合有效描边应约为 1.44px，实际 ${guideEffective.toFixed(2)}px`,
+  );
+});
+
+await test("图标填充比例分两套：guide 56%、标签 76%（否则标签里小一圈）", () => {
+  const icon = mobileType.guide[0].icon;
+  const bodyBox = (tree) => {
+    const rect = tree.props.children.find((c) => c?.type === "rect");
+    return { height: rect.props.height, min: rect.props.y, max: rect.props.y + rect.props.height };
+  };
+
+  // 官方 guide artwork（GuideArtworkBrowser）：圆形占 viewBox 的 56.4%
+  const guide = bodyBox(icon({ size: 26 }));
+  const guideFill = guide.height / 36;
+  assert.ok(
+    Math.abs(guideFill - 0.564) < 0.01,
+    `guide 填充比例应约 56.4%，实际 ${(guideFill * 100).toFixed(1)}%`,
+  );
+
+  // 官方 tab 图标（IconGlobeOutlineRegular）：占 76.1%。
+  // 少了 dense，16px 下只画 9px，而旁边的文件夹/地球是 12.2px —— 肉眼可见小一圈。
+  const tab = bodyBox(icon({ size: 16, dense: true }));
+  const tabFill = tab.height / 36;
+  assert.ok(
+    Math.abs(tabFill - 0.761) < 0.01,
+    `标签填充比例应约 76.1%（对齐官方 tab 图标），实际 ${(tabFill * 100).toFixed(1)}%`,
+  );
+
+  // 关键：16px 下标签图标的实际绘制高度要接近官方的 12.18px
+  const rendered = (tab.height / 36) * 16;
+  assert.ok(
+    rendered > 11.8 && rendered < 12.6,
+    `标签图标应渲染约 12.2px（官方 globe 尺寸），实际 ${rendered.toFixed(1)}px`,
+  );
+
+  // 两者都必须垂直居中
+  for (const [name, box] of [["guide", guide], ["tab", tab]]) {
+    const center = (box.min + box.max) / 2;
+    assert.ok(Math.abs(center - 18) < 0.01, `${name} 未垂直居中：中心 ${center}`);
+  }
+});
+
+await test("图标 color 可覆盖：胶囊用固定蓝，标签行用 currentColor", () => {
+  const icon = mobileType.guide[0].icon;
+  const walk = (node, sink) => {
+    if (node === null || typeof node !== "object") return;
+    if (node.props?.stroke !== undefined) sink.push(node.props.stroke);
+    for (const c of [].concat(node.props?.children ?? [])) walk(c, sink);
+  };
+
+  // 默认（guide 胶囊）：固定蓝 —— 官方两幅 artwork 都是固定色
+  const guideStrokes = [];
+  walk(icon({ size: 26 }), guideStrokes);
+  assert.ok(guideStrokes.every((s) => s === "#539CFA"), "guide 里应是固定蓝");
+
+  // 标签行：currentColor —— 官方 tab 图标（IconGlobeOutlineRegular）都用它，
+  // 否则暗色主题下固定蓝会突兀
+  const tabStrokes = [];
+  walk(icon({ size: 16, color: "currentColor" }), tabStrokes);
+  assert.ok(tabStrokes.length > 0, "标签图标没有描边");
+  assert.ok(
+    tabStrokes.every((s) => s === "currentColor"),
+    `标签行应传 currentColor 跟随前景色，实际：${tabStrokes.join(", ")}`,
+  );
+});
+
+await test("快捷键已注册，且 guide 的 commandId 与之逐字一致", () => {
+  // commandId 对不上 → 胶囊右侧的快捷键徽标不显示（官方 files/browser 同样机制）
+  assert.equal(client.shortcuts.length, 1, "应恰好注册一条快捷键");
+  const sc = client.shortcuts[0];
+  assert.equal(
+    mobileType.guide[0].commandId,
+    sc.id,
+    "guide.commandId 必须等于 shortcuts.register 的 id，否则徽标不显示",
+  );
+  // DSH 的 commandPattern：点分两段，重复 id 会 throw
+  assert.match(sc.id, /^[a-z][a-zA-Z0-9-]*(?:\.[a-zA-Z][a-zA-Z0-9-]*)+$/u);
+});
+
+await test("快捷键覆盖桌面与浏览器，且避开被占用的组合", () => {
+  const sc = client.shortcuts[0];
+  for (const profile of [
+    "desktop:macos", "desktop:windows", "desktop:linux",
+    "web:macos", "web:windows",
+  ]) {
+    assert.ok(sc.defaults[profile] !== undefined, `缺 ${profile} 的默认键`);
+  }
+
+  // DSH 自带 8 条绑定的 web:macos 组合（实测扫描 asar 得出），不能撞上
+  const takenWeb = new Set([
+    "alt+primary+Comma", "alt+primary+KeyB", "alt+primary+KeyP", "alt+primary+KeyT",
+    "control+Backquote", "primary+shift+KeyB", "primary+shift+KeyO", "primary+Slash",
+  ]);
+  const webMac = sc.defaults["web:macos"];
+  const key = [...webMac.modifiers].sort().join("+") + "+" + webMac.code;
+  assert.ok(!takenWeb.has(key), `web:macos 的 ${key} 已被官方占用`);
+
+  // 桌面端不能只用 ⌘M：macOS 的 windowMenu 把 ⌘M 绑给了「最小化」，
+  // 原生菜单会先吃掉这个键。至少要两段修饰键。
+  for (const profile of ["desktop:macos", "desktop:windows", "desktop:linux"]) {
+    assert.ok(
+      sc.defaults[profile].modifiers.length >= 2,
+      `${profile} 必须至少两个修饰键（⌘M 被系统「最小化」占用）`,
+    );
+  }
+});
+
+await test("快捷键无会话时 blocked（带可读原因，而不是静默无反应）", async () => {
+  const noSession = await loadClientRegistrations({ commandTarget: () => undefined });
+  const blocked = noSession.shortcuts[0].resolve({ target: null });
+  assert.equal(blocked.status, "blocked");
+  assert.ok(blocked.reason.length > 0, "blocked 必须带原因，否则用户不知道为什么没反应");
+});
+
+await test("有会话时 resolve 返回 handled，且 run() 按 kind=mobile 打开", () => {
+  const handled = client.shortcuts[0].resolve({ target: null });
+  assert.equal(handled.status, "handled");
+  assert.equal(typeof handled.run, "function", "handled 必须带 run，否则按键没反应");
+
+  handled.run();
+  assert.equal(client.opened.length, 1, "run() 应恰好打开一次");
+  assert.equal(client.opened[0].kind, "mobile", "必须按 kind=mobile 打开");
+});
+
+// ── H.264 码流解析 ──────────────────────────────────────────────────────
+//
+// 这一段锁的是一个**真机上踩到过的黑屏 bug**：
+// codecStringFromSps 忘了跳过起始码，从 `nal[1..3]` 读到的是 00 00 01，
+// 于是算出 "avc1.000001"。Chrome 判为 "Unknown or ambiguous codec name."，
+// 异步把解码器置为 closed，之后每次 decode() 都抛
+// "Cannot call 'decode' on a closed codec" —— 画面全黑。
+//
+// 注意：这个函数从 client.js **源码里抽出来**求值，不是手抄一份副本，
+// 否则测试会和出货代码漂移（这正是原 bug 没被测出来的原因）。
+
+console.log("\nH.264 码流解析");
+
+/** 从 client.js 源码里抽出一个具名函数（含函数体），用于独立测试。 */
+function extractFunction(name) {
+  const source = readFileSync(new URL("./lib/client.js", import.meta.url), "utf8");
+  const start = source.indexOf(`function ${name}(`);
+  if (start < 0) throw new Error(`client.js 里找不到函数 ${name}`);
+  let depth = 0;
+  let seen = false;
+  for (let i = start; i < source.length; i += 1) {
+    if (source[i] === "{") { depth += 1; seen = true; }
+    else if (source[i] === "}") {
+      depth -= 1;
+      if (seen && depth === 0) return source.slice(start, i + 1);
+    }
+  }
+  throw new Error(`函数 ${name} 的大括号不配对`);
+}
+
+/** 把抽出来的函数包成可调用的形式。 */
+function loadCodecHelpers() {
+  const body = ["codecStringFromSps", "nalType", "concatBytes"]
+    .map(extractFunction)
+    .join("\n");
+  return new Function(`${body}\nreturn { codecStringFromSps, nalType, concatBytes };`)();
+}
+
+const { codecStringFromSps, nalType, concatBytes } = loadCodecHelpers();
+
+await test("codecStringFromSps 跳过 4 字节起始码（真机 SPS 回归）", () => {
+  // 一加 12 / Android 16 实测抓到的 SPS：
+  //   00 00 00 01 | 67 | 64 00 32 | ...
+  //   起始码       NAL头  PP  CC  LL
+  //   → profile 100 (High), constraint 0, level 50 → avc1.640032
+  const sps = new Uint8Array([0x00, 0x00, 0x00, 0x01, 0x67, 0x64, 0x00, 0x32, 0xac, 0xb4]);
+  assert.equal(nalType(sps), 7, "应先认出这是 SPS");
+  assert.equal(
+    codecStringFromSps(sps),
+    "avc1.640032",
+    "必须跳过起始码再读 PPCCLL；读到起始码会得到 avc1.000001 并导致解码器 closed",
+  );
+});
+
+await test("codecStringFromSps 跳过 3 字节起始码", () => {
+  const sps = new Uint8Array([0x00, 0x00, 0x01, 0x67, 0x42, 0xE0, 0x1F]);
+  assert.equal(nalType(sps), 7);
+  // 十六进制大小写在 codec 字符串里等价（实测 Chrome 都接受），本实现统一小写
+  assert.equal(codecStringFromSps(sps).toLowerCase(), "avc1.42e01f", "Baseline 3.1");
+});
+
+await test("codecStringFromSps 绝不会返回 avc1.000001 这种无效值", () => {
+  // 任何合法 SPS 都不该产出 profile=0x00 constraint=0x00 level=0x01
+  const samples = [
+    [0x00, 0x00, 0x00, 0x01, 0x67, 0x64, 0x00, 0x32],
+    [0x00, 0x00, 0x01, 0x67, 0x4d, 0x40, 0x28],
+    [0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x1e],
+  ];
+  for (const bytes of samples) {
+    const codec = codecStringFromSps(new Uint8Array(bytes));
+    assert.notEqual(codec, "avc1.000001", `起始码泄漏进 codec 字符串：${codec}`);
+    assert.match(codec, /^avc1\.[0-9a-f]{6}$/u, `codec 字符串形状不对：${codec}`);
+    // profile_idc 为 0 在 H.264 里是未定义值
+    assert.notEqual(codec.slice(5, 7), "00", `profile_idc 为 0：${codec}`);
+  }
+});
+
+await test("codecStringFromSps 对短数据回落到保守值而不是崩", () => {
+  assert.equal(codecStringFromSps(new Uint8Array([0x00, 0x00, 0x01, 0x67])), "avc1.42E01F");
+  assert.equal(codecStringFromSps(new Uint8Array(0)), "avc1.42E01F");
+});
+
+await test("concatBytes 按顺序拼接（关键帧自带参数集）", () => {
+  // 关键帧必须把 SPS+PPS 拼在自己前面一起喂，实测这是唯一能出画面的喂法
+  const sps = new Uint8Array([0x00, 0x00, 0x00, 0x01, 0x67, 0x64, 0x00, 0x32]);
+  const pps = new Uint8Array([0x00, 0x00, 0x00, 0x01, 0x68, 0xee]);
+  const idr = new Uint8Array([0x00, 0x00, 0x00, 0x01, 0x65, 0x88]);
+  const merged = concatBytes(sps, pps, idr);
+
+  assert.equal(merged.length, sps.length + pps.length + idr.length);
+  assert.deepEqual([...merged.slice(0, sps.length)], [...sps], "SPS 应在最前");
+  assert.deepEqual(
+    [...merged.slice(sps.length, sps.length + pps.length)],
+    [...pps],
+    "PPS 应紧随其后",
+  );
+  assert.deepEqual([...merged.slice(sps.length + pps.length)], [...idr], "关键帧应在最后");
+  // 每段自带起始码，所以拼起来仍是合法 Annex B：头 4 字节仍是起始码
+  assert.deepEqual([...merged.slice(0, 4)], [0, 0, 0, 1]);
+});
+
+await test("concatBytes 在 subarray 上工作（真实调用场景）", () => {
+  // 真实代码里 sps/pps/unit 都是同一个大 buffer 上的 subarray，不是独立数组
+  const big = new Uint8Array([0xff, 0x00, 0x00, 0x00, 0x01, 0x67, 0x64, 0x00, 0x32, 0xee]);
+  const sps = big.subarray(1, 9);
+  const merged = concatBytes(sps, big.subarray(9, 10));
+  assert.equal(merged.length, 9);
+  assert.deepEqual([...merged], [0x00, 0x00, 0x00, 0x01, 0x67, 0x64, 0x00, 0x32, 0xee]);
 });
 
 // ── 流会话与多播 ────────────────────────────────────────────────────────

@@ -206,6 +206,7 @@ mobilecli daemon stop
 | `取流失败（HTTP 403）` | 经代理访问但 `trustedAuthorities` 没配 |
 | `取流失败（HTTP 401）` | 令牌过期（10 分钟）。点 ⟲ 重新申请 |
 | `此浏览器不支持 WebCodecs` | H.264 路径需要较新的 Chrome/Edge，且必须从 HTTPS 或 localhost 打开 |
+| `解码失败：Cannot call 'decode' on a closed codec` | 曾因 codec 字符串算错（读到起始码 → `avc1.000001`）导致解码器 closed。0.1.0 起已修；若仍出现，看一眼控制台里 codec 是否形如 `avc1.640032` |
 | 点击位置偏移 | 检查是否在画面黑边上点（黑边事件被忽略）。若整个画面偏移，说明缩放计算有问题 |
 | 工具全报「mobilecli 不可用」 | 装它：`npm i -g mobilecli@latest`，或配 `binaryPath` |
 | `uiautomator dump` 失效 | 这是已知边界：mobilecli 独占 UiAutomation。`mobilecli daemon stop` 后恢复 |
