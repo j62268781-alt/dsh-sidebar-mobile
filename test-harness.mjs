@@ -387,5 +387,223 @@ await test("reference.md 作为附录并入正文", () => {
   assert.ok(bundled.content.includes("命令速查"), "缺少 reference 附录");
 });
 
+// ── 流会话与多播 ────────────────────────────────────────────────────────
+//
+// 这一段用假的 spawn 替身，不需要设备。它锁住的是两个真实踩到过的 bug：
+//   ① 首块消费者不注销 → consumers.size 永不归零 → 空闲自停永不触发
+//   ② 首块转发两次 → 码流里多一个重复 NAL
+// 两者都不会报错，只会表现为"设备一直编码"和"画面偶发花屏"，极难定位。
+
+console.log("\n流会话");
+
+const { StreamSession, StreamSessionPool } = await import("./lib/stream-session.js");
+
+/** 造一个可控的假流进程。 */
+function fakeStream() {
+  const listeners = {};
+  const child = {
+    on: (event, cb) => { (listeners[event] ??= []).push(cb); },
+    emit: (event, ...args) => { for (const cb of listeners[event] ?? []) cb(...args); },
+  };
+  let killed = false;
+
+  const proc = {
+    child,
+    stdout: {
+      on: (event, cb) => { (listeners[`stdout:${event}`] ??= []).push(cb); },
+      emit: (event, ...args) => { for (const cb of listeners[`stdout:${event}`] ?? []) cb(...args); },
+    },
+    stderr: () => "",
+    kill: () => { killed = true; child.emit("exit", 0, null); },
+  };
+
+  return {
+    proc,
+    /** 往会话里推一块数据。 */
+    push: (buf) => { for (const cb of listeners["stdout:data"] ?? []) cb(buf); },
+    /** 模拟进程崩溃（触发 exit）。 */
+    kill: () => proc.kill(),
+    get killed() { return killed; },
+  };
+}
+
+await test("首个消费者拉起进程，后续消费者复用同一进程", () => {
+  let spawns = 0;
+  let current = null;
+  const session = new StreamSession({
+    deviceId: "d",
+    spawn: () => { spawns += 1; current = fakeStream(); return current.proc; },
+    idleStopMs: 100_000,
+  });
+
+  session.addConsumer(() => {});
+  session.addConsumer(() => {});
+  assert.equal(spawns, 1, "不应为每个消费者各起一个进程");
+  assert.equal(session.consumers.size, 2);
+  session.stop();
+});
+
+await test("新消费者会拿到已缓存的首块（否则错过格式）", () => {
+  let current = null;
+  const session = new StreamSession({
+    deviceId: "d",
+    spawn: () => { current = fakeStream(); return current.proc; },
+    idleStopMs: 100_000,
+  });
+
+  session.addConsumer(() => {});
+  const head = Buffer.from([0, 0, 0, 1, 0x67]);
+  current.push(head);
+  assert.equal(session.format.kind, "h264", "首块应被嗅探");
+
+  const received = [];
+  session.addConsumer((c) => received.push(c));
+  assert.equal(received.length, 1, "新消费者应立刻收到首块回放");
+  assert.deepEqual(received[0], head);
+  session.stop();
+});
+
+await test("消费者全部退订后必须归零（空闲自停的前提）", () => {
+  let current = null;
+  const session = new StreamSession({
+    deviceId: "d",
+    spawn: () => { current = fakeStream(); return current.proc; },
+    idleStopMs: 100_000,
+  });
+
+  const a = session.addConsumer(() => {});
+  const b = session.addConsumer(() => {});
+  assert.equal(session.consumers.size, 2);
+  a.remove();
+  b.remove();
+  // 这条断言就是为了锁住那个 bug：曾经的转发实现留下一个永不注销的消费者
+  assert.equal(session.consumers.size, 0, "退订后 consumers 必须归零，否则空闲自停永不触发");
+  session.stop();
+});
+
+await test("remove 幂等：重复调用不会误减计数", () => {
+  const session = new StreamSession({
+    deviceId: "d",
+    spawn: () => fakeStream().proc,
+    idleStopMs: 100_000,
+  });
+  const a = session.addConsumer(() => {});
+  const b = session.addConsumer(() => {});
+  a.remove();
+  a.remove();
+  a.remove();
+  assert.equal(session.consumers.size, 1, "重复 remove 不该影响仍在的消费者");
+  b.remove();
+  assert.equal(session.consumers.size, 0);
+  session.stop();
+});
+
+await test("进程崩溃后自动重启（还有人订阅时）", async () => {
+  let spawns = 0;
+  let current = null;
+  const session = new StreamSession({
+    deviceId: "d",
+    spawn: () => { spawns += 1; current = fakeStream(); return current.proc; },
+    idleStopMs: 100_000,
+    restartDelayMs: 10,
+  });
+
+  session.addConsumer(() => {});
+  assert.equal(spawns, 1);
+  current.kill(); // 模拟崩溃
+  await new Promise((r) => setTimeout(r, 80));
+  assert.equal(spawns, 2, "有消费者时应自动重启");
+  session.stop();
+});
+
+await test("主动 stop 后不再重启（否则退出事件会把刚停的流拉起来）", async () => {
+  let spawns = 0;
+  const session = new StreamSession({
+    deviceId: "d",
+    spawn: () => { spawns += 1; return fakeStream().proc; },
+    idleStopMs: 100_000,
+    restartDelayMs: 10,
+  });
+
+  session.addConsumer(() => {});
+  session.stop();
+  await new Promise((r) => setTimeout(r, 80));
+  assert.equal(spawns, 1, "主动停止后不该被退出事件重新拉起");
+  assert.ok(session.stopped);
+});
+
+await test("无消费者时崩溃不重启（等下次订阅）", async () => {
+  let spawns = 0;
+  let current = null;
+  const session = new StreamSession({
+    deviceId: "d",
+    spawn: () => { spawns += 1; current = fakeStream(); return current.proc; },
+    idleStopMs: 100_000,
+    restartDelayMs: 10,
+  });
+
+  const sub = session.addConsumer(() => {});
+  sub.remove();
+  current.kill();
+  await new Promise((r) => setTimeout(r, 80));
+  assert.equal(spawns, 1, "没人看时不该白白重启");
+  session.stop();
+});
+
+await test("池按 deviceId 复用，stop 后可重新获取", () => {
+  let spawns = 0;
+  const pool = new StreamSessionPool({
+    spawnFor: () => { spawns += 1; return fakeStream().proc; },
+    idleStopMs: 100_000,
+  });
+
+  const a1 = pool.acquire("dev-1");
+  const a2 = pool.acquire("dev-1");
+  assert.equal(a1, a2, "同一设备应复用会话");
+  const b = pool.acquire("dev-2");
+  assert.notEqual(a1, b, "不同设备应各自一条流");
+
+  pool.stop("dev-1");
+  const a3 = pool.acquire("dev-1");
+  assert.notEqual(a1, a3, "stop 后应能重新获取");
+  pool.stopAll();
+  assert.equal(pool.sessions.size, 0);
+});
+
+await test("停止的会话拒绝新订阅（而不是静默失效）", () => {
+  const session = new StreamSession({
+    deviceId: "d",
+    spawn: () => fakeStream().proc,
+    idleStopMs: 100_000,
+  });
+  session.stop();
+  assert.throws(() => session.addConsumer(() => {}), /stopped/);
+});
+
+await test("sendInput 拼出的命令形状正确", async () => {
+  const session = new StreamSession({
+    deviceId: "dev-1",
+    spawn: () => fakeStream().proc,
+    idleStopMs: 100_000,
+  });
+  const seen = [];
+  const run = async (args) => { seen.push(args); return {}; };
+
+  await session.sendInput(run, { action: "tap", x: 10, y: 20 });
+  assert.deepEqual(seen[0], ["io", "tap", "--device", "dev-1", "10,20"]);
+
+  await session.sendInput(run, { action: "swipe", x1: 1, y1: 2, x2: 3, y2: 4 });
+  assert.deepEqual(seen[1], ["io", "swipe", "--device", "dev-1", "1,2,3,4"]);
+
+  await session.sendInput(run, { action: "longpress", x: 5, y: 6, duration: 800 });
+  assert.deepEqual(seen[2], ["io", "longpress", "--device", "dev-1", "5,6", "--duration", "800"]);
+
+  await session.sendInput(run, { action: "button", name: "HOME" });
+  assert.deepEqual(seen[3], ["io", "button", "--device", "dev-1", "HOME"]);
+
+  await assert.rejects(() => session.sendInput(run, { action: "nope" }), /不支持的操作/);
+  session.stop();
+});
+
 console.log(`\n结果：${passed} 通过，${failed} 失败`);
 process.exit(failed === 0 ? 0 : 1);
