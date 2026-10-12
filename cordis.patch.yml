@@ -1,0 +1,65 @@
+# dsh-mobile-cli 的挂载层。
+#
+# 本插件把 mobilecli 二进制封装成 DSH 的设备层：Host 侧负责进程/流/工具，
+# Client 侧负责右侧边栏的实时画面与点击转发。
+#
+# 它不依赖 @deepseek-ai/dsh-mcp-client —— mobilecli 不是 MCP server，而是一个
+# 自带 JSON-RPC 接口的 Go 二进制。Host 半个自己管它的生命周期。
+- insert:
+    - id: dsh-mobile-cli
+      name: '@j62268781-alt/dsh-mobile-cli'
+      config:
+        # 部署层总开关。关掉后插件仍会加载，但不挂流路由、不注册工具与技能。
+        enabled: true
+
+        # mobilecli 二进制路径。
+        #   null（默认）→ 自动解析：MOBILECLI_PATH 环境变量 → PATH 上的 mobilecli
+        #                 → 本包 node_modules 里的平台包
+        #   字符串      → 直接用这个路径（绝对路径，或能被 PATH 解析的命令名）
+        binaryPath: null
+
+        # mobilecli daemon 的状态目录（MOBILECLI_HOME）。
+        #   null（默认）→ ~/.mobilecli，即 mobilecli 自己的默认值
+        # 多个 DSH profile 想各用各的 daemon 时，各自指一个目录即可。
+        # ⚠️ 同一个 daemon 同时只能服务一个 DSH 进程，详见 README「已知边界」。
+        homeDir: null
+
+        # 流路由的挂载前缀（`/_dsh/dsh-mobile-cli/*`）。改动通常没有必要。
+        routePrefix: '/_dsh/dsh-mobile-cli'
+
+        # 是否把 mobilecli 自带的 skill（skills/mobilecli/*.md）注册给模型。
+        # 关掉只影响「模型知不知道这套命令」，不影响面板与工具本身。
+        registerSkills: true
+
+        # 流的中断策略。
+        stream:
+          # 没有任何消费者（面板关着、没有卡片挂着）时，多少秒后停掉流。
+          # 停掉不是崩溃：下一次打开面板或调用工具会自动重启。
+          idleStopSeconds: 300
+
+          # 流崩了之后自动重启的延迟（毫秒）。
+          restartDelayMs: 5000
+
+          # 单条流的帧率上限（0 = 不限制，交给 mobilecli 与设备）。
+          # ⚠️ 实测 mobilecli 的 --fps 参数当前不生效（请求 15/30 都是 ~104fps），
+          #    所以这里默认交给对端；真需要限速时再由 Host 侧按帧丢弃。
+          maxFps: 0
+
+          # 默认缩放。0.5 在 iOS 模拟器上实测 104fps / 6.6Mbps，
+          # 全分辨率 131fps / 20.6Mbps。画质优先就改成 1.0。
+          defaultScale: 1.0
+
+        # 面板尺寸的默认值（用户可在面板里改，改完记在本地）。
+        panel:
+          # 'fit' | 50 | 75 | 100 | 125
+          defaultSize: 'fit'
+          # 'frameless' | 'bezel' | 'device'
+          defaultFrame: 'bezel'
+
+        # 安全：经过反向代理访问时，把对外的 authority 显式列在这里，
+        # 否则 Host 头不是 loopback 的请求一律 403。
+        # 与 dsh-android 的 trustedAuthorities 同一套语义：
+        #   host            → 任意 Host 端口
+        #   host:port       → 精确匹配
+        #   https://host:port → 同时钉住 scheme
+        trustedAuthorities: []

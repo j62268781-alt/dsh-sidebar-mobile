@@ -1,0 +1,63 @@
+{
+  "name": "@j62268781-alt/dsh-mobile-cli",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "把 mobilecli 封装成 DSH 的移动设备层：右侧边栏实时画面 + 直接操作，一套 API 同时覆盖 iOS 与 Android，并把 mobilecli 自带的 skill 一并注册给模型。Wraps mobilecli as a DeepSeek Harness device layer — a live device panel in the right sidebar with direct interaction, one API for iOS and Android, plus the bundled mobilecli skill registered for the model.",
+  "license": "MIT",
+  "author": "j62268781-alt",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "deepseek",
+    "mobile",
+    "mobilecli",
+    "ios",
+    "android",
+    "simulator",
+    "emulator",
+    "device",
+    "screen-mirror",
+    "flutter"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/j62268781-alt/dsh-mobile-cli.git"
+  },
+  "homepage": "https://github.com/j62268781-alt/dsh-mobile-cli#readme",
+  "bugs": {
+    "url": "https://github.com/j62268781-alt/dsh-mobile-cli/issues"
+  },
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "scripts": {
+    "test": "node test-harness.mjs",
+    "check": "node --check index.js",
+    "verify": "npm run check && npm test",
+    "prepublishOnly": "npm run verify"
+  },
+  "engines": {
+    "node": ">=20",
+    "dsh": ">=0.2.0-0"
+  },
+  "files": [
+    "index.js",
+    "lib",
+    "skills",
+    "cordis.patch.yml",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "access": "public"
+  }
+}
