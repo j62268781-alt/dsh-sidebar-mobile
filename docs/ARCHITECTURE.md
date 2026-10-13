@@ -9,15 +9,18 @@
   │  只经 DSH 自己的 web 源，从不接触 mobilecli 的端口
   ▼
 lib/client.js            tab 类型 + 正文组件；两条渲染路径（H.264 / MJPEG）
+  │  ⚠️ 这是**构建产物**（源码在 src/client/，见「为什么客户端要构建」）
   │  fetch POST /_dsh/dsh-sidebar-mobile/{grant,control,device-action,status}
   │  <img|canvas> GET …/stream/<token>
   ▼
-lib/stream-routes.js     路由分发、body 解析、错误收敛
-  ├── lib/stream-access.js    签名令牌 + loopback 围栏
-  └── lib/stream-session.js   单流多播、空闲自停、崩溃重启
+lib/stream/routes.js     路由分发、body 解析、错误收敛
+  ├── lib/stream/access.js    签名令牌 + loopback 围栏
+  └── lib/stream/session.js   单流多播、空闲自停、崩溃重启
         │
         ▼
-lib/mobilecli.js         二进制解析、execFile 调用、spawn 流进程
+lib/device/mobilecli.js  二进制解析、execFile 调用、spawn 流进程
+        ├── lib/device/android-toolchain.js  adb 体检
+        └── lib/device/daemon-rpc.js         daemon socket 的 JSON-RPC（交互加速）
         │
         ▼
 mobilecli（Go 二进制）
@@ -26,10 +29,19 @@ mobilecli（Go 二进制）
 设备
 ```
 
-Host 侧另有两个平级的模块：
+`lib/` 按职责分目录，同类放在一起：
 
-- `lib/tools.js` —— 16 个模型工具，全部经 `defineTool` 注册
-- `lib/skills.js` —— 把打包的 mobilecli playbook 注册给模型
+| 目录 | 放什么 |
+|---|---|
+| `lib/`（根） | 仅 `client.js` —— 唯一一个构建产物，刻意不放进子目录，让"它是生成的"一眼可见 |
+| `lib/device/` | 怎么跟设备说话：二进制解析、CLI 调用、daemon RPC、adb 体检 |
+| `lib/stream/` | 视频流的整条链路：令牌、会话池、HTTP 路由 |
+| `lib/agent/` | 给模型的那一面：工具定义、skill 注册、宿主契约转发层 |
+
+Host 侧的 agent 模块：
+
+- `lib/agent/tools.js` —— 11 个模型工具，全部经 `defineTool` 注册
+- `lib/agent/skills.js` —— 把打包的 mobilecli playbook 注册给模型
 
 `index.js` 负责接线，并用 `ctx.effect` 保证卸载时全部注销。
 
@@ -188,13 +200,58 @@ H.264 没有这种待遇，必须自己解。几个必要处理：
 修好之后 `contain` 退化为恒等映射（画面与容器同比例、已居中），坐标换算里的
 偏移量恒为 0 —— 但那段代码保留着，因为容器比例仍可能与设备不同。
 
-### 为什么客户端不用 JSX / 不用构建
+### 为什么客户端要构建（以及为什么产物进仓库）
 
-DSH 把 client bundle 当**经典脚本**求值（官方产物 0 个顶层 import）。别的插件靠 esbuild 预转译，那会引入构建步骤与 devDependencies。
+**先摆硬约束**：DSH 把 client bundle 当**经典脚本**求值 —— 它只做
+`window.__ModuleLoader__` 的注册，不做任何转译。运行时解析器只有四条分支
+（DSH 源码原文）：
 
-本插件承诺零运行时依赖，也不想让使用者为了改一行样式就装工具链，所以直接用 `React.createElement`（别名 `h`）。单文件、无需构建、改完刷新即生效。
+```
+seed word → memoized record → graph row → registered factory;
+anything else → throw (loud — the runtime mirror of the build-time bundle purity gate)
+```
 
-代价是写起来啰嗦。对一个面板来说可以接受。
+所以**不编译就既不能写 JSX，也不能拆文件** —— 相对 `require` 只对打包器产出的
+chunk 有效，手写的兄弟文件解析不到。DSH 自己的客户端插件同样是打包出来的
+（`packages/client/tsdown.client.ts`）。
+
+早先的做法是接受这个约束、手写 `h(...)` 单文件。后来改了，因为：
+
+- `h(...)` 嵌套到第四层就读不动了，54 处调用全是括号
+- CSS 与布局挤在同一个文件里，改样式要在 1800 行里翻
+
+**现在的做法**：源码是 `src/client/index.jsx`（JSX）+ `src/client/styles.css`
+（样式），`npm run build` 经 esbuild 生成 `lib/client.js`。
+
+三个刻意的决定：
+
+1. **只转译、不打包**（用 esbuild 的 `transform`，不是 `build`）。
+   产物必须保留 `window.__ModuleLoader__.load({ factory(require) {...} })`
+   外壳，`require("react")` 也得留着 —— react 由宿主注入，打进产物就违反
+   purity，还会和宿主的 React 变成两份实例。
+2. **`jsxFactory: "h"`**：JSX 编译成 `h(...)`，与改造前同构。好处是产物仍是
+   一堆 `h(...)` 调用，既有的源码断言测试继续有效（改成自动运行时 `_jsx(...)`
+   会让十几处断言全部重写）。
+3. **产物提交进仓库**。本插件以 **git 依赖**安装
+   （profile 里写的是 `github:j62268781-alt/dsh-sidebar-mobile`），提交产物能让
+   安装方**完全不需要工具链** —— esbuild 只是 devDependency。
+
+产物进仓库的代价是**会漂移**（改了 src 忘了构建，安装方拿到的还是旧文件，
+这种 bug 极难察觉）。所以 `npm run verify` 里有一道 `build:check`：重新构建
+一遍并与提交的产物逐字节比对，不一致就直接失败。
+
+另外两个构建细节，都是踩过的坑：
+
+- **`charset: "utf8"` 必须显式设**。esbuild 默认 `ascii`，会把每个非 ASCII
+  字符转义成 `\uXXXX` —— 对本项目（字符串与注释几乎全中文）会让产物变成
+  一屏 `\u771F\u673A`，没法读也没法 review。实测确认过这个默认值。
+- 构建时剥掉 esbuild 给每个 JSX 元素加的 `/* @__PURE__ */` 标注：那是给
+  下游打包器摇树用的，本插件不打包产物，留着只会弄脏提交的文件。
+
+CSS 走占位符 `__CLIENT_CSS__` **内联**成字符串常量，而不是让客户端去 fetch：
+DSH 把插件注入的 `<style>` 标签纳入生命周期管理（打 `data-plugin`、卸载时
+清理），内联正好走这条既有通道；异步 fetch 会引入首屏无样式闪烁，还多一条
+失败路径。
 
 ### 为什么可以 require primitives（官方组件库）
 
@@ -442,6 +499,6 @@ mobilecli 的 `dump ui --format json` 返回**嵌套树**（子节点挂在 `chi
 
 `package.json` 没有 `dependencies`。`react` 用宿主提供的（`require("react")`），`@deepseek-ai/*` 同理。
 
-`lib/tool-support.js` 把"依赖宿主"收敛到一处：`defineTool` 与 `ToolArgsError` 由 `@deepseek-ai/dsh-tools` 提供。不自己实现它们，因为 `defineTool` 负责 schema 编译与校验，自己实现会与宿主规则产生偏差，而偏差的表现是"工具在某些参数下静默失败"。
+`lib/agent/tool-support.js` 把"依赖宿主"收敛到一处：`defineTool` 与 `ToolArgsError` 由 `@deepseek-ai/dsh-tools` 提供。不自己实现它们，因为 `defineTool` 负责 schema 编译与校验，自己实现会与宿主规则产生偏差，而偏差的表现是"工具在某些参数下静默失败"。
 
 ⚠️ 这个 import 在没有宿主的环境会失败，所以 `test-harness.mjs` 只加载纯逻辑模块，不加载 `tools.js` / `index.js`。

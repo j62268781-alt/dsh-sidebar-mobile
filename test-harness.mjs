@@ -13,20 +13,20 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import net from "node:net";
 import { Readable } from "node:stream";
-import { Mobilecli, resolveBinary } from "./lib/mobilecli.js";
-import { StreamRoutes } from "./lib/stream-routes.js";
+import { Mobilecli, resolveBinary } from "./lib/device/mobilecli.js";
+import { StreamRoutes } from "./lib/stream/routes.js";
 import {
   resolveSocketPath,
   callDaemon,
   rpcForInput,
   rpcForDeviceAction,
   DaemonRpc,
-} from "./lib/daemon-rpc.js";
+} from "./lib/device/daemon-rpc.js";
 
 let passed = 0;
 let failed = 0;
@@ -238,7 +238,7 @@ const {
   isLoopbackRemoteAddress,
   isSameOriginRequest,
   parseTrustedAuthority,
-} = await import("./lib/stream-access.js");
+} = await import("./lib/stream/access.js");
 
 await test("loopback 判定覆盖 IPv4 / IPv6 / mapped / 非本机", () => {
   for (const addr of ["127.0.0.1", "::1", "::ffff:127.0.0.1", "127.0.0.53"]) {
@@ -358,7 +358,7 @@ await test("同源校验：跨站 POST 被拒，无 Origin 交给围栏兜底", 
 
 console.log("\n流格式嗅探");
 
-const { sniffStreamFormat } = await import("./lib/stream-session.js");
+const { sniffStreamFormat } = await import("./lib/stream/session.js");
 
 await test("识别 H.264 Annex B（4 字节起始码）", () => {
   const head = Buffer.from([0, 0, 0, 1, 0x67, 0x42, 0x00, 0x1e]);
@@ -387,7 +387,7 @@ await test("空 / 未知数据不误判", () => {
 
 console.log("\n交互输入校验");
 
-const { validateInput } = await import("./lib/stream-routes.js");
+const { validateInput } = await import("./lib/stream/routes.js");
 
 await test("tap 要求数值型坐标", () => {
   assert.ok(validateInput("tap", { x: 10, y: 20 }).ok);
@@ -444,7 +444,7 @@ await test("未知 action 被拒", () => {
 
 console.log("\n路由匹配");
 
-const { matchRouteName } = await import("./lib/stream-routes.js");
+const { matchRouteName } = await import("./lib/stream/routes.js");
 const PREFIX = "/_dsh/dsh-sidebar-mobile";
 
 await test("匹配已知路由", () => {
@@ -475,7 +475,7 @@ await test("拒绝未知路由与裸前缀", () => {
 console.log("\n背压对齐");
 
 const { findStartCode, lastStartCode, findBoundary, lastBoundary } =
-  await import("./lib/stream-routes.js");
+  await import("./lib/stream/routes.js");
 
 /** 造一段真实的 MJPEG multipart 数据（帧内含 00 00 01 序列）。 */
 function fakeMjpeg(boundary, frameCount, filler) {
@@ -682,7 +682,7 @@ await test("没有选中设备时仍然 409（去掉预检查不能连带丢掉�
 console.log("\nAndroid 工具链（adb）");
 
 const { findAdb, parseAdbDevices, describeAdbProblem, probeAdb, AdbProbe } =
-  await import("./lib/android-toolchain.js");
+  await import("./lib/device/android-toolchain.js");
 
 await test("parseAdbDevices 解析真实输出（含 -l 的 key:value）", () => {
   const out = [
@@ -804,7 +804,7 @@ await test("adb 装了但当前进程看不到 → 提示重启 DSH，而不是�
 });
 
 await test("findAdbOutsideEnv：能从常见安装位置找到 adb（不依赖 PATH）", async () => {
-  const { findAdbOutsideEnv } = await import("./lib/android-toolchain.js");
+  const { findAdbOutsideEnv } = await import("./lib/device/android-toolchain.js");
   // 造一个"常见位置"，确认它真的会被查到
   const fakeDrive = join(tmpdir(), "adb-outside");
   const target = join(fakeDrive, "Android", "platform-tools");
@@ -842,7 +842,7 @@ await test("AdbProbe：短时间内的重复查询命中缓存，invalidate 能�
 
 console.log("\n技能注册");
 
-const { parseFrontmatter, loadBundledSkill } = await import("./lib/skills.js");
+const { parseFrontmatter, loadBundledSkill } = await import("./lib/agent/skills.js");
 
 await test("frontmatter 解析：标量 + 折叠块 + 正文切分", () => {
   const { attributes, body } = parseFrontmatter(
@@ -1002,12 +1002,16 @@ await test("注册了 tab 标签 slot（否则标签上没有图标）", () => {
 
 console.log("\n面板外观");
 
-/** 把 client.js 里的 CSS 模板取出来做断言。 */
+/**
+ * 面板样式文本。
+ *
+ * ⚠️ 直接读 `src/client/styles.css`，**不要**再去 `lib/client.js` 里抠模板：
+ * 样式已经拆成独立文件，构建时被内联成**一个 JSON 字符串**（单行）。
+ * 从产物里正则抠 CSS 既脆又难读，而断言的本来就是"样式写了什么"，
+ * 源文件才是它该待的地方。
+ */
 function panelCss() {
-  const source = readFileSync(new URL("./lib/client.js", import.meta.url), "utf8");
-  const match = source.match(/const CSS = `([\s\S]*?)`;/u);
-  if (match === null) throw new Error("client.js 里找不到 CSS 模板");
-  return match[1];
+  return readFileSync(new URL("./src/client/styles.css", import.meta.url), "utf8");
 }
 
 await test("工具栏按钮用官方 Button（28px），而不是自绘的 26px 小方块", () => {
@@ -1478,7 +1482,7 @@ await test("concatBytes 在 subarray 上工作（真实调用场景）", () => {
 console.log("\n流会话");
 
 const { StreamSession, StreamSessionPool, DEFAULT_SWIPE_DURATION_MS } =
-  await import("./lib/stream-session.js");
+  await import("./lib/stream/session.js");
 
 /** 造一个可控的假流进程。 */
 function fakeStream() {
@@ -1774,7 +1778,13 @@ await test("面板捕获按键但不吞 DSH 快捷键（作用域 + 放行规则
   assert.ok(!/window\.addEventListener\(\s*["']key/u.test(source), "不得全局监听 keydown");
   assert.ok(!/document\.addEventListener\(\s*["']key/u.test(source), "不得在 document 上监听 keydown");
   // 画面要可聚焦
-  assert.ok(source.includes("tabIndex: interactive ? 0 : undefined"), "画面元素缺 tabIndex，无法聚焦");
+  //
+  // ⚠️ 接受 `undefined` 与 `void 0` 两种写法：esbuild 会把前者改写成后者
+  // （语义相同）。钉死字面量只会让"重新构建"变成一次无谓的失败。
+  assert.ok(
+    /tabIndex: interactive \? 0 : (undefined|void 0)/u.test(source),
+    "画面元素缺 tabIndex，无法聚焦",
+  );
   // ⌘/Ctrl 组合除编辑键外要放行
   assert.ok(source.includes("EDIT_KEYS"), "缺少修饰键放行名单，会吞掉 ⌘R 等浏览器快捷键");
   // 必须合批（逐字符发 = 每字符 100ms，没法用）
@@ -1875,7 +1885,7 @@ await test("只注册加工型工具，薄包装不许回流", () => {
    * 在没有宿主的环境会直接抛（见 lib/tool-support.js 的说明）。
    * 所以按本仓库惯例：读源码 + 先剥注释（注释里会引用工具名，不剥会骗过断言）。
    */
-  const source = stripComments(readFileSync(new URL("./lib/tools.js", import.meta.url), "utf8"));
+  const source = stripComments(readFileSync(new URL("./lib/agent/tools.js", import.meta.url), "utf8"));
 
   /**
    * 注册表 = 源码里的 `[TOOL_NAMES.x]: y` 注册项。
@@ -1938,7 +1948,7 @@ await test("被删工具的关键知识必须留在 skill 里（否则是净损�
 });
 
 await test("skill 的触发描述不许覆盖工具已能做的场景", async () => {
-  const { loadBundledSkill } = await import("./lib/skills.js");
+  const { loadBundledSkill } = await import("./lib/agent/skills.js");
   const skill = loadBundledSkill();
   assert.ok(skill !== null, "skill 未加载");
 
@@ -2010,7 +2020,7 @@ await test("客户端必须有断流自动重连（而不是停在『流已结�
 });
 
 await test("流启动成功后 crashCount 要归零（否则退避单向累积到 30s）", () => {
-  const source = stripComments(readFileSync(new URL("./lib/stream-session.js", import.meta.url), "utf8"));
+  const source = stripComments(readFileSync(new URL("./lib/stream/session.js", import.meta.url), "utf8"));
   /**
    * ⚠️ crashCount 原先只在**空闲自停**时归零，会单向累积：
    * 一次抖动 + 一次设备忙碌就能把退避推到 30s 上限，此后即使流跑得很好，
@@ -2488,7 +2498,7 @@ await test("状态栏用同一个映射（避免与下拉自相矛盾）", () =>
 console.log("\n离线设备");
 
 await test("grant 必须包含离线设备（否则与面板列表自相矛盾）", () => {
-  const source = stripComments(readFileSync(new URL("./lib/stream-routes.js", import.meta.url), "utf8"));
+  const source = stripComments(readFileSync(new URL("./lib/stream/routes.js", import.meta.url), "utf8"));
   const grant = source.slice(source.indexOf("async #grant"));
   const head = grant.slice(0, grant.indexOf("#status") === -1 ? 2000 : 2000);
   assert.ok(
@@ -2498,7 +2508,7 @@ await test("grant 必须包含离线设备（否则与面板列表自相矛盾�
 });
 
 await test("选中离线模拟器会自动启动，且 boot 失败不影响选中", () => {
-  const source = stripComments(readFileSync(new URL("./lib/stream-routes.js", import.meta.url), "utf8"));
+  const source = stripComments(readFileSync(new URL("./lib/stream/routes.js", import.meta.url), "utf8"));
   // 只有虚拟设备才 boot（真机 boot 无意义）
   assert.ok(/"simulator"/u.test(source) && /"emulator"/u.test(source), "应识别 simulator 与 emulator");
   assert.ok(/device", "boot"/u.test(source), "应调用 device boot");
@@ -2527,6 +2537,68 @@ await test("面板会提示正在启动（冷启动数分钟，否则看起来�
   );
   // bootError 要显示给用户
   assert.ok(source.includes("bootError"), "bootError 应显示给用户，否则黑屏无解释");
+});
+
+// ── 客户端源码与构建 ────────────────────────────────────────────────────
+//
+// 客户端现在是「源码 + 产物」两分：src/client/ 手写，lib/client.js 由
+// scripts/build-client.mjs 生成且**提交进仓库**（安装方是 git 依赖，这样
+// 他们不需要工具链）。产物会漂移，所以 build:check 在 verify 里拦它。
+//
+// 下面这些守的是"源码该长什么样"：用了 JSX 就别再退回手写 h(...)，
+// 样式就该待在 styles.css 里。
+
+console.log("\n客户端源码与构建");
+
+const SRC_CLIENT = new URL("./src/client/index.jsx", import.meta.url);
+const SRC_STYLES = new URL("./src/client/styles.css", import.meta.url);
+
+await test("客户端源码用 JSX，没有手写 h(...) 调用", () => {
+  const source = stripComments(readFileSync(SRC_CLIENT, "utf8"));
+  // 只找真正的调用（排除 hintText( / fetch( 这类同尾名）
+  const calls = source.match(/(?:^|[^\w.$])h\(/gmu) ?? [];
+  assert.equal(
+    calls.length, 0,
+    `还有 ${calls.length} 处手写 h(...)。源码是 JSX，新增元素请用 JSX 写`
+      + `（产物里的 h(...) 是构建产生的，不要直接改 lib/client.js）。`,
+  );
+});
+
+await test("样式在 styles.css 里，没有留在 JSX 源码中", () => {
+  const jsx = stripComments(readFileSync(SRC_CLIENT, "utf8"));
+  // JSX 侧只应保留占位符，不应再出现真实 CSS 规则
+  assert.ok(jsx.includes("__CLIENT_CSS__"), "缺少 CSS 占位符，样式不会被注入");
+  assert.ok(
+    !/\.mbm-[a-z-]+\s*\{/u.test(jsx),
+    "JSX 源码里出现了 CSS 规则 —— 样式应写在 src/client/styles.css",
+  );
+  const css = readFileSync(SRC_STYLES, "utf8");
+  assert.ok(css.includes(".mbm-root"), "styles.css 里找不到面板根样式");
+});
+
+await test("构建配置守住两条易错项（utf8 与 jsxFactory=h）", () => {
+  const source = stripComments(readFileSync(new URL("./scripts/build-client.mjs", import.meta.url), "utf8"));
+  // esbuild 默认 charset=ascii，会把中文转义成 \uXXXX，产物没法读
+  assert.ok(/charset:\s*"utf8"/u.test(source), "构建没设 charset=utf8，产物里的中文会被转义");
+  // jsxFactory=h 让产物与改造前同构，既有断言测试才继续有效
+  assert.ok(/jsxFactory:\s*"h"/u.test(source), "构建没把 JSX 编译成 h(...)");
+  // 必须是 transform（只转译），不是 build（会打包并试图解析 react）
+  assert.ok(/from "esbuild"/u.test(source), "应使用 esbuild");
+  assert.ok(!/\bbuild\s*\(/u.test(source), "不要用 esbuild 的 build()：会把 react 打进产物，违反 bundle purity");
+});
+
+await test("lib 按职责分目录，且只有 client.js 留在根下", () => {
+  // fs 直接接受 URL 对象，省掉 dirname(fileURLToPath(...)) 那串转换
+  const loose = readdirSync(new URL("./lib", import.meta.url), { withFileTypes: true })
+    .filter((e) => e.isFile())
+    .map((e) => e.name);
+  assert.deepEqual(
+    loose, ["client.js"],
+    "lib/ 根下只应有构建产物 client.js；其余模块按 device/ stream/ agent/ 归位",
+  );
+  for (const dir of ["device", "stream", "agent"]) {
+    assert.ok(existsSync(new URL(`./lib/${dir}`, import.meta.url)), `缺少 lib/${dir}/`);
+  }
 });
 
 console.log(`\n结果：${passed} 通过，${failed} 失败`);

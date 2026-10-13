@@ -22,7 +22,7 @@
 - 🐦 **能读 Flutter 的真实 widget 树**：绕过无障碍投影，直连 Dart VM Service
 - 🎓 **自带 mobilecli 的 skill**：把上游 playbook 打包注册给模型，不用自己往 `.agents/` 抄
 - 🔐 **浏览器从不接触设备端口**：只经 DSH 自己的 web 源，签名令牌 + loopback 围栏
-- 📦 **零运行时依赖**：`react` 用宿主那份，客户端单文件、无需构建
+- 📦 **零运行时依赖**：`react` 用宿主那份；客户端源码是 JSX，但**产物已提交**，安装方无需工具链（见[开发与自测](#开发与自测)）
 
 **目录**：[它解决什么问题](#它解决什么问题) · [安装](#安装) · [配置](#配置) · [使用](#使用) · [安全模型](#安全模型) · [已知边界](#已知边界) · [更多文档](#更多文档) · [License](#license)
 
@@ -244,15 +244,34 @@ mobilecli 仓库里的 playbook（`SKILL.md` + `reference.md`）被原样打包�
 - **多个 DSH 进程不能共用同一个 daemon**。需要并行时给每个 profile 配不同的 `homeDir`。
 - **⚠️ 从源码装时不能用软链**。本插件的 Host 半 import 宿主包（`@deepseek-ai/dsh-tools`），而 Node 的 ESM 解析会以软链的**真实路径**为基准去找 `node_modules`——源码目录下没有那些包，于是启动日志报 `failed to import`（伴随 `1 entry did not activate`）。**实测对照**：同一个插件软链失败、真实目录成功。用 `dsh plugin add "link:$PWD"` 或 `cp -R` 成真实目录，见 [docs/DEPLOY-DSH.md](docs/DEPLOY-DSH.md)。发到 npm 后不受影响。
 
-## 自测
+## 开发与自测
 
-```bash
-npm test          # 134 项，无设备也能跑完（有设备时额外验证真实调用）
-npm run check     # 语法检查
-npm run verify    # 两者都跑
+客户端半边有**源码与产物之分**，改客户端代码前先看这一节：
+
+```
+src/client/index.jsx    ← 手写源码（JSX）
+src/client/styles.css   ← 手写源码（样式）
+lib/client.js           ← 构建产物，已提交进仓库；安装方加载的就是它
+scripts/build-client.mjs
 ```
 
-自测覆盖：二进制四级解析（含 Windows shim 回归）、adb 体检与六类失败诊断、错误归一化、令牌签名与篡改检测、loopback 围栏（含 DNS rebinding）、流格式嗅探、交互输入校验（含 swipe duration 透传）、路由匹配、skill frontmatter 剥离。
+```bash
+npm run build       # 由 src/client/ 生成 lib/client.js —— 改完客户端必须跑
+npm test            # 138 项，无设备也能跑完（有设备时额外验证真实调用）
+npm run check       # Host 半边语法检查
+npm run build:check # 校验 lib/client.js 与 src/client/ 是否同步
+npm run verify      # build:check + check + test（提交前跑这个）
+```
+
+> ⚠️ **改了 `src/client/` 一定要 `npm run build` 并一起提交**。
+> 产物进仓库是为了让安装方（git 依赖）完全不需要工具链，代价是它会漂移 ——
+> `build:check` 就是拦这个的：它重新构建一遍并与提交的产物逐字节比对，
+> 不一致就失败。忘了构建而只提交源码，安装方拿到的仍是旧面板。
+
+`lib/` 按职责分目录（`device/` 怎么跟设备说话、`stream/` 视频流链路、
+`agent/` 给模型的那一面），唯一放在根下的 `client.js` 就是上面那个构建产物。
+
+自测覆盖：二进制四级解析（含 Windows shim 回归）、adb 体检与六类失败诊断、错误归一化、令牌签名与篡改检测、loopback 围栏（含 DNS rebinding）、流格式嗅探、交互输入校验（含 swipe duration 透传）、路由匹配、skill frontmatter 剥离、客户端构建产物是否过期。
 
 ## 更多文档
 

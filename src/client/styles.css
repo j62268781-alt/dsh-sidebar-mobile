@@ -1,0 +1,71 @@
+.mbm-root { display: flex; flex-direction: column; height: 100%; min-height: 0; gap: 8px; padding: 8px;
+  font-size: 12px; color: var(--dsw-alias-label-primary, #1f2329); }
+/* 一行工具栏：左边设备下拉，右边动作按钮 */
+.mbm-bar { display: flex; align-items: center; gap: 8px; }
+/* 设备下拉：高 28 与官方 sm 按钮齐平。
+   原生箭头会吃掉右侧内边距（左 8 / 右 0 的视觉歪斜就是它造成的），
+   所以 appearance:none 关掉它，再自绘一个官方 chevron。 */
+.mbm-selectWrap { position: relative; display: flex; flex: 1; min-width: 0; max-width: 220px; }
+.mbm-select { font: inherit; height: 28px; width: 100%; min-width: 0;
+  appearance: none; -webkit-appearance: none;
+  padding: 0 26px 0 8px; border-radius: var(--dsw-radius-sm, 6px);
+  border: 1px solid var(--dsw-alias-border-l2, #d0d5dd);
+  background: var(--dsw-alias-bg-layer-1, #fff); color: inherit; cursor: pointer; }
+.mbm-select:disabled { opacity: .5; cursor: default; }
+/* 自绘箭头：文字左内边距 8px；右侧 6px + 16px 箭头 ≈ 视觉上也是 8px */
+.mbm-selectCaret { position: absolute; top: 50%; right: 6px; transform: translateY(-50%);
+  width: 16px; height: 16px; pointer-events: none;
+  color: var(--dsw-alias-label-tertiary, #98a2b3); }
+/* 动作按钮：靠右，自身小间距 */
+.mbm-actions { display: flex; align-items: center; gap: 2px; margin-left: auto; }
+/* 官方 Button 是 28px 高的方形容器；这里只补「图标按钮」的宽度与内边距。
+   不加边框、不加背景——hover 填充由 Button 的 ghost 变体提供。 */
+.mbm-tool { width: 28px; padding: 0; color: var(--dsw-alias-label-secondary, #667085); }
+.mbm-tool:hover:not(:disabled) { color: var(--dsw-alias-label-primary, #1f2329); }
+.mbm-stage { position: relative; flex: 1; min-height: 120px; display: flex; align-items: center;
+  justify-content: center; overflow: hidden; border-radius: 10px;
+  background: var(--dsw-alias-bg-layer-2, #f4f5f7);
+  border: 1px solid var(--dsw-alias-border-l2, #e4e7ec); }
+.mbm-stage[data-frame="device"] { padding: 10px; background: #101114; }
+.mbm-stage[data-frame="frameless"] { border: none; background: transparent; }
+/* 媒体元素：CSS 尺寸由 JS 按帧的真实宽高比算好写进 style（见 fitCanvasToFrame）。
+   这里只加 flex:none —— 否则 flex 容器会把它拉伸/压缩，宽高比又丢了。
+   max-* 作为兜底：万一 JS 还没跑到，也不至于溢出容器。 */
+.mbm-media { display: block; flex: none; max-width: 100%; max-height: 100%; }
+/* 画面获得键盘焦点时给一圈提示 —— 否则用户不知道打字会送到哪里。
+   只在键盘聚焦时显示（:focus-visible），鼠标点选不闪边框。 */
+.mbm-media:focus { outline: none; }
+.mbm-media:focus-visible { outline: 2px solid var(--dsw-alias-brand-primary, #4d6bfe);
+  outline-offset: 2px; }
+.mbm-stage[data-frame="device"] .mbm-media { border-radius: 18px; }
+.mbm-stage[data-frame="bezel"] .mbm-media { border-radius: 10px; }
+.mbm-hint { position: absolute; inset: 0; display: flex; flex-direction: column; gap: 6px;
+  align-items: center; justify-content: center; text-align: center; padding: 16px;
+  color: var(--dsw-alias-label-tertiary, #667085); line-height: 1.6; }
+.mbm-hint[data-overlay="1"] { background: rgba(16,17,20,.72); color: #fff; }
+.mbm-dot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; margin-right: 5px; }
+.mbm-dot[data-on="1"] { background: #22c55e; }
+.mbm-dot[data-on="0"] { background: #9aa4b2; }
+/* data-on="2" = 正在启动设备。琥珀色 + 呼吸动画：既区别于「正常 / 未串流」，
+   又表明「在动，等着就好」，而不是故障。 */
+.mbm-dot[data-on="2"] { background: #f59e0b; animation: mbm-pulse 1.2s ease-in-out infinite; }
+@keyframes mbm-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
+.mbm-status { display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  color: var(--dsw-alias-label-tertiary, #667085); font-size: 11px; }
+.mbm-err { color: var(--dsw-alias-state-error-primary, #d92d20); line-height: 1.6; }
+/* adb / 工具链诊断横幅。
+   用警示色的浅底而不是纯红字：它是"需要你做一个动作"的说明，不是崩溃。
+   三行各司其职 —— 结论 / 原因 / 怎么做 —— 所以各自成段，行高放松。 */
+.mbm-adb { display: flex; flex-direction: column; gap: 4px; padding: 8px 10px;
+  border-radius: var(--dsw-radius-sm, 6px); line-height: 1.6;
+  border: 1px solid var(--dsw-alias-state-warning-border, #f7d08a);
+  background: var(--dsw-alias-state-warning-bg, #fff8e6);
+  color: var(--dsw-alias-label-primary, #1f2329); }
+.mbm-adbHint { color: var(--dsw-alias-label-secondary, #667085); }
+.mbm-adbPath { font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10px; color: var(--dsw-alias-label-tertiary, #98a2b3);
+  word-break: break-all; }
+/* tab 标签里的图标。dockkit 的 .tabTitle 已经给了 gap:5px，所以这里**只**需要
+   flex:none（防止标题长时被压扁）。不要再加 margin-right：那会变成 9px，
+   而官方的「文件」标签用的是 5px（它的 titleIcon 就没写 margin）。 */
+.mbm-title-icon { flex: none; }

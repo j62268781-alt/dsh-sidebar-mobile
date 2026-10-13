@@ -23,19 +23,19 @@
  * @module dsh-sidebar-mobile
  */
 
-import { Mobilecli, resolveBinary } from "./lib/mobilecli.js";
-import { AdbProbe, findAdb } from "./lib/android-toolchain.js";
-import { registerSkills } from "./lib/skills.js";
-import { StreamSessionPool } from "./lib/stream-session.js";
+import { Mobilecli, resolveBinary } from "./lib/device/mobilecli.js";
+import { AdbProbe, findAdb } from "./lib/device/android-toolchain.js";
+import { registerSkills } from "./lib/agent/skills.js";
+import { StreamSessionPool } from "./lib/stream/session.js";
 import {
   ROUTES,
   StreamAccessController,
   parseTrustedAuthority,
   prepareStreamAccessKey,
-} from "./lib/stream-access.js";
-import { StreamRoutes, mountRoutes } from "./lib/stream-routes.js";
-import { DaemonRpc } from "./lib/daemon-rpc.js";
-import { TOOL_NAMES, createTools } from "./lib/tools.js";
+} from "./lib/stream/access.js";
+import { StreamRoutes, mountRoutes } from "./lib/stream/routes.js";
+import { DaemonRpc } from "./lib/device/daemon-rpc.js";
+import { TOOL_NAMES, createTools } from "./lib/agent/tools.js";
 
 /** Cordis 插件名，也是挂载 id。 */
 export const name = "dsh-sidebar-mobile";

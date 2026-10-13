@@ -37,7 +37,7 @@ done
 npm test              # 验证 frontmatter 仍能被正确剥离
 ```
 
-自测里有一项专门断言"正文里没有 frontmatter 残留"。上游若改了 frontmatter 的结构（比如换成 TOML），这项会失败——那时需要更新 `lib/skills.js` 的 `parseFrontmatter()`。
+自测里有一项专门断言"正文里没有 frontmatter 残留"。上游若改了 frontmatter 的结构（比如换成 TOML），这项会失败——那时需要更新 `lib/agent/skills.js` 的 `parseFrontmatter()`。
 
 ## 发包
 
