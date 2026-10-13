@@ -2415,5 +2415,65 @@ await test("rpc 为 null 时全部走 CLI（配置可强制关闭）", async () 
   assert.equal(cliCalls.length, 1, "rpc=null 时必须走 CLI");
 });
 
+// ── 设备类型可辨识 ──────────────────────────────────────────────────────
+//
+// 用户反馈：「机型选择里面应该加入模拟器选项才对，现在这 2 个选项我没办法
+// 区分哪个是模拟器哪个是真机」。
+//
+// 设备数据里本来就有 `type`（mobilecli 的 `--type` 帮助原文：
+// `real or simulator/emulator`），只是面板没用它 —— 下拉里只显示名字。
+//
+// 这一组守两件事：① 下拉里必须能看出类型；② 类型映射只有一处，
+// 避免"下拉说是模拟器、状态栏说是 real"这种自相矛盾。
+
+console.log("\n设备类型可辨识");
+
+await test("类型映射：real/simulator/emulator 都有中文名，未知值不猜", () => {
+  const source = stripComments(readFileSync(new URL("./lib/client.js", import.meta.url), "utf8"));
+  const fn = source.match(/function deviceKindLabel\([\s\S]*?\n    \}/u)?.[0] ?? "";
+  assert.ok(fn.length > 0, "找不到 deviceKindLabel");
+  assert.ok(/=== "real"/u.test(fn), "real 应有专门分支");
+  assert.ok(/"simulator"/u.test(fn) && /"emulator"/u.test(fn), "simulator 与 emulator 都要认");
+  assert.ok(fn.includes("真机") && fn.includes("模拟器"), "应有中文名");
+  // 未知值必须原样返回而不是猜一个 —— 猜错会误导用户
+  assert.ok(
+    !/return "真机";\s*\}\s*$/u.test(fn.replace(/\s+/gu, " ").trim()),
+    "不能把未知类型兜底成「真机」",
+  );
+});
+
+await test("下拉选项带类型后缀（否则模拟器与真机无法区分）", () => {
+  const source = stripComments(readFileSync(new URL("./lib/client.js", import.meta.url), "utf8"));
+  assert.ok(source.includes("deviceKindSuffix"), "缺类型后缀函数");
+  assert.ok(source.includes("deviceOptionText"), "缺选项文案函数");
+  // 选项文案里必须真的用了后缀
+  const fn = source.match(/function deviceOptionText\([\s\S]*?\n    \}/u)?.[0] ?? "";
+  assert.ok(fn.includes("deviceKindSuffix"), "选项文案没有拼上类型后缀");
+});
+
+await test("多种类型时按类型分组，单一类型时不加多余分组", () => {
+  const source = stripComments(readFileSync(new URL("./lib/client.js", import.meta.url), "utf8"));
+  const fn = source.match(/function renderDeviceOptions\([\s\S]*?\n    \}/u)?.[0] ?? "";
+  assert.ok(fn.length > 0, "找不到 renderDeviceOptions");
+  assert.ok(fn.includes("optgroup"), "应使用 optgroup 分组");
+  assert.ok(
+    /length <= 1/u.test(fn),
+    "只有一种类型时不该分组（多余层级），但要保留选项里的类型后缀",
+  );
+  // 分组时不再重复后缀（否则「真机 / 一加 12 · 真机」很啰嗦）
+  assert.ok(/deviceOptionText\(d, false\)/u.test(fn), "分组内应关掉类型后缀，避免与分组标题重复");
+  assert.ok(/deviceOptionText\(d, true\)/u.test(fn), "不分组时应保留类型后缀");
+});
+
+await test("状态栏用同一个映射（避免与下拉自相矛盾）", () => {
+  const source = stripComments(readFileSync(new URL("./lib/client.js", import.meta.url), "utf8"));
+  // 状态栏不能再用裸的 active.type
+  assert.ok(
+    !/\$\{active\.type\}/u.test(source),
+    "状态栏仍显示裸的 active.type（英文 real/simulator），应与下拉用同一映射",
+  );
+  assert.ok(/deviceKindLabel\(active\.type\)/u.test(source), "状态栏应走 deviceKindLabel");
+});
+
 console.log(`\n结果：${passed} 通过，${failed} 失败`);
 process.exit(failed === 0 ? 0 : 1);
