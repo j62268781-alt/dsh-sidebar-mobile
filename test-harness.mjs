@@ -449,6 +449,116 @@ await test("拒绝未知路由与裸前缀", () => {
   assert.equal(matchRouteName("/other/stream", PREFIX), null);
 });
 
+// ── 背压对齐：两种格式的「帧边界」不是一回事 ────────────────────────────
+//
+// 这一段锁的是一个真实缺陷：拥塞丢弃时两种格式**共用**了 H.264 起始码逻辑。
+// MJPEG 的 JPEG 像素数据里天然大量出现 00 00 01（实测 36MB 流里 1925 个三字节
+// + 3465 个四字节），按它截断会切出不含 multipart boundary 的半截 JPEG ——
+// 那一帧永远等不到结束标记（浏览器不渲染），恢复投递后的残余字节还会被当成
+// 上一帧的像素。MJPEG 实测 21.8 Mbps、每帧 ~35KB，而阈值 256KB，积压约 7 帧
+// 就触发，所以这是日常路径而不是边角情况。
+//
+// 实测对照（真实 iOS 模拟器流，抽样 719 个 64KB 块）：
+//   旧（起始码）切在帧中间：506 ❌
+//   新（boundary）切在帧中间：  0 ✅
+
+console.log("\n背压对齐");
+
+const { findStartCode, lastStartCode, findBoundary, lastBoundary } =
+  await import("./lib/stream-routes.js");
+
+/** 造一段真实的 MJPEG multipart 数据（帧内含 00 00 01 序列）。 */
+function fakeMjpeg(boundary, frameCount, filler) {
+  const parts = [];
+  for (let i = 0; i < frameCount; i++) {
+    parts.push(
+      Buffer.from(`${boundary}\r\nContent-Type: image/jpeg\r\nContent-Length: ${filler.length}\r\n\r\n`, "latin1"),
+      filler,
+      Buffer.from("\r\n", "latin1"),
+    );
+  }
+  return Buffer.concat(parts);
+}
+
+await test("H.264：起始码能找到帧边界", () => {
+  const gop = Buffer.concat([
+    Buffer.from([0, 0, 0, 1, 0x67]), // SPS
+    Buffer.from([0, 0, 0, 1, 0x68]), // PPS
+    Buffer.from([0, 0, 0, 1, 0x65, 0xaa]),
+    Buffer.from([0, 0, 1, 0x41, 0xbb]),
+  ]);
+  assert.equal(findStartCode(gop), 0, "第一个起始码应在 0");
+  // 最后一个起始码是末尾那个**三字节**形式，位于索引 16（不是 gop.length-3：
+  // 4 字节形式占 4 个位置，所以末段起点比 length-3 更靠前）
+  assert.equal(lastStartCode(gop), 16, "最后一个起始码应在末尾那段");
+  assert.deepEqual([...gop.subarray(16, 19)], [0, 0, 1], "该位置确实是起始码");
+  // 三字节与四字节都要认
+  assert.notEqual(findStartCode(Buffer.from([9, 9, 0, 0, 1, 0x41])), -1);
+  assert.notEqual(findStartCode(Buffer.from([9, 9, 0, 0, 0, 1, 0x41])), -1);
+  // 跨在块尾的 00 00 00（第 4 字节还没到）不能误判成起始码
+  assert.equal(lastStartCode(Buffer.from([9, 9, 0, 0, 0])), -1, "跨块尾的 00 00 00 不是起始码");
+});
+
+await test("MJPEG：起始码会落在 JPEG 数据内部（所以不能用它对齐）", () => {
+  const BOUNDARY = "--mjpeg-frame-boundary";
+  // JPEG 里出现 00 00 01 是**正常**的（它就是像素/段数据的一部分）
+  const filler = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x00, 0x01, 0x00, 0xff, 0xd9]);
+  const stream = fakeMjpeg(BOUNDARY, 4, filler);
+
+  const at = findStartCode(stream);
+  assert.notEqual(at, -1, "构造的数据里应当有 00 00 01");
+  // 关键断言：起始码给出的位置**不是** boundary 起点
+  assert.notEqual(
+    stream.subarray(at, at + 2).toString("latin1"),
+    "--",
+    "MJPEG 里按起始码对齐会切在帧中间 —— 这正是那个缺陷",
+  );
+});
+
+await test("MJPEG：boundary 对齐永远切在帧边界上", () => {
+  const BOUNDARY = "--mjpeg-frame-boundary";
+  const filler = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x00, 0x01, 0x00, 0xff, 0xd9]);
+  const stream = fakeMjpeg(BOUNDARY, 6, filler);
+
+  // 恢复点：找到的每个 boundary 都必须真是 boundary 起点
+  let from = 0;
+  let found = 0;
+  for (;;) {
+    const at = findBoundary(stream.subarray(from), BOUNDARY);
+    if (at === -1) break;
+    const abs = from + at;
+    assert.equal(
+      stream.subarray(abs, abs + BOUNDARY.length).toString("latin1"),
+      BOUNDARY,
+      "findBoundary 的返回值必须正好落在 boundary 起点",
+    );
+    found++;
+    from = abs + BOUNDARY.length;
+  }
+  assert.equal(found, 6, `应找到 6 个 boundary，实际 ${found}`);
+
+  // 切点：最后一个是第 6 个（最后一个）boundary 的起点
+  const cut = lastBoundary(stream, BOUNDARY);
+  assert.ok(cut > 0, "应当能找到最后一个 boundary");
+  assert.equal(
+    stream.subarray(cut, cut + BOUNDARY.length).toString("latin1"),
+    BOUNDARY,
+    "lastBoundary 必须停在完整帧的结尾（即下一帧的 boundary 起点）",
+  );
+  // 投递到 cut 为止：被投递的部分以完整帧（含结尾 \r\n）结束
+  const sent = stream.subarray(0, cut);
+  assert.ok(
+    sent.subarray(-2).toString("latin1") === "\r\n",
+    "被投递的部分应以完整帧结尾，而不是半截 JPEG",
+  );
+});
+
+await test("boundary 找不到时返回 -1（调用方据此整块丢弃）", () => {
+  const data = Buffer.from("no boundary here at all", "latin1");
+  assert.equal(findBoundary(data, "--mjpeg-frame-boundary"), -1);
+  assert.equal(lastBoundary(data, "--mjpeg-frame-boundary"), -1);
+});
+
 // ── Android 工具链（adb）体检 ───────────────────────────────────────────
 //
 // 这一组测试守着一个很具体的坑：**adb 缺失时 mobilecli 不报错**。
