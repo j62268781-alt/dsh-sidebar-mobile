@@ -16,7 +16,9 @@ import assert from "node:assert/strict";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Readable } from "node:stream";
 import { Mobilecli, resolveBinary } from "./lib/mobilecli.js";
+import { StreamRoutes } from "./lib/stream-routes.js";
 
 let passed = 0;
 let failed = 0;
@@ -557,6 +559,110 @@ await test("boundary 找不到时返回 -1（调用方据此整块丢弃）", ()
   const data = Buffer.from("no boundary here at all", "latin1");
   assert.equal(findBoundary(data, "--mjpeg-frame-boundary"), -1);
   assert.equal(lastBoundary(data, "--mjpeg-frame-boundary"), -1);
+});
+
+// ── 交互延迟：热路径不许查设备列表 ──────────────────────────────────────
+//
+// 这一段锁的是一个**体感**问题：用户反馈"点一下按钮要等 300 多毫秒"。
+//
+// 根因是 #requireActiveDevice 每次点击/滑动都调 listDevices 复核设备。
+// 实测分解（一加 12）：
+//
+//     mobilecli devices --include-offline   328 ms   ← 完整的设备枚举
+//     mobilecli io tap                      103 ms   ← 真正的操作
+//     合计                                  431 ms
+//
+// 也就是 **76% 的点击延迟花在一个只用来"确认设备还在"的预检查上**。
+// 它只买到"早 328ms 失败"，代价是让所有正常操作都慢 328ms。
+//
+// 去掉之后：431 → 103 ms。设备真掉线时 mobilecli 自己会报
+// `device not found: <id>`（实测），错误信息一样清楚。
+//
+// 用真实 StreamRoutes 驱动，断言的是**调用序列**（不依赖计时，稳定）。
+
+console.log("\n交互延迟");
+
+/** 造一个记录了调用序列的假 client。 */
+function latencyHarness() {
+  const calls = [];
+  const client = {
+    async listDevices() {
+      calls.push("listDevices");
+      return [{ id: "dev1", name: "一加 12", platform: "android", state: "online" }];
+    },
+    async runJson(args) {
+      calls.push(`runJson:${args.join(" ")}`);
+      return {};
+    },
+  };
+  const pool = {
+    acquire: () => ({ sendInput: (run) => run(["io", "tap", "--device", "dev1", "1,2"]) }),
+  };
+  const routes = new StreamRoutes({ client, pool, access: { mint: () => "t" }, log: () => {} });
+  routes.activeDeviceId = "dev1";
+  return { routes, calls };
+}
+
+/** 最小的 req/res 替身（走 req.on("data"/"end") 那条路）。 */
+function latencyReqRes(body) {
+  const req = new Readable({ read() {} });
+  req.method = "POST";
+  req.url = "/control";
+  req.headers = {
+    host: "127.0.0.1:19387",
+    origin: "http://127.0.0.1:19387",
+    "content-type": "application/json",
+  };
+  req.socket = { remoteAddress: "127.0.0.1", localAddress: "127.0.0.1" };
+  const res = {
+    statusCode: 0,
+    body: "",
+    headersSent: false,
+    writeHead(code) { this.statusCode = code; this.headersSent = true; },
+    end(payload) { this.body = payload ?? ""; },
+    write() {},
+    on() {},
+    setHeader() {},
+  };
+  req.push(Buffer.from(JSON.stringify(body)));
+  req.push(null);
+  return { req, res };
+}
+
+await test("control 热路径不查设备列表（否则每次点击多付 328ms）", async () => {
+  const { routes, calls } = latencyHarness();
+  const { req, res } = latencyReqRes({ action: "tap", x: 1, y: 2 });
+  await routes.handle("control", req, res);
+
+  assert.equal(res.statusCode, 200, `应当成功，实际 ${res.statusCode} ${res.body}`);
+  assert.equal(
+    calls.filter((c) => c === "listDevices").length,
+    0,
+    "热路径查了设备列表 —— 那是一次 328ms 的完整枚举，正是点击延迟的来源",
+  );
+  assert.equal(calls.length, 1, `应当只有一次真实操作，实际：${calls.join(" → ")}`);
+  assert.ok(calls[0].startsWith("runJson:io tap"), `应当直接执行 tap，实际：${calls[0]}`);
+});
+
+await test("device-action 热路径同样不查设备列表", async () => {
+  const { routes, calls } = latencyHarness();
+  routes.client.runJson = async (args) => { calls.push(`runJson:${args.join(" ")}`); return {}; };
+  const { req, res } = latencyReqRes({ action: "home" });
+  await routes.handle("device-action", req, res);
+  assert.equal(
+    calls.filter((c) => c === "listDevices").length,
+    0,
+    "device-action 也不该查设备列表",
+  );
+});
+
+await test("没有选中设备时仍然 409（去掉预检查不能连带丢掉这个判断）", async () => {
+  const { routes } = latencyHarness();
+  routes.activeDeviceId = null;
+  const { req, res } = latencyReqRes({ action: "tap", x: 1, y: 2 });
+  await routes.handle("control", req, res);
+  assert.equal(res.statusCode, 409, "没选设备必须拒绝，而不是把 null 当 deviceId 传下去");
+  assert.match(res.body, /尚未选择设备/u);
 });
 
 // ── Android 工具链（adb）体检 ───────────────────────────────────────────

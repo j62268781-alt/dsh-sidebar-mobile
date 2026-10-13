@@ -250,6 +250,55 @@ mobile_find_text  ~1s          OCR，兜底
 
 所以：枚举失败一律抛；`count: 0` 只在调用成功时才可能是事实。
 
+### 交互热路径不许查设备列表
+
+用户反馈"点一下按钮要等 300 多毫秒"。实测分解（一加 12 真机）：
+
+| 步骤 | 中位数 |
+|---|---|
+| `mobilecli devices --include-offline` | **328 ms** |
+| `mobilecli io tap` | **103 ms** |
+| 合计（原实现） | **431 ms** |
+
+也就是 **76% 的点击延迟花在一个只用来"确认设备还在"的预检查上**。
+对运行中的服务实测更夸张：缓存（1.5s TTL）过期时单次 tap **576 ms / 516 ms**。
+
+`#requireActiveDevice()` 因此改成同步返回记住的 id，**不做存在性复核**：
+
+- 设备真掉线时，`mobilecli` 自己会报
+  `{"status":"error","error":"error finding device: device not found: <id>"}`
+  —— 措辞一样清楚，只是晚 328ms；
+- "离线"本来就有更权威的信号：5 秒状态轮询会更新设备列表，面板据此禁用按钮。
+
+那个预检查只买到"早 328ms 失败"，代价是让**几乎每次正常操作**都慢 328ms。
+用真实 `StreamRoutes` 驱动验证：**431 → 105 ms**，调用序列只剩一次 `io tap`。
+（`activeDeviceId === null` → 409 的判断要保留，别连它一起删掉。）
+
+#### 剩下的延迟里，哪些动不了
+
+| 步骤 | ms | 说明 |
+|---|---|---|
+| 浏览器 POST → Host | 5 | 同机 loopback |
+| Host 解析 + 校验 | 1 | 纯 JS |
+| **mobilecli 进程启动** | **62** | CLI 每条命令新起一个 node 进程 |
+| daemon IPC + adb 往返 | 41 | 实测 |
+| 下一条编码帧 | 17 | ~60fps 编码周期 |
+| adb/USB 回传 | 20 | 1080p 帧 ~35KB |
+| Host 转发 + 背压 | 2 | 16KB hwm |
+| 浏览器解码 | 5 | WebCodecs 硬件解码 |
+| 渲染限流等待 | 17 | 30fps 的半个周期（均值）|
+| drawImage + 合成 | 8 | 主线程 |
+| **合计** | **~178** | |
+
+那 62ms 的进程启动**目前无法消除**：`mobilecli` 是 Node CLI，输入类命令
+（`io tap/swipe/longpress/pinch/button/text/keys/clipboard`）全是**一次性**命令，
+没有常驻输入通道 —— 唯一的常驻进程是 daemon，但它不对外暴露输入 socket。
+所以 ≈100ms 是每个动作的下限。
+
+渲染限流也不是延迟杠杆：源流 ~120fps，限到 60fps 只是隔帧绘制，
+**等待下一个绘制点的时间没变**；真正拖累跟手的是主线程被 `drawImage` 占满。
+（同理：只能丢绘制，绝不能丢解码 —— P 帧依赖参考帧。）
+
 ### 为什么 UI 树要递归展平
 
 mobilecli 的 `dump ui --format json` 返回**嵌套树**（子节点挂在 `children` 下）。直接读 `data.elements` 只拿到最外层几个容器——实测同一屏：展平前 0 个元素、展平后 92 个。

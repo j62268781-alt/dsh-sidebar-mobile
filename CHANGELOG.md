@@ -7,6 +7,29 @@
 
 ### 修复
 
+- **点击/滑动有 300+ms 延迟（体感"不跟手"）**：交互热路径上挂着一个设备预检查
+  —— 每次点击都先 `listDevices({includeOffline:true})` 复核设备还在不在。
+  实测分解（一加 12 真机）：
+
+  | 步骤 | 中位数 |
+  |---|---|
+  | `mobilecli devices --include-offline` | **328 ms** |
+  | `mobilecli io tap` | **103 ms** |
+  | 合计（原实现） | **431 ms** |
+
+  即 **76% 的点击延迟花在这个预检查上**。对运行中的服务实测更夸张：
+  设备缓存（1.5s TTL）一过期，单次 tap 就要 **576 / 516 ms**。
+
+  现在 `#requireActiveDevice()` 同步返回记住的 id，不做存在性复核：
+  设备真掉线时 `mobilecli` 自己会报
+  `error finding device: device not found: <id>`（实测），措辞一样清楚；
+  而"离线"本就有更权威的信号 —— 5 秒状态轮询会更新设备列表、面板据此禁用按钮。
+  那个预检查只买到"早 328ms 失败"，代价是让**几乎每次正常操作**都慢 328ms。
+
+  用真实 `StreamRoutes` 驱动验证：**431 → 105 ms**，调用序列只剩一次 `io tap`。
+  自测补 3 条（热路径不得出现 `listDevices`、`device-action` 同理、
+  以及 `activeDeviceId` 为 null 时仍要 409），97 → 100。
+
 - **画面被压成一条横向小条（真机截图确认）**：canvas 尺寸写成了
   「读它自己的 `getBoundingClientRect()` × DPR」，那是**循环依赖**：
 
