@@ -40,7 +40,7 @@ mobilecli（Go 二进制）
 
 Host 侧的 agent 模块：
 
-- `lib/agent/tools.js` —— 10 个模型工具，全部经 `defineTool` 注册
+- `lib/agent/tools.js` —— 11 个模型工具，全部经 `defineTool` 注册
 - `lib/agent/skills.js` —— 把打包的 mobilecli playbook 注册给模型
 
 `index.js` 负责接线，并用 `ctx.effect` 保证卸载时全部注销。
@@ -349,7 +349,7 @@ mobile_find_text  ~1s          OCR，兜底
 
 | | tokens | 何时付费 |
 |---|---|---|
-| 工具 schema | 10 个 = **910** | **每轮**（工具面随每次请求发出） |
+| 工具 schema | 11 个 = **964** | **每轮**（工具面随每次请求发出） |
 | skill 摘要 | **213** | **每轮** |
 | skill 正文 | **5137** | 载入后**每轮**（正文是 tool result，留在历史里） |
 
@@ -367,6 +367,13 @@ mobile_find_text  ~1s          OCR，兜底
 - `mobile_devices` —— 合并设备数据与流池的 `streaming` 状态。
 - 其余：`tap_element` / `tap_text` / `find_text`（定位 + 失败时附可见元素）、
   `screenshot`（落临时文件）、`logs`（限流+过滤）、`list_apps`（字段归一化）。
+- `mobile_open_panel` —— **跨进程**：Host 上的工具要去驱动浏览器里的侧边栏。
+  这是插件里唯一一个"动作发生在另一个进程"的能力，靠客户端长轮询 + 回执实现
+  （见 `lib/stream/routes.js` 里 `#panelOpen` 的注释）。
+
+  ⚠️ 它**必须**挂在客户端 `apply(ctx)` 里而不是面板组件里 —— 挂在组件里就只有在
+  面板已经打开时才会轮询，而这个功能的全部意义恰恰是打开一个**还没打开**的面板。
+  测试「请打开面板的轮询必须在 apply() 里」钉住这条。
 
 ⚠️ `flutter_tree` 曾被列在这里，但那是错的：它不是「加工型」，而是
 `ui_tree` 的副本（两者调同一个 `dumpUiElements`），描述却声称直连 VM Service。

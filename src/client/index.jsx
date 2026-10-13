@@ -60,6 +60,14 @@ window.__ModuleLoader__.load({
     const TAB_ID = "@j62268781-alt/dsh-sidebar-mobile";
     /** 与 cordis.patch.yml 的 routePrefix 一致。 */
     const PREFIX = "/_dsh/dsh-sidebar-mobile";
+    /**
+     * 「请把面板打开」的长轮询与回执路由。
+     *
+     * 名字与 lib/stream/access.js 的 ROUTES 必须一致 —— 那边是宿主侧的路由表，
+     * 这里是客户端拼 URL。测试会核对这两个字符串。
+     */
+    const ROUTE_PANEL_OPEN = "panel-open";
+    const ROUTE_PANEL_OPEN_ACK = "panel-open-ack";
 
     /**
      * 滑动手势的时长夹取范围（毫秒）。
@@ -1702,6 +1710,66 @@ window.__ModuleLoader__.load({
        * @param {object} ctx 客户端插件上下文
        */
       apply(ctx) {
+        /**
+         * 让**模型**也能把面板打开：长轮询宿主侧的"请打开面板"请求。
+         *
+         * 为什么放在 apply() 而不是面板组件里：**面板还没打开时才最需要它**。
+         * 放在组件里就只有面板已挂载时才会轮询 —— "打开一个还没打开的面板"
+         * 就永远等不到人来问，这个功能会自相矛盾。
+         *
+         * 为什么用长轮询而不是定频心跳：空闲时只挂着一条连接、零重复请求；
+         * 宿主那边一有请求就立刻返回，所以"模型调用 → 面板出现"之间没有
+         * 一个 5 秒量级的固定延迟。宿主最多挂 20s，然后正常收尾、客户端再挂。
+         */
+        ctx.inject(["sidebarRight"], (scope) => {
+          scope.effect(() => {
+            let stopped = false;
+            /** 已处理过的请求号。宿主那边单调递增，所以记住号就天然幂等。 */
+            let lastHandled = 0;
+
+            const pump = async () => {
+              while (!stopped) {
+                let seq = null;
+                try {
+                  const response = await fetch(`${PREFIX}/${ROUTE_PANEL_OPEN}`, { method: "GET" });
+                  if (stopped) return;
+                  const payload = await response.json().catch(() => ({}));
+                  seq = typeof payload?.request === "number" ? payload.request : null;
+                } catch {
+                  // 宿主重启 / 网络抖动：退避后重试。
+                  // 不能立刻重来 —— 那会在宿主没起来时变成忙等。
+                  if (stopped) return;
+                  await new Promise((resolve) => setTimeout(resolve, 2000));
+                  continue;
+                }
+
+                if (stopped || seq === null || seq === lastHandled) continue;
+                lastHandled = seq;
+
+                try {
+                  // openTab 的默认行为：已有同 kind 的 tab 就聚焦它，没有就建一个。
+                  // 所以"打开"和"已经在则切过去"是同一句话。
+                  scope.sidebarRight.openTab("mobile");
+                } catch {
+                  // 打开失败也要回执 —— 否则宿主的工具会一直干等到超时，
+                  // 拿不到"失败"这个信息，只能报"没人应答"。
+                }
+
+                try {
+                  await api(ROUTE_PANEL_OPEN_ACK, { request: seq });
+                } catch {
+                  // 回执没送到不影响"面板已经打开"这个事实，下次轮询会补上
+                }
+              }
+            };
+
+            void pump();
+            return () => {
+              stopped = true;
+            };
+          }, "dsh-sidebar-mobile:panel-open-poll");
+        });
+
         // 快捷键：和官方 files/browser 一样，一个命令 + 一个 guide 胶囊徽标。
         //
         // 只有「打开面板」这一个动作走快捷键；面板里的操作（主屏/返回/旋转）

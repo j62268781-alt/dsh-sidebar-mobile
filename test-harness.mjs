@@ -1897,7 +1897,7 @@ await test("只注册加工型工具，薄包装不许回流", () => {
   const entries = [...source.matchAll(/\[TOOL_NAMES\.(\w+)\]/gu)].map((m) => m[1]);
   assert.ok(entries.length > 0, "找不到任何 [TOOL_NAMES.x] 注册项");
 
-  assert.equal(entries.length, 10, `应注册 10 个工具，实际 ${entries.length}：${entries.join(", ")}`);
+  assert.equal(entries.length, 11, `应注册 11 个工具，实际 ${entries.length}：${entries.join(", ")}`);
 
   /**
    * 被删的工具不得回流，且必须出现在 REMOVED_TOOL_NAMES 里
@@ -1933,6 +1933,240 @@ await test("只注册加工型工具，薄包装不许回流", () => {
     [...entries].sort(),
     `TOOL_NAMES 与注册表不一致：声明 ${declared.join(",")} / 注册 ${entries.join(",")}`,
   );
+});
+
+console.log("\n打开面板（mobile_open_panel）");
+
+await test("面板打开的路由名在宿主与客户端两处必须一致", () => {
+  /**
+   * 这两个名字是**跨进程的契约**：宿主在 lib/stream/access.js 的 ROUTES 里
+   * 定义，客户端在 src/client/index.jsx 里拼 URL。两边写错一个字符，症状是
+   * 404 或者长轮询永远挂着 —— 都不会有人报错，只会"点了没反应"。
+   */
+  const access = stripComments(
+    readFileSync(new URL("./lib/stream/access.js", import.meta.url), "utf8"),
+  );
+  const client = stripComments(
+    readFileSync(new URL("./src/client/index.jsx", import.meta.url), "utf8"),
+  );
+
+  const pairs = [
+    ["panelOpen", "ROUTE_PANEL_OPEN", "panel-open"],
+    ["panelOpenAck", "ROUTE_PANEL_OPEN_ACK", "panel-open-ack"],
+  ];
+  for (const [hostKey, clientConst, path] of pairs) {
+    assert.ok(
+      new RegExp(`${hostKey}:\\s*"${path}"`, "u").test(access),
+      `access.js 的 ROUTES.${hostKey} 应为 "${path}"`,
+    );
+    assert.ok(
+      new RegExp(`const ${clientConst} = "${path}"`, "u").test(client),
+      `客户端 ${clientConst} 应为 "${path}"`,
+    );
+  }
+});
+
+await test("「请打开面板」的轮询必须在 apply() 里，不能放进面板组件", () => {
+  /**
+   * 这是这个能力的核心不变量，放错地方它会自相矛盾：
+   *
+   * 需求是"打开一个**还没打开**的面板"。而面板组件的 useEffect 只在组件
+   * 挂载后才跑 —— 把轮询放进组件，就只有在面板已经打开时才会轮询，恰恰是
+   * 最不需要它的时候。所以轮询必须挂在插件加载期（apply）。
+   *
+   * 客户端源码里 MobilePanel 组件在 apply() 之前，因此"轮询代码的位置必须
+   * 晚于 apply(ctx)"就等价于"它在 apply 里、不在组件里"。这个断言会随文件
+   * 重排失效，但那时它会**失败**而不是静默放过 —— 这是刻意的。
+   */
+  const source = stripComments(
+    readFileSync(new URL("./src/client/index.jsx", import.meta.url), "utf8"),
+  );
+
+  const applyAt = source.indexOf("apply(ctx) {");
+  assert.ok(applyAt > 0, "找不到 apply(ctx)");
+
+  const pollAt = source.indexOf("dsh-sidebar-mobile:panel-open-poll");
+  assert.ok(
+    pollAt > applyAt,
+    "「请打开面板」的轮询不在 apply() 里 —— 面板没打开时它根本不会跑，功能自相矛盾",
+  );
+
+  // 打开动作按 kind（openTab），不能用 openTabFromTarget ——
+  // 后者要一个 DOM 元素，而模型发起的打开没有元素可给。
+  const openAt = source.indexOf('openTab("mobile")');
+  assert.ok(openAt > applyAt, 'apply() 里找不到 openTab("mobile")');
+  const fromTargetAt = source.indexOf("openTabFromTarget", applyAt);
+  assert.ok(
+    fromTargetAt === -1 || fromTargetAt > openAt,
+    "模型发起的打开不能用 openTabFromTarget（它需要 DOM 元素）",
+  );
+});
+
+await test("打开面板的跨进程链路必须完整接线", () => {
+  const routes = readFileSync(new URL("./lib/stream/routes.js", import.meta.url), "utf8");
+  const tools = stripComments(
+    readFileSync(new URL("./lib/agent/tools.js", import.meta.url), "utf8"),
+  );
+  const index = stripComments(readFileSync(new URL("./index.js", import.meta.url), "utf8"));
+  const client = stripComments(
+    readFileSync(new URL("./src/client/index.jsx", import.meta.url), "utf8"),
+  );
+
+  // 宿主：请求状态 + 长轮询 + 回执 + 分发
+  for (const need of [
+    "requestPanelOpen",
+    "#panelOpen(",
+    "#panelOpenAck(",
+    "case ROUTES.panelOpen:",
+    "case ROUTES.panelOpenAck:",
+  ]) {
+    assert.ok(routes.includes(need), `routes.js 缺少 ${need}`);
+  }
+
+  // 工具：定义 + 注册 + 有回执字段
+  assert.ok(tools.includes('openPanel: "mobile_open_panel"'), "TOOL_NAMES 缺 openPanel");
+  assert.ok(tools.includes("[TOOL_NAMES.openPanel]: openPanelTool"), "注册表缺 openPanel");
+  assert.ok(tools.includes('opened: { type: "boolean", required: true }'), "工具没回执字段");
+
+  // 宿主接线：工具要真的拿得到打开能力
+  assert.ok(
+    /openPanel:\s*\(\)\s*=>\s*routes\.requestPanelOpen\(\)/u.test(index),
+    "index.js 没把 requestPanelOpen 交给工具",
+  );
+
+  // 客户端：打开之后必须回执，否则工具只能干等超时
+  assert.ok(
+    client.includes("ROUTE_PANEL_OPEN_ACK, { request: seq }"),
+    "客户端打开面板后没有回执",
+  );
+});
+
+await test("长轮询：请求到达时挂起的响应立刻返回，回执后工具拿到 opened:true", async () => {
+  /**
+   * 这是"模型能把面板打开"的实际机制，所以按**行为**验，不只验接线：
+   *
+   *   ① 客户端先挂着 GET /panel-open（此时没有请求 → 响应必须不返回）
+   *   ② 工具调 requestPanelOpen() → 挂起的那条立刻带着请求号返回
+   *   ③ 客户端 POST 回执 → 工具的 Promise resolve 成 opened:true
+   */
+  const client = {
+    async listDevices() { return [{ id: "d1", name: "d", platform: "android", state: "online" }]; },
+    async runJson() { return {}; },
+  };
+  const routes = new StreamRoutes({
+    client, pool: { acquire: () => ({}) }, access: { mint: () => "t" }, log: () => {},
+  });
+
+  const headers = {
+    host: "127.0.0.1:19387",
+    origin: "http://127.0.0.1:19387",
+    "content-type": "application/json",
+  };
+  const makeRes = () => ({
+    statusCode: 0, body: "", headersSent: false, writableEnded: false,
+    writeHead(c) { this.statusCode = c; this.headersSent = true; },
+    end(p) { this.body = p ?? ""; this.writableEnded = true; },
+    write() {}, on() {}, setHeader() {},
+  });
+  const makeAck = (request) => {
+    const req = new Readable({ read() {} });
+    req.method = "POST";
+    req.url = "/panel-open-ack";
+    req.headers = headers;
+    req.socket = { remoteAddress: "127.0.0.1" };
+    req.push(Buffer.from(JSON.stringify({ request })));
+    req.push(null);
+    return routes.handle("panel-open-ack", req, makeRes());
+  };
+
+  // ① 客户端挂上长轮询
+  const getReq = new Readable({ read() {} });
+  getReq.method = "GET";
+  getReq.url = "/panel-open";
+  getReq.headers = headers;
+  getReq.socket = { remoteAddress: "127.0.0.1" };
+  const heldRes = makeRes();
+  let heldDone = false;
+  const held = routes.handle("panel-open", getReq, heldRes).then((v) => { heldDone = true; return v; });
+
+  await new Promise((r) => setTimeout(r, 30));
+  assert.equal(heldDone, false, "没有待处理请求时，长轮询必须挂起而不是空转返回");
+
+  // ② 工具发起打开请求
+  const opening = routes.requestPanelOpen(5000);
+  await held;
+  assert.equal(heldRes.statusCode, 200, "挂起的响应应当被唤醒并返回");
+  const carried = JSON.parse(heldRes.body);
+  assert.equal(carried.request, 1, `应当把请求号带回给客户端，实际 ${heldRes.body}`);
+
+  // ③ 客户端回执
+  await makeAck(1);
+
+  const result = await opening;
+  assert.equal(result.opened, true, "收到回执后工具必须拿到 opened:true");
+  assert.equal(routes.panelOpenPending, null, "回执后待处理请求应当清空");
+});
+
+await test("没人回执时如实报 opened:false —— 不许假装成功", async () => {
+  /**
+   * 这是"工具描述是否诚实"的底线：客户端没响应（网页没开、客户端半边没加载）
+   * 时返回 opened:true，会让模型对用户说"已经打开了"，而屏幕上一片空白。
+   */
+  const routes = new StreamRoutes({
+    client: { async listDevices() { return []; }, async runJson() { return {}; } },
+    pool: { acquire: () => ({}) }, access: { mint: () => "t" }, log: () => {},
+  });
+
+  const result = await routes.requestPanelOpen(80);
+  assert.equal(result.opened, false, "没人回执时不能报成功");
+  assert.ok(
+    typeof result.reason === "string" && result.reason.includes("回执"),
+    `应当给出可照做的原因，实际 ${JSON.stringify(result)}`,
+  );
+  assert.ok(result.waitedMs >= 70, `应当真的等满超时，实际 ${result.waitedMs}ms`);
+});
+
+await test("迟到的回执不算数（不能替下一次请求开门）", async () => {
+  /**
+   * 超时之后客户端才把回执送到，是正常会发生的事（网络慢、页面卡）。
+   * 如果拿旧号也能算数，就会出现"这次请求其实没人应答，但因为上次的迟到
+   * 回执而被判成功" —— 又一条对用户说谎的路径。
+   */
+  const routes = new StreamRoutes({
+    client: { async listDevices() { return []; }, async runJson() { return {}; } },
+    pool: { acquire: () => ({}) }, access: { mint: () => "t" }, log: () => {},
+  });
+
+  const headers = {
+    host: "127.0.0.1:19387", origin: "http://127.0.0.1:19387",
+    "content-type": "application/json",
+  };
+
+  // 第一次请求超时（没有客户端来取）
+  const first = await routes.requestPanelOpen(60);
+  assert.equal(first.opened, false);
+  assert.equal(routes.panelOpenPending, 1, "超时后请求号应仍挂着，等客户端来取");
+
+  // 来一个属于"上一次"的迟到回执
+  const ackReq = new Readable({ read() {} });
+  ackReq.method = "POST";
+  ackReq.url = "/panel-open-ack";
+  ackReq.headers = headers;
+  ackReq.socket = { remoteAddress: "127.0.0.1" };
+  ackReq.push(Buffer.from(JSON.stringify({ request: 0 })));
+  ackReq.push(null);
+  const ackRes = {
+    statusCode: 0, body: "", headersSent: false, writableEnded: false,
+    writeHead(c) { this.statusCode = c; this.headersSent = true; },
+    end(p) { this.body = p ?? ""; this.writableEnded = true; },
+    write() {}, on() {}, setHeader() {},
+  };
+  await routes.handle("panel-open-ack", ackReq, ackRes);
+  assert.equal(JSON.parse(ackRes.body).stale, true, "对不上号的回执应当被认作 stale");
+
+  // 关键：这个回执不能把"下一次请求"提前判成功
+  const secondResult = await routes.requestPanelOpen(60);
+  assert.equal(secondResult.opened, false, "对不上号的回执不能替新请求开门");
 });
 
 await test("被删工具的关键知识必须留在 skill 里（否则是净损失）", () => {

@@ -180,7 +180,7 @@ pnpm add @j62268781-alt/dsh-sidebar-mobile
 
 ### 模型工具
 
-只注册 **10 个**「工具能做得比 CLI 更好」的工具：
+只注册 **11 个**「工具能做得比 CLI 更好」的工具：
 
 | 工具 | 用途 |
 |---|---|
@@ -193,6 +193,7 @@ pnpm add @j62268781-alt/dsh-sidebar-mobile
 | `mobile_find_text` / `mobile_tap_text` | OCR 找文字 / 点文字（树读不到时的兜底） |
 | `mobile_wait_for` | 等文本出现或消失 |
 | `mobile_logs` | 读设备日志（logcat / unified log） |
+| `mobile_open_panel` | **把侧边栏的移动设备面板打开给用户看**（跨进程，需要客户端在跑） |
 
 #### 为什么不给 tap / swipe / 输入 / 按键 / 启动应用注册工具
 
@@ -207,7 +208,7 @@ mobilecli io button --device <id> BACK
 mobilecli apps launch --device <id> com.example.app
 ```
 
-它们的 schema 每次请求都要发，实测 10 个 = **910 tokens/轮**（16 个时是 1487）
+它们的 schema 每次请求都要发，实测 11 个 = **964 tokens/轮**（16 个时是 1487）
 —— **省 453 tokens/轮**。
 
 ⚠️ 关键细节没跟着删，都在 skill 的「Driving the device from the shell」一节：

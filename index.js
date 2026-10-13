@@ -329,6 +329,14 @@ export function apply(ctx, config = {}) {
     client: guardedClient,
     // 工具的 streaming 状态与面板共用同一个会话池，两端看到的是一致的
     acquireSession: (deviceId) => pool.acquire(deviceId),
+    /**
+     * `mobile_open_panel` 的实现：请求浏览器把侧边栏面板打开，并等回执。
+     *
+     * 跨进程的活由 routes 那边做（客户端长轮询 + 回执），这里只是把能力
+     * 交给工具。routes 在没挂上 webServer 时仍然是可用对象，但没人会来
+     * 轮询 —— 那种情况工具会如实回 opened:false。
+     */
+    openPanel: () => routes.requestPanelOpen(),
   });
 
   for (const [toolName, definition] of Object.entries(tools)) {
