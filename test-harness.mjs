@@ -13,12 +13,20 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import net from "node:net";
 import { Readable } from "node:stream";
 import { Mobilecli, resolveBinary } from "./lib/mobilecli.js";
 import { StreamRoutes } from "./lib/stream-routes.js";
+import {
+  resolveSocketPath,
+  callDaemon,
+  rpcForInput,
+  rpcForDeviceAction,
+  DaemonRpc,
+} from "./lib/daemon-rpc.js";
 
 let passed = 0;
 let failed = 0;
@@ -2092,6 +2100,319 @@ await test("停流看门狗与重连的行为（真实控制流 + 忠实的 stre
   assert.equal(rounds, 2, "没有发生重连 —— 断流后画面会永久停在终态");
   assert.ok(bytes >= 1024, "重连后应当继续收到数据");
   cancelled = true;
+});
+
+// ── daemon RPC（交互加速通道）────────────────────────────────────────
+//
+// 交互指令优先走 daemon 的 unix socket：实测 device.io.tap 7.3ms
+// vs CLI 的 104.2ms（省掉每条命令约 66ms 的 node 进程启动）。
+// daemon 本来就在运行，所以不需要新起进程、不需要端口、没有会话过期。
+//
+// 下面用**本地假 socket 服务器**验证协议，不依赖真机或真 daemon。
+// 守的都是实测得来的事实 —— 错了会让交互静默变慢或失败。
+
+console.log("\ndaemon RPC");
+
+// 假 daemon：读一行 JSON、回一行 JSON、然后关闭连接（与真实语义一致）。
+// 三种假行为要分得开（否则「超时」与「提前断开」会混在一起）：
+//   返回 null      → 不回也不关（卡住）→ 只能被超时打断
+//   返回 undefined → 不回、直接 destroy → 客户端看到「响应前关闭」
+//   返回对象       → 正常回一行
+function fakeDaemon(handler, { keepOpen = false } = {}) {
+  const dir = mkdtempSync(join(tmpdir(), "dsh-rpc-"));
+  const socketPath = join(dir, "daemon.sock");
+  const received = [];
+  const server = net.createServer((socket) => {
+    let buf = "";
+    socket.on("data", (d) => {
+      buf += d.toString();
+      const nl = buf.indexOf("\n");
+      if (nl === -1) return;
+      let msg;
+      try { msg = JSON.parse(buf.slice(0, nl)); } catch { socket.end(); return; }
+      received.push(msg);
+      const reply = handler(msg);
+      if (reply === null) return; // 保持连接不动
+      if (reply === undefined) { socket.destroy(); return; }
+      socket.write(JSON.stringify(reply) + "\n");
+      if (!keepOpen) socket.end();
+    });
+    socket.on("error", () => {});
+  });
+  return new Promise((resolve) => {
+    server.listen(socketPath, () => {
+      resolve({
+        socketPath,
+        received,
+        close: () => new Promise((r) => {
+          server.close(() => { rmSync(dir, { recursive: true, force: true }); r(); });
+        }),
+      });
+    });
+  });
+}
+
+await test("resolveSocketPath 跟随 MOBILECLI_HOME（与 CLI 同一规则）", () => {
+  assert.equal(resolveSocketPath(null), join(process.env.HOME, ".mobilecli", "daemon.sock"));
+  assert.equal(resolveSocketPath("/tmp/custom"), "/tmp/custom/daemon.sock");
+  assert.equal(resolveSocketPath(null).endsWith("daemon.sock"), true);
+});
+
+await test("RPC 参数形状与 CLI 不同：独立字段，不是逗号串", () => {
+  const swipe = rpcForInput({ action: "swipe", deviceId: "d1", x1: 1, y1: 2, x2: 3, y2: 4, duration: 200 });
+  assert.equal(swipe.method, "device.io.swipe");
+  assert.deepEqual(swipe.params, { deviceId: "d1", x1: 1, y1: 2, x2: 3, y2: 4, duration: 200 });
+  // 关键：不能是 CLI 那种逗号串
+  assert.equal("coordinates" in swipe.params, false, "RPC 不接受逗号串坐标");
+
+  const tap = rpcForInput({ action: "tap", deviceId: "d1", x: 9, y: 8 });
+  assert.deepEqual(tap.params, { deviceId: "d1", x: 9, y: 8 });
+
+  const keys = rpcForInput({ action: "keys", deviceId: "d1", keys: ["ctrl+a"] });
+  assert.deepEqual(keys.params, { deviceId: "d1", keys: ["ctrl+a"] });
+});
+
+await test("rotate 没有 RPC 实现（必须回退 CLI）", () => {
+  // daemon 不暴露 orientation —— 实测多个候选方法名全部 method not found
+  assert.equal(rpcForDeviceAction("rotate", "d1"), null);
+  assert.equal(rpcForInput({ action: "rotate", deviceId: "d1" }), null);
+  // home/back/power 都落在 device.io.button
+  assert.deepEqual(rpcForDeviceAction("back", "d1"), {
+    method: "device.io.button",
+    params: { deviceId: "d1", button: "BACK" },
+  });
+  assert.equal(rpcForDeviceAction("home", "d1").params.button, "HOME");
+  assert.equal(rpcForDeviceAction("power", "d1").params.button, "POWER");
+});
+
+await test("callDaemon 发的是 newline-delimited JSON（不是 HTTP）", async () => {
+  const daemon = await fakeDaemon((msg) => ({ jsonrpc: "2.0", id: msg.id, result: { status: "ok" } }));
+  try {
+    const result = await callDaemon("device.io.tap", { deviceId: "d1", x: 1, y: 2 }, { socketPath: daemon.socketPath });
+    assert.deepEqual(result, { status: "ok" });
+    assert.equal(daemon.received.length, 1);
+    assert.equal(daemon.received[0].method, "device.io.tap");
+    assert.deepEqual(daemon.received[0].params, { deviceId: "d1", x: 1, y: 2 });
+    assert.equal(daemon.received[0].jsonrpc, "2.0");
+  } finally {
+    await daemon.close();
+  }
+});
+
+await test("JSON-RPC error 会抛出，且优先用 error.data 里的具体原因", async () => {
+  const daemon = await fakeDaemon((msg) => ({
+    jsonrpc: "2.0", id: msg.id,
+    error: { code: -32000, message: "Server error", data: "error finding device: device not found: NOPE" },
+  }));
+  try {
+    await assert.rejects(
+      () => callDaemon("device.io.tap", { deviceId: "NOPE" }, { socketPath: daemon.socketPath }),
+      /device not found: NOPE/,
+      "应当抛出 data 里的具体原因，而不是笼统的 Server error",
+    );
+  } finally {
+    await daemon.close();
+  }
+});
+
+await test("daemon 不回就关闭 → 报错而不是永久挂起", async () => {
+  const daemon = await fakeDaemon(() => undefined); // 不回，直接 destroy
+  try {
+    await assert.rejects(
+      () => callDaemon("device.io.tap", {}, { socketPath: daemon.socketPath, timeoutMs: 3000 }),
+      /关闭了连接/u,
+    );
+  } finally {
+    await daemon.close();
+  }
+});
+
+await test("socket 不存在 → ENOENT，且通道被标记为不可用（不再逐次白等）", async () => {
+  const logs = [];
+  const rpc = new DaemonRpc({ home: "/tmp/definitely-not-here-dsh", log: (l, m) => logs.push(`${l}:${m}`) });
+  assert.equal(rpc.available, true);
+  await assert.rejects(() => rpc.call("device.io.tap", {}), (e) => e.code === "ENOENT");
+  assert.equal(rpc.available, false, "连接层失败后应标记不可用，避免每次交互都白等一次超时");
+  assert.ok(logs.some((l) => l.includes("daemon socket 不可用")), "应记录日志");
+
+  // 再调一次：立即失败，不再尝试连接
+  await assert.rejects(() => rpc.call("device.io.tap", {}), /已标记为不可用/u);
+
+  // reset 后可以重试（daemon 重启的场景）
+  rpc.reset();
+  assert.equal(rpc.available, true);
+});
+
+await test("业务失败不标记通道不可用（否则一次设备错误就永久降级）", async () => {
+  const daemon = await fakeDaemon((msg) => ({
+    jsonrpc: "2.0", id: msg.id,
+    error: { code: -32000, message: "Server error", data: "gesture rejected" },
+  }));
+  try {
+    const rpc = new DaemonRpc({ home: join(daemon.socketPath, ".."), log: () => {} });
+    // home 指向 socket 所在目录
+    const fixed = new DaemonRpc({ home: daemon.socketPath.replace(/\/daemon\.sock$/u, ""), log: () => {} });
+    assert.equal(fixed.socketPath, daemon.socketPath);
+    await assert.rejects(() => fixed.call("device.io.tap", {}), /gesture rejected/u);
+    assert.equal(fixed.available, true, "业务错误不该让整条通道停用");
+    void rpc;
+  } finally {
+    await daemon.close();
+  }
+});
+
+await test("超时会抛错（设备卡住时不至于无限等）", async () => {
+  const daemon = await fakeDaemon(() => null); // 连着但不回 → 只能被超时打断
+  try {
+    await assert.rejects(
+      () => callDaemon("device.io.tap", {}, { socketPath: daemon.socketPath, timeoutMs: 250 }),
+      /超时/u,
+    );
+  } finally {
+    await daemon.close();
+  }
+});
+
+await test("路由真正走 RPC，且 rotate 回退 CLI", async () => {
+  /**
+   * 单元测试证明协议对了，这条证明**接线**对了：
+   * 经真实 StreamRoutes 发一次 tap，应当调 RPC 而不是 CLI。
+   * 用桩 RPC 记录调用，用桩 client 记录 CLI 调用。
+   */
+  const rpcCalls = [];
+  const cliCalls = [];
+  const stubRpc = {
+    available: true,
+    async call(method, params) { rpcCalls.push({ method, params }); return { status: "ok" }; },
+  };
+  const client = {
+    async listDevices() { return [{ id: "d1", name: "d", platform: "android", state: "online" }]; },
+    async runJson(args) { cliCalls.push(args.join(" ")); return {}; },
+  };
+  const pool = { acquire: () => ({ sendInput: (run, input) => run(["io", input.action]) }) };
+  const routes = new StreamRoutes({
+    client, pool, access: { mint: () => "t" }, log: () => {}, rpc: stubRpc,
+  });
+  routes.activeDeviceId = "d1";
+
+  const post = async (route, body) => {
+    const req = new Readable({ read() {} });
+    req.method = "POST";
+    req.url = `/${route}`;
+    req.headers = {
+      host: "127.0.0.1:19387", origin: "http://127.0.0.1:19387",
+      "content-type": "application/json",
+    };
+    req.socket = { remoteAddress: "127.0.0.1" };
+    const res = {
+      statusCode: 0, body: "", headersSent: false,
+      writeHead(c) { this.statusCode = c; this.headersSent = true; },
+      end(p) { this.body = p ?? ""; },
+      write() {}, on() {}, setHeader() {},
+    };
+    req.push(Buffer.from(JSON.stringify(body)));
+    req.push(null);
+    await routes.handle(route, req, res);
+    return res;
+  };
+
+  // tap → 应走 RPC
+  let res = await post("control", { action: "tap", x: 10, y: 20 });
+  assert.equal(res.statusCode, 200);
+  assert.equal(rpcCalls.length, 1, `tap 应走 RPC，实际 rpc=${rpcCalls.length} cli=${cliCalls.length}`);
+  assert.equal(rpcCalls[0].method, "device.io.tap");
+  assert.deepEqual(rpcCalls[0].params, { deviceId: "d1", x: 10, y: 20 });
+  assert.equal(cliCalls.length, 0, "走通 RPC 时不该再调 CLI");
+
+  // back → 应走 RPC
+  res = await post("device-action", { action: "back" });
+  assert.equal(res.statusCode, 200);
+  assert.equal(rpcCalls.length, 2);
+  assert.equal(rpcCalls[1].method, "device.io.button");
+  assert.equal(rpcCalls[1].params.button, "BACK");
+
+  // rotate → daemon 没有该方法，必须回退 CLI
+  const before = cliCalls.length;
+  res = await post("device-action", { action: "rotate" });
+  assert.equal(res.statusCode, 200);
+  assert.equal(
+    rpcCalls.length, 2,
+    "rotate 不该走 RPC —— daemon 不暴露 orientation（实测 method not found）",
+  );
+  assert.ok(cliCalls.length > before, "rotate 应当回退到 CLI");
+});
+
+await test("RPC 失败要回退 CLI，而不是让交互失败", async () => {
+  const cliCalls = [];
+  const stubRpc = {
+    available: true,
+    async call() { throw new Error("daemon 挂了"); },
+  };
+  const client = {
+    async listDevices() { return [{ id: "d1", name: "d", platform: "android", state: "online" }]; },
+    async runJson(args) { cliCalls.push(args.join(" ")); return {}; },
+  };
+  const pool = { acquire: () => ({ sendInput: (run, input) => run(["io", input.action]) }) };
+  const warns = [];
+  const routes = new StreamRoutes({
+    client, pool, access: { mint: () => "t" },
+    log: (level, msg) => warns.push(`${level}:${msg}`), rpc: stubRpc,
+  });
+  routes.activeDeviceId = "d1";
+
+  const req = new Readable({ read() {} });
+  req.method = "POST";
+  req.url = "/control";
+  req.headers = {
+    host: "127.0.0.1:19387", origin: "http://127.0.0.1:19387",
+    "content-type": "application/json",
+  };
+  req.socket = { remoteAddress: "127.0.0.1" };
+  const res = {
+    statusCode: 0, body: "", headersSent: false,
+    writeHead(c) { this.statusCode = c; this.headersSent = true; },
+    end(p) { this.body = p ?? ""; },
+    write() {}, on() {}, setHeader() {},
+  };
+  req.push(Buffer.from(JSON.stringify({ action: "tap", x: 1, y: 2 })));
+  req.push(null);
+  await routes.handle("control", req, res);
+
+  assert.equal(res.statusCode, 200, "RPC 失败不该让用户看到错误");
+  assert.ok(cliCalls.length > 0, "应当回退到 CLI");
+  assert.ok(warns.some((w) => w.includes("回退 CLI")), "应记录回退日志，便于排查");
+});
+
+await test("rpc 为 null 时全部走 CLI（配置可强制关闭）", async () => {
+  const cliCalls = [];
+  const client = {
+    async listDevices() { return [{ id: "d1", name: "d", platform: "android", state: "online" }]; },
+    async runJson(args) { cliCalls.push(args.join(" ")); return {}; },
+  };
+  const pool = { acquire: () => ({ sendInput: (run, input) => run(["io", input.action]) }) };
+  const routes = new StreamRoutes({ client, pool, access: { mint: () => "t" }, log: () => {}, rpc: null });
+  routes.activeDeviceId = "d1";
+
+  const req = new Readable({ read() {} });
+  req.method = "POST";
+  req.url = "/control";
+  req.headers = {
+    host: "127.0.0.1:19387", origin: "http://127.0.0.1:19387",
+    "content-type": "application/json",
+  };
+  req.socket = { remoteAddress: "127.0.0.1" };
+  const res = {
+    statusCode: 0, body: "", headersSent: false,
+    writeHead(c) { this.statusCode = c; this.headersSent = true; },
+    end(p) { this.body = p ?? ""; },
+    write() {}, on() {}, setHeader() {},
+  };
+  req.push(Buffer.from(JSON.stringify({ action: "tap", x: 1, y: 2 })));
+  req.push(null);
+  await routes.handle("control", req, res);
+
+  assert.equal(res.statusCode, 200);
+  assert.equal(cliCalls.length, 1, "rpc=null 时必须走 CLI");
 });
 
 console.log(`\n结果：${passed} 通过，${failed} 失败`);

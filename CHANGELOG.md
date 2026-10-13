@@ -5,6 +5,34 @@
 
 ## [未发布]
 
+### 变更
+
+- **交互指令改走 daemon 的 unix socket，延迟降低约 90%**：CLI 路径每条指令都要
+  新起一个 node 进程（mobilecli 是 `#!/usr/bin/env node`），实测固定开销约 66ms。
+  改用 daemon socket 的 JSON-RPC 后：
+
+  | 操作 | 改前（CLI） | 改后（RPC） |
+  |---|---|---|
+  | `tap` | 104.2 ms | **7.3 ms** |
+  | `swipe --duration 300` | 411 ms | 314.9 ms |
+  | （其中固定开销） | 111 ms | **14 ms** |
+
+  **关键：这条路径不需要 `server start`。** mobilecli 的 daemon 本来就在运行
+  （CLI 每条命令都会把它拉起来），它的 socket 直接吃 JSON-RPC —— 所以不新增
+  进程、不占端口、没有会话过期，正好绕开 ARCHITECTURE 里「不用 server 模式」
+  的三条理由。
+
+  协议细节（都是实测出来的）：传输是 **newline-delimited JSON 而非 HTTP**
+  （`curl --unix-socket` 会被拒）；**一请求一连接**（daemon 回完就主动关闭，
+  连发 3 个只回 1 个）；参数是**独立字段**而非 CLI 的逗号串。
+
+  ⚠️ **`rotate` 仍走 CLI** —— daemon 不暴露 orientation（实测多个候选方法名
+  全部 `method not found`）。CLI 始终是兜底：daemon 没起、版本不支持、
+  动作无 RPC 实现时都回退，功能不丢。连接层失败会标记通道不可用（不逐次
+  白等超时），但业务失败不标记（否则一次设备错误就永久降级）。
+
+  配置 `useDaemonRpc: false` 可强制全部走 CLI。自测 115 → 127。
+
 ### 修复
 
 - **流中断后画面永久死亡（用户报告"滚动的时候画面直接死了"）**：两个叠加的缺陷，

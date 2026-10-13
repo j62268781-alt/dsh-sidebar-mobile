@@ -45,6 +45,47 @@ mobilecli 有 `server start` + JSON-RPC，返回 `sessionUrl` 供二次连接。
 
 代价是流格式无法从 API 声明得知，只能从首块字节嗅探——但这本来就是必需的（见下）。
 
+### 为什么交互指令走 daemon socket 而不是 spawn CLI
+
+上面的「不用 server 模式」只管**取流**（`screencapture` 走 stdout 是对的）。
+但**交互指令**另有一条路，而且实测差距很大：
+
+| | tap | swipe(300ms) |
+|---|---|---|
+| spawn CLI | 104.2 ms | 411 ms（固定开销 111ms）|
+| daemon socket | **7.3 ms** | 314.9 ms（固定开销 14ms）|
+
+差在**每条命令新起一个 node 进程**（mobilecli 是 `#!/usr/bin/env node`），实测约 66ms。
+
+关键是：**这条路不需要 server 模式**。mobilecli 的 daemon 本来就在运行（CLI 每条
+命令都会把它拉起来，空闲 30 分钟自退），而它的 unix socket 直接吃 JSON-RPC。
+所以「不用 server 模式」的三条理由在这里都不成立 —— 不新增进程、不占端口、
+没有会话。
+
+协议细节（都是实测出来的，写错任何一条都会静默变慢或失败）：
+
+- 传输是 **newline-delimited JSON**（写一行 + `\n`），**不是 HTTP**。
+  用 `curl --unix-socket` 会被拒（`Received HTTP/0.9 when not allowed`）。
+- **一请求一连接**：daemon 回完响应就**主动关闭** socket。连发 3 个请求只回 1 个。
+  所以每个请求新建连接 —— 约 7ms，仍远快于 CLI。不要试图复用连接（会 EPIPE）。
+- 参数形状与 CLI **不同**：CLI 是逗号串（`540,1800,540,900`），
+  RPC 是独立字段（`x1/y1/x2/y2`）。传逗号串报 `'x1' is required`。
+- socket 路径 = `<MOBILECLI_HOME>/daemon.sock`。**必须与 CLI 用同一个 home**
+  （插件里抽成 `mobilecliHome` 一个变量），否则两边连到不同 daemon。
+- 权限天然收窄：socket 是 `srw-------`，只有本用户可连。
+
+⚠️ **`rotate` 没有 RPC 实现**：daemon 不暴露 orientation（实测
+`device.orientation(.get/.set)`、`device.rotate`、`device.setRotation` 等
+全部 `method not found`），所以 `rpcForDeviceAction` 对它返回 null，
+调用方回退 CLI。这是唯一一个仍走 CLI 的面板动作。
+
+**CLI 始终是兜底**：daemon 没起（ENOENT）、版本不支持、某动作无 RPC 实现时
+都回退，功能不丢。`DaemonRpc` 在**连接层**失败后会标记不可用，避免之后每次
+交互都白等一次连接超时；但**业务失败**（设备不存在、手势被拒）不标记 ——
+否则一次设备错误就会让整条快速通道永久降级。
+
+配置 `useDaemonRpc: false` 可强制全部走 CLI（排查用）。
+
 ### 为什么从字节嗅探流格式，而不相信请求参数
 
 实测：**iOS 模拟器上 `--format avc` 会静默降级成 MJPEG**，不报错、不警告。如果相信请求参数，就会给前端发 `content-type: video/h264`，而前端拿 H.264 解码器去解 JPEG——必然黑屏，且原因极难定位。

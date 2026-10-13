@@ -27,6 +27,19 @@
         # 流路由的挂载前缀（`/_dsh/dsh-sidebar-mobile/*`）。改动通常没有必要。
         routePrefix: '/_dsh/dsh-sidebar-mobile'
 
+        # 交互指令是否优先走 daemon 的 unix socket（JSON-RPC）。
+        #   true（默认）→ 优先 RPC，失败自动回退 CLI
+        #   false       → 全部走 CLI（排查用）
+        #
+        # 为什么：CLI 每条指令都要新起一个 node 进程，实测固定开销约 66ms，
+        # 一条 `io tap` 总共 104ms。而 daemon **本来就在运行**，它的 socket
+        # 直接吃 JSON-RPC（一请求一连接），tap 只要 7.3ms —— 快 93%。
+        # 关键是它不需要新起进程、不需要端口、没有会话过期。
+        #
+        # ⚠️ `rotate` 没有 RPC 实现（daemon 不暴露 orientation），
+        #    无论这个开关怎么设都走 CLI。
+        useDaemonRpc: true
+
         # 是否把 mobilecli 自带的 skill（skills/mobilecli/*.md）注册给模型。
         # 关掉只影响「模型知不知道这套命令」，不影响面板与工具本身。
         registerSkills: true
