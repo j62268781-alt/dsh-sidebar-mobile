@@ -41,7 +41,6 @@
 import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { transform } from "esbuild";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(HERE, "..");
@@ -52,6 +51,26 @@ const OUTPUT = join(ROOT, "lib", "client.js");
 
 /** CSS 在源码里的占位符。必须是合法标识符，否则 esbuild 会拒绝解析。 */
 const CSS_PLACEHOLDER = "__CLIENT_CSS__";
+
+/**
+ * 取 esbuild。**用动态 import 而不是顶层 import** —— 顶层 import 在没装依赖时
+ * 会抛一条 `ERR_MODULE_NOT_FOUND` 的栈，对使用者毫无信息量。换成一个明确的提示。
+ *
+ * 要区分两类人：
+ *   · **安装方**（git 依赖）根本不需要 esbuild —— 产物已提交进仓库。
+ *   · **改客户端源码的人**才需要，所以提示要写清是给谁的。
+ */
+async function loadEsbuild() {
+  try {
+    return await import("esbuild");
+  } catch {
+    throw new Error(
+      "缺少 esbuild（本仓库唯一的 devDependency）。\n"
+        + "  只安装/使用本插件不需要它 —— lib/client.js 已随仓库提交。\n"
+        + "  要改 src/client/ 才需要：先跑 npm install。",
+    );
+  }
+}
 
 const BANNER = `/**
  * ⚠️ 本文件是**构建产物**，不要直接编辑 —— 改动会在下次构建时被覆盖。
@@ -88,6 +107,7 @@ export async function buildClient() {
     );
   }
 
+  const { transform } = await loadEsbuild();
   const result = await transform(source, {
     loader: "jsx",
     // 产物保持 h(...) 形态，与改造前同构（见文件头）。

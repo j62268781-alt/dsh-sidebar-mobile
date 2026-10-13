@@ -2582,8 +2582,16 @@ await test("构建配置守住两条易错项（utf8 与 jsxFactory=h）", () =>
   assert.ok(/charset:\s*"utf8"/u.test(source), "构建没设 charset=utf8，产物里的中文会被转义");
   // jsxFactory=h 让产物与改造前同构，既有断言测试才继续有效
   assert.ok(/jsxFactory:\s*"h"/u.test(source), "构建没把 JSX 编译成 h(...)");
+  // 必须用 esbuild。
+  //
+  // ⚠️ 断言"用了 esbuild"这件事，**不要**钉死 import 写法：脚本里现在是
+  // `await import("esbuild")`（动态导入，好让缺依赖时给出可读提示而不是裸栈）。
+  // 只认 `from "esbuild"` 的话，改成动态导入就会无谓地变红 —— 实测踩过。
+  assert.ok(
+    /import\(\s*"esbuild"\s*\)|from "esbuild"/u.test(source),
+    "构建没有用 esbuild",
+  );
   // 必须是 transform（只转译），不是 build（会打包并试图解析 react）
-  assert.ok(/from "esbuild"/u.test(source), "应使用 esbuild");
   assert.ok(!/\bbuild\s*\(/u.test(source), "不要用 esbuild 的 build()：会把 react 打进产物，违反 bundle purity");
 });
 
