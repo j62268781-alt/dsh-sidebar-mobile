@@ -2475,5 +2475,59 @@ await test("状态栏用同一个映射（避免与下拉自相矛盾）", () =>
   assert.ok(/deviceKindLabel\(active\.type\)/u.test(source), "状态栏应走 deviceKindLabel");
 });
 
+// ── 离线设备可选中 + 自动启动 ───────────────────────────────────────────
+//
+// 用户问："USB 连一台真机，iPhone 17 Pro 模拟器没启动属于离线状态，
+// 点击可以启动吗？"
+//
+// 查下来这里有个**自相矛盾的 bug**：面板的设备列表来自 #status
+// （includeOffline:true，所以用户看得见那台关着的模拟器），
+// 但点它时走 #grant（默认**不含**离线）→ 查不到 → 回 "未找到设备：<id>"。
+// 用户视角就是"列表里明明有，点了却说没有"。
+
+console.log("\n离线设备");
+
+await test("grant 必须包含离线设备（否则与面板列表自相矛盾）", () => {
+  const source = stripComments(readFileSync(new URL("./lib/stream-routes.js", import.meta.url), "utf8"));
+  const grant = source.slice(source.indexOf("async #grant"));
+  const head = grant.slice(0, grant.indexOf("#status") === -1 ? 2000 : 2000);
+  assert.ok(
+    /listDevices\(\{\s*includeOffline:\s*true\s*\}\)/u.test(head),
+    "grant 用了不含离线的 listDevices —— 面板看得到却选不中",
+  );
+});
+
+await test("选中离线模拟器会自动启动，且 boot 失败不影响选中", () => {
+  const source = stripComments(readFileSync(new URL("./lib/stream-routes.js", import.meta.url), "utf8"));
+  // 只有虚拟设备才 boot（真机 boot 无意义）
+  assert.ok(/"simulator"/u.test(source) && /"emulator"/u.test(source), "应识别 simulator 与 emulator");
+  assert.ok(/device", "boot"/u.test(source), "应调用 device boot");
+  assert.ok(source.includes("BOOT_TIMEOUT_MS"), "启动要有超时（冷启动可达数分钟）");
+  // 失败不能吞掉 grant 成功
+  assert.ok(source.includes("bootError"), "启动失败应通过 bootError 如实返回，而不是让选中失败");
+});
+
+await test("面板会提示正在启动（冷启动数分钟，否则看起来像卡死）", () => {
+  const source = stripComments(readFileSync(new URL("./lib/client.js", import.meta.url), "utf8"));
+  assert.ok(source.includes("setBooting"), "缺启动中的状态");
+  /**
+   * ⚠️ 不要断言裸短语 `正在启动设备` —— CSS 注释里也有同样的词
+   * （CSS 在模板字符串里，stripComments 不会剥它），于是断言会被注释满足：
+   * 真删掉 UI 文案，测试照样通过（实测确认过这个假阴性）。
+   *
+   * 所以断言**那个 h(...) 调用里的完整文案**，也就是真正渲染出去的那句。
+   */
+  assert.ok(
+    /"mbm-dot", "data-on": "2" \}\),\s*"正在启动设备/u.test(source),
+    "应在状态栏渲染出启动提示（不能只在注释里提到）",
+  );
+  assert.ok(
+    /data-on": "2"/u.test(source),
+    "启动状态应有独立的视觉标识（不能和「未串流」混在一起）",
+  );
+  // bootError 要显示给用户
+  assert.ok(source.includes("bootError"), "bootError 应显示给用户，否则黑屏无解释");
+});
+
 console.log(`\n结果：${passed} 通过，${failed} 失败`);
 process.exit(failed === 0 ? 0 : 1);
