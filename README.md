@@ -17,9 +17,8 @@
 
 - 📺 **实时画面**：Android 走 AVC/H.264（实测 **104fps**），iOS 模拟器走 MJPEG（实测 **131fps**）
 - 👆 **直接在画面上操作**：点击即点击、拖拽即滑动，等比例换算回设备坐标
-- 🧰 **16 个模型工具**：读 UI 树、按标识点元素、启动应用、读日志、等文本出现
+- 🧰 **10 个模型工具**：读 UI 树、按标识点元素、启动应用、读日志、等文本出现
 - 📱 **一套 API 两端通用**：真机、模拟器、模拟机走同一条路径，没有平台分支
-- 🐦 **能读 Flutter 的真实 widget 树**：绕过无障碍投影，直连 Dart VM Service
 - 🎓 **自带 mobilecli 的 skill**：把上游 playbook 打包注册给模型，不用自己往 `.agents/` 抄
 - 🔐 **浏览器从不接触设备端口**：只经 DSH 自己的 web 源，签名令牌 + loopback 围栏
 - 📦 **零运行时依赖**：`react` 用宿主那份；客户端源码是 JSX，但**产物已提交**，安装方无需工具链（见[开发与自测](#开发与自测)）
@@ -39,7 +38,23 @@ DSH 社区已有一个 Android 插件和一个 iOS 插件，但各自踩了一�
 
 瓶颈不在 adb，而在**每帧搬一张完整 PNG**：1080p PNG 每帧几百 KB，H.264 每帧几 KB，差两个数量级。mobilecli 在设备端用 MediaCodec 编码，只把压缩后的码流传回来。
 
-更关键的是另一件事：**它能读 Flutter 的真实 render tree**。Flutter 把整个 UI 画进一块不透明的原生 view，无障碍树只能看到应用主动投影出去的那部分（合并过的、丢类型的，`CustomPaint` 画的图表直接消失）。mobilecli 通过 Dart VM Service 直读渲染树，拿得到 widget Key、控件状态、自绘内容——**这是现成插件都没有的能力**。
+### ⚠️ Flutter 应用读元素会读不到，这是预期的
+
+Flutter 把整个 UI 画进一块不透明的原生 view，**无障碍树只能看到应用主动投影出去的那部分**。实测一个真实的 Flutter 应用（debug 构建）：
+
+```
+mobilecli dump ui --format json  →  69 个节点，全部是 android.*
+  其中 32 个是 systemui 状态栏（时间/网速/wifi/电池），与你的应用无关
+  应用窗口下全是匿名 View / ImageView —— 只有 rect，没有 text、没有 identifier
+```
+
+更深一层：Flutter 的**语义树默认根本不生成**（框架出于性能考虑，只在检测到读屏类辅助技术时才生成）。所以这不是 mobilecli 的缺陷，是 Flutter 的渲染模型决定的 —— 关掉读屏时 `ext.flutter.debugDumpSemanticsTreeInTraversalOrder` 会明确回你：
+
+> Semantics not generated … the framework only generates semantics when asked to do so by the platform.
+
+要读**真正的 widget 树**必须走 Dart VM Service，或在 Flutter 工程里跑 `integration_test` / Patrol。两条路线的完整实测（协议细节、踩坑、阻塞项）见 **[docs/FLUTTER-TREE-RESEARCH.md](docs/FLUTTER-TREE-RESEARCH.md)**。
+
+本插件**不提供**这个能力 —— 早先的 `mobile_flutter_tree` 只是个空承诺（它与 `mobile_ui_tree` 调同一个函数，却声称直连 VM Service），已删除。
 
 ## 安装
 
@@ -165,7 +180,7 @@ pnpm add @j62268781-alt/dsh-sidebar-mobile
 
 ### 模型工具
 
-只注册 **11 个**「工具能做得比 CLI 更好」的工具：
+只注册 **10 个**「工具能做得比 CLI 更好」的工具：
 
 | 工具 | 用途 |
 |---|---|
@@ -178,7 +193,6 @@ pnpm add @j62268781-alt/dsh-sidebar-mobile
 | `mobile_find_text` / `mobile_tap_text` | OCR 找文字 / 点文字（树读不到时的兜底） |
 | `mobile_wait_for` | 等文本出现或消失 |
 | `mobile_logs` | 读设备日志（logcat / unified log） |
-| `mobile_flutter_tree` | **读 Flutter 真实 widget 树**（需 debug 构建） |
 
 #### 为什么不给 tap / swipe / 输入 / 按键 / 启动应用注册工具
 
@@ -193,7 +207,7 @@ mobilecli io button --device <id> BACK
 mobilecli apps launch --device <id> com.example.app
 ```
 
-它们的 schema 每次请求都要发，实测 11 个 = **1034 tokens/轮**（留着 16 个是 1487）
+它们的 schema 每次请求都要发，实测 10 个 = **910 tokens/轮**（16 个时是 1487）
 —— **省 453 tokens/轮**。
 
 ⚠️ 关键细节没跟着删，都在 skill 的「Driving the device from the shell」一节：
@@ -239,8 +253,6 @@ mobilecli 仓库里的 playbook（`SKILL.md` + `reference.md`）被原样打包�
 - **⚠️ swipe 不传 `--duration` 时会跑满 1000ms**。实测 `io swipe` 不带该参数耗时 1074ms，带 `--duration 300` 只需 374ms。插件按手指按住时长自动计算并透传。
 - **⚠️ `--bitrate` 默认值偏低**。实测 1080×2400 静止仅 0.98 Mbps、滑动 2.15 Mbps（大范围运动时明显发糊）。插件默认传 8 Mbps，同场景实测可达 6.6 Mbps。
 - **⚠️ iOS 的 `--format avc` 会被静默降级成 MJPEG**。这也是本插件从首块字节嗅探格式、而不相信请求参数的原因。
-- **⚠️ Flutter render tree 需要 debug 构建**。JVMTI 只能 attach 可调试的应用；release/profile 会退回无障碍树。
-- **iOS 真机的 Flutter 支持未验证**。已知的 Flutter 实现在模拟器路径上；真机走 WDA + LLDB 注入。
 - **多个 DSH 进程不能共用同一个 daemon**。需要并行时给每个 profile 配不同的 `homeDir`。
 - **⚠️ 从源码装时不能用软链**。本插件的 Host 半 import 宿主包（`@deepseek-ai/dsh-tools`），而 Node 的 ESM 解析会以软链的**真实路径**为基准去找 `node_modules`——源码目录下没有那些包，于是启动日志报 `failed to import`（伴随 `1 entry did not activate`）。**实测对照**：同一个插件软链失败、真实目录成功。用 `dsh plugin add "link:$PWD"` 或 `cp -R` 成真实目录，见 [docs/DEPLOY-DSH.md](docs/DEPLOY-DSH.md)。发到 npm 后不受影响。
 

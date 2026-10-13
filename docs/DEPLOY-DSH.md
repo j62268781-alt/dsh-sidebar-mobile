@@ -185,7 +185,7 @@ dsh plugin --profile web remove @j62268781-alt/dsh-sidebar-mobile
 
 插件卸载时：
 
-1. 注销 16 个工具与 skill
+1. 注销 10 个工具与 skill
 2. 摘掉流路由
 3. **停掉所有流子进程**（否则设备会一直编码，耗电并占用 USB 带宽）
 

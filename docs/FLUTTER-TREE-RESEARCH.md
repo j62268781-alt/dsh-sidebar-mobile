@@ -28,6 +28,18 @@ client.runJson(["dump", "ui", "--device", deviceId, "--format", "json"])
 `--device` / `--format json|text|raw` / `--full`），CLI 里也没有 `flutter` 命令，
 daemon 的 `device.flutter.vmServiceUri` 返回 `method not found`。
 
+### 结论：该工具**已删除**
+
+一个**描述骗人的工具比没有这个工具更糟** —— agent 会以为读到了 Flutter 树
+并据此下结论。它同时还与 `mobile_ui_tree` 完全重复，白占约
+**124 tokens/轮** 的 schema 成本（11 个工具 1034 → 10 个 910，实测）。
+
+名字保留在 `REMOVED_TOOL_NAMES` 里（本仓库惯例），这样调用方拿到
+`mobile_flutter_tree is not a tool` 时能分辨"插件删了它"和"名字打错了"。
+
+**替换路径**：真要读 Flutter widget 树，走下面两条路线之一，本插件不再实现。
+
+
 ### 实测：它拿到的是什么
 
 对上述应用（**确实是 Flutter**，APK 里有 `assets/flutter_assets/`）执行
@@ -52,6 +64,44 @@ content                    1080x2376 @0,0
 **这正是 Flutter 在无障碍层的投影**：整屏画出来的东西没有语义，只有矩形。
 所以这份"树"对要看懂界面结构几乎没有价值 —— 描述承诺的恰是"绕过无障碍投影"，
 而它没有绕过。
+
+### 为什么会这样：Flutter 的语义树**默认根本不生成**
+
+这一点最初被误判为"Flutter 不可测"。实测把它纠正了 —— Flutter 自己会告诉你：
+
+```
+$ curl ".../ext.flutter.debugDumpSemanticsTreeInTraversalOrder?isolateId=..."
+Semantics not generated for _ReusableRenderView#35615.
+For performance reasons, the framework only generates semantics when asked
+to do so by the platform. Usually, platforms only ask for semantics when
+assistive technologies (like screen readers) are running.
+To generate semantics, try turning on an assistive technology (like TalkBack).
+```
+
+配合设备状态一起看就完整了：`accessibility_enabled = 0`、**零个无障碍服务在跑**
+—— 所以语义树从未生成，`dump ui` 自然只能看到匿名 view。
+
+**那么"开启 TalkBack 再读 a11y 树"是不是一条可行的替代路线？实测后不推荐。**
+
+短暂启用 TalkBack（`settings put secure enabled_accessibility_services
+com.google.android.marvin.talkback/.TalkBackService`）后重新 dump，树确实变了：
+
+| | 拍平节点 | 有文字 | 有 identifier |
+|---|---|---|---|
+| TalkBack 关闭 | 69 | 3（全是 systemui） | 34 |
+| TalkBack 开启 | 68 | 11 | 61 |
+
+**但多出来的文字全是 TalkBack 自己的引导页** —— `TalkBack 已开启` /
+`关闭 TalkBack` / `欢迎使用 TalkBack` / `第 1 页，共 7 页`。它把前台抢走了，
+所以这次测量**没能验证到应用自身的语义树是否填充**（要验下去得先闯过 7 页设置向导）。
+
+而"得先闯过设置向导"**本身就是反对这条路的证据**：作为产品能力，它需要
+**改变用户设备的无障碍状态**、会让手机开始朗读、还会把触控变成"单击选中、
+双击激活"。不可接受。Patrol 完全不需要碰这些。
+
+> 复现步骤、以及本次为避免残留做了什么恢复（音量/无障碍开关/前台应用），
+> 见文末附录。
+
 
 ---
 
@@ -293,25 +343,35 @@ dart pub add --dev patrol_mcp
 
 ## 4. 建议
 
-1. **两个都要，但分开做**，别把 Patrol 逻辑塞进 `mobile_flutter_tree`
-2. 走 VM Service 那条时，**判定表是必需的**（否则会静默给出错误的树）
-3. 走 Patrol 那条时，**先修版本不匹配**，否则后面全是假故障
+1. **本插件不再自带 Flutter 树能力**（`mobile_flutter_tree` 已删除）。
+   两条路线都属于**别的工具**的职责，塞进本插件只会重复且说谎。
+2. **首选 Patrol / `patrol_mcp`**（脚本化自动化）。对本插件面向的场景
+   （自己的 App、可复现流程、要进 CI）它明显更优：有断言、有 Key 定位、
+   能控系统开关、有测试运行器。**但先修版本不匹配**，否则后面全是假故障。
+3. 要**现场观测**（"现在屏幕上是什么"）时才走 VM Service。那时**判定表是必需的**
+   —— 否则会静默给出错误的树，比报错更糟。
 4. 若目标应用是自己人写的（如 `tcl_jiguang`），**`creationLocation` ↔ 本机源码**
-   是最有价值的产出 —— 值得单独做个能力
+   是最有价值的产出 —— 值得单独做个能力。
+5. 若在 `tcl_jiguang` 工作区，**优先用已经配好的 `dart-mcp-server`** 的
+   `get_widget_tree`：它由 `launch_app` 自行持有 URI，**不需要抓鉴权码**。
+   ⚠️ 但它 26 个 schema 常驻约 **6867 tokens/轮**（是本插件全部 10 个工具的
+   7.5 倍），建议用 `--exclude-tool` 排掉与 shell 命令等价的那些。
 
 ---
 
-## 附：未提交的原型
+## 附：原型与复现
 
-`lib/device/flutter-vm.js` 是一份**未接线的原型**（未提交、未被任何工具引用），
-含：
+### `lib/device/flutter-vm.js`（未提交、未接线）
+
+调研期间写过一份原型，含：
 
 - 判定表 `FLUTTER_RULES` / `decideFlutterStrategy()`（纯函数，可单测）
 - 三个纯解析器：`parseVmServiceUri()` / `findVmServicePort()` / `isFlutterProcess()`
 - 裁剪器 `shapeWidgetTree()`（`scope: app|all` + `maxNodes`/`maxDepth`）
 - IO 层 `FlutterVm`（adb 探测 → forward → VM Service RPC）
 
-它**没有**接进 `mobile_flutter_tree`，所以对现有行为零影响。
+**它从未接线，也随着 `mobile_flutter_tree` 的删除而失去归宿。** 保留在此仅为
+记录"这个方案长什么样"；如果要重做，上面的协议细节比这份代码更值钱。
 
 ### 复现本次调研的关键命令
 

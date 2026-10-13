@@ -1897,14 +1897,21 @@ await test("只注册加工型工具，薄包装不许回流", () => {
   const entries = [...source.matchAll(/\[TOOL_NAMES\.(\w+)\]/gu)].map((m) => m[1]);
   assert.ok(entries.length > 0, "找不到任何 [TOOL_NAMES.x] 注册项");
 
-  assert.equal(entries.length, 11, `应注册 11 个工具，实际 ${entries.length}：${entries.join(", ")}`);
+  assert.equal(entries.length, 10, `应注册 10 个工具，实际 ${entries.length}：${entries.join(", ")}`);
 
-  // 被删的 5 个不得回流
-  const REMOVED = ["tap", "swipe", "text", "button", "launchApp"];
+  /**
+   * 被删的工具不得回流，且必须出现在 REMOVED_TOOL_NAMES 里
+   * （让调用方能分辨"删了"和"打错了"）。
+   *
+   * 两组移除原因不同：
+   *   · 薄包装 5 个 —— 只是 runJson 加 return，agent 有 shell 就不需要
+   *   · flutterTree —— 与 ui_tree 完全重复（同一个 dumpUiElements），
+   *                    且描述谎称直连 Dart VM Service
+   */
+  const REMOVED = ["tap", "swipe", "text", "button", "launchApp", "flutterTree"];
   for (const key of REMOVED) {
-    assert.ok(!entries.includes(key), `TOOL_NAMES.${key} 是薄包装，不该被注册`);
+    assert.ok(!entries.includes(key), `TOOL_NAMES.${key} 不该被注册`);
   }
-  // 它们必须出现在 REMOVED_TOOL_NAMES 里（让调用方能分辨"删了"和"打错了"）
   const removedBlock = source.slice(
     source.indexOf("export const REMOVED_TOOL_NAMES = {"),
     source.indexOf("};", source.indexOf("export const REMOVED_TOOL_NAMES = {")),

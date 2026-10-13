@@ -40,7 +40,7 @@ mobilecli（Go 二进制）
 
 Host 侧的 agent 模块：
 
-- `lib/agent/tools.js` —— 11 个模型工具，全部经 `defineTool` 注册
+- `lib/agent/tools.js` —— 10 个模型工具，全部经 `defineTool` 注册
 - `lib/agent/skills.js` —— 把打包的 mobilecli playbook 注册给模型
 
 `index.js` 负责接线，并用 `ctx.effect` 保证卸载时全部注销。
@@ -349,7 +349,7 @@ mobile_find_text  ~1s          OCR，兜底
 
 | | tokens | 何时付费 |
 |---|---|---|
-| 工具 schema | 11 个 = **1034** | **每轮**（工具面随每次请求发出） |
+| 工具 schema | 10 个 = **910** | **每轮**（工具面随每次请求发出） |
 | skill 摘要 | **213** | **每轮** |
 | skill 正文 | **5137** | 载入后**每轮**（正文是 tool result，留在历史里） |
 
@@ -366,8 +366,11 @@ mobile_find_text  ~1s          OCR，兜底
 - `mobile_wait_for` —— OCR 轮询循环，单次 CLI 调用表达不了。
 - `mobile_devices` —— 合并设备数据与流池的 `streaming` 状态。
 - 其余：`tap_element` / `tap_text` / `find_text`（定位 + 失败时附可见元素）、
-  `flutter_tree`（绕过 a11y）、`screenshot`（落临时文件）、`logs`（限流+过滤）、
-  `list_apps`（字段归一化）。
+  `screenshot`（落临时文件）、`logs`（限流+过滤）、`list_apps`（字段归一化）。
+
+⚠️ `flutter_tree` 曾被列在这里，但那是错的：它不是「加工型」，而是
+`ui_tree` 的副本（两者调同一个 `dumpUiElements`），描述却声称直连 VM Service。
+已删除 —— 理由与替代路径见 [FLUTTER-TREE-RESEARCH.md](FLUTTER-TREE-RESEARCH.md)。
 
 **② skill 的触发描述是成本杠杆，不是文案。** `description` + `whenToUse`
 进每轮索引；一旦诱导模型在本可直接调工具的场景去载入技能，代价是

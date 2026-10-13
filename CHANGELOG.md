@@ -7,6 +7,48 @@
 
 ### 变更
 
+- **删除 `mobile_flutter_tree`**：它**与 `mobile_ui_tree` 完全重复**，且描述不实。
+
+  两者的 `execute` 调的是同一个函数（`dumpUiElements` → `mobilecli dump ui`），
+  唯一差别是它多一层"结果为空时给友好报错"。而它的描述却写着"绕过无障碍投影，
+  **直连 Dart VM Service**" —— 它从未连过任何 VM Service。
+
+  实测对一台真实的 debug Flutter 应用（`com.dycjr.jg.inner`，APK 有
+  `assets/flutter_assets/`、`flags=[ DEBUGGABLE ]`、无 `libapp.so`）：
+
+  ```
+  mobilecli dump ui --format json  →  69 个节点，全部 android.*
+    32 个是 systemui 状态栏（时间/网速/wifi/电池），与应用无关
+    应用窗口下全是匿名 View/ImageView —— 只有 rect，没有 text/identifier
+  ```
+
+  也就是说它给不出描述承诺的任何东西。**一个描述骗人的工具比没有这个工具更糟**
+  —— agent 会以为读到了 Flutter 树并据此下结论。
+
+  顺带纠正一个更容易被误判的点：**这不是 Flutter 不可测，而是 Flutter 的语义树
+  默认根本不生成**。实测关掉读屏时它自己会回：
+
+  > Semantics not generated … the framework only generates semantics when
+  > asked to do so by the platform. Usually, platforms only ask for semantics
+  > when assistive technologies (like screen readers) are running.
+
+  实测过"开 TalkBack 再读 a11y 树"这条替代路线，**不推荐**：启用后 TalkBack
+  自己的 7 页设置向导会抢占前台（拿到的文字全是 `关闭 TalkBack` / `欢迎使用
+  TalkBack` 之类），而且它需要改变用户设备的无障碍状态、让手机开始朗读、把触控
+  变成"单击选中双击激活"。作为产品能力不可接受。
+
+  真读 Flutter widget 树的正确路径是 **Dart VM Service** 或 **Patrol /
+  `integration_test`**，两条路线的完整实测（协议细节、踩坑、阻塞项）见
+  [docs/FLUTTER-TREE-RESEARCH.md](docs/FLUTTER-TREE-RESEARCH.md)。
+
+  名字保留在 `REMOVED_TOOL_NAMES`（本仓库惯例），便于分辨"插件删了它"和
+  "名字打错了"。**工具面 11 → 10，schema 常驻 1034 → 910 tokens/轮**
+  （实测：用桩宿主直接加载 `tools.js` 量 `header.tools`）。
+
+  一并清掉了 README 里**同样不实的营销文案**（"能读 Flutter 的真实 widget 树：
+  直连 Dart VM Service"、已知边界里的两条 Flutter 说明）与 `docs/market-entry.yml`
+  的中英文描述 —— 那个不实能力原先一路渗透到了对外的市场文案里。
+
 - **客户端改用 JSX + 独立样式文件，`lib/` 按职责分目录**（用户反馈
   "用的 h 这种让人看起来代码好奇怪"、"样式文件和布局文件应该要做区分"）。
 
