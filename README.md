@@ -278,6 +278,7 @@ npm run verify      # build:check + check + test（提交前跑这个）
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) —— 模块划分与关键取舍
 - [docs/DEPLOY-DSH.md](docs/DEPLOY-DSH.md) —— 部署到 DSH profile
 - [docs/PUBLISHING.md](docs/PUBLISHING.md) —— 发版流程
+- [docs/FLUTTER-TREE-RESEARCH.md](docs/FLUTTER-TREE-RESEARCH.md) —— 读 Flutter widget 树的两条路线（VM Service 直连 vs Patrol），含实测协议细节与阻塞项
 - [CHANGELOG.md](CHANGELOG.md)
 
 ## License
