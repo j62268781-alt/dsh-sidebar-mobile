@@ -909,6 +909,64 @@ await test("工具栏按钮用官方 Button（28px），而不是自绘的 26px 
   assert.ok(!/\.mbm-btn\s*\{/u.test(source), "残留了 .mbm-btn 规则");
 });
 
+// ── canvas 尺寸：必须由「帧的宽高比」决定 ──────────────────────────────
+//
+// 这一段锁的是一个把画面压成**横向小条**的真实 bug（真机截图确认）。
+//
+// <canvas> 没设 CSS 尺寸时默认 300×150（宽高比 2.0）。`.mbm-media` 只有
+// max-width/max-height，元素就按这个内在尺寸排版。若尺寸函数去读
+// canvas 自己的 getBoundingClientRect，就形成循环依赖：
+//
+//   读到 300×150 → 后备存储设成 600×300 → 显示仍是 300×150（max-* 之下不变）
+//   → 自洽地卡在 2.0，与设备的 1080×2376（0.45）毫无关系
+//
+// 实测：连续 6 帧都停在 330×165（2.0），而正确值应是 ~318×700（0.45）。
+//
+// 所以尺寸必须由**帧的真实宽高比** + **父容器可用空间**推出。
+
+console.log("\ncanvas 尺寸");
+
+await test("尺寸从帧的宽高比推出，而不是读 canvas 自己的矩形（防反馈环）", () => {
+  const source = readFileSync(new URL("./lib/client.js", import.meta.url), "utf8");
+  const fit = source.match(/function fitCanvasToFrame\([\s\S]*?\n    \}/u)?.[0] ?? "";
+  assert.ok(fit.length > 0, "找不到 fitCanvasToFrame");
+
+  // 必须用传入的帧尺寸算宽高比（contain：两轴都要参与，取较小的缩放比）
+  assert.ok(/frameWidth/u.test(fit) && /frameHeight/u.test(fit), "未使用帧尺寸");
+  assert.ok(/availWidth \/ frameWidth/u.test(fit), "没有按 frameWidth 做 contain");
+  assert.ok(/availHeight \/ frameHeight/u.test(fit), "没有按 frameHeight 做 contain");
+  assert.ok(/Math\.min\(/u.test(fit), "contain 必须取两轴缩放比的较小值");
+
+  // ★ 核心断言：不能读 canvas 自己的 getBoundingClientRect 来定尺寸
+  assert.ok(
+    !fit.includes("canvas.getBoundingClientRect"),
+    "读了 canvas 自己的矩形 —— 那正是把画面压成横条的反馈环",
+  );
+  // 可用空间应取自父容器
+  assert.ok(/parentElement/u.test(fit), "可用空间应取自父容器（.mbm-stage）");
+  // 两个尺寸都要写：CSS 决定显示多大，后备存储决定画多少像素
+  assert.ok(/canvas\.style\.width/u.test(fit), "没有写 CSS 尺寸 → 元素仍按 300×150 排版");
+  assert.ok(/canvas\.width = /u.test(fit), "没有写后备存储");
+});
+
+await test("媒体元素是 flex:none（否则 flex 容器会拉伸它、宽高比又丢）", () => {
+  const css = panelCss();
+  const rule = css.match(/\.mbm-media\s*\{([^}]*)\}/u)?.[1] ?? "";
+  assert.ok(rule.includes("flex: none"), `媒体元素必须 flex:none：${rule}`);
+  assert.ok(rule.includes("max-width: 100%"), "应保留 max-* 作为 JS 未跑到时的兜底");
+});
+
+await test("绘制时按帧尺寸设 canvas（而不是复用传入的旧尺寸）", () => {
+  const source = readFileSync(new URL("./lib/client.js", import.meta.url), "utf8");
+  // 调用点必须把 frame.displayWidth/Height 传进去
+  assert.ok(
+    /fitCanvasToFrame\(canvas,\s*frame\.displayWidth,\s*frame\.displayHeight\)/u.test(source),
+    "调用点没有传真实帧尺寸",
+  );
+  // 旧的 syncCanvasSize 应已删除
+  assert.ok(!source.includes("syncCanvasSize"), "残留了旧的 syncCanvasSize");
+});
+
 await test("设备下拉：关掉原生箭头并自绘，左右内边距才对称", () => {
   const css = panelCss();
   // 原生箭头会吃掉右侧内边距（左 8 / 右 0），必须 appearance:none

@@ -227,7 +227,7 @@ mobilecli 仓库里的 playbook（`SKILL.md` + `reference.md`）被原样打包�
 ## 自测
 
 ```bash
-npm test          # 94 项，无设备也能跑完（有设备时额外验证真实调用）
+npm test          # 97 项，无设备也能跑完（有设备时额外验证真实调用）
 npm run check     # 语法检查
 npm run verify    # 两者都跑
 ```
