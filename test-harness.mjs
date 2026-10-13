@@ -1846,5 +1846,111 @@ await test("tab 类型声明了 keepMounted（否则切会话会 dispose 重建�
   );
 });
 
+// ── 工具面：只留"加工型" ────────────────────────────────────────────────
+//
+// 5 个薄包装（tap/swipe/button/type_text/launch_app）被删掉了 —— 它们只是
+// `runJson(...)` 加一句 return，而 agent 本来就有 shell（dsh-tool-bash 在
+// dsh-base 里，恒可用），直接跑等价 mobilecli 命令就行。
+//
+// 收益（按 dsh-token-meter 的 ceil(chars/4)+4 公式实测）：
+//   16 个工具 schema = 1487 tokens/轮（每次请求都发）
+//   11 个工具 schema = 1034 tokens/轮
+//   → 省 453 tokens/轮
+//
+// 这一段守住两件事：① 薄包装不许悄悄回来；② 它们的**知识**必须留在 skill 里。
+
+console.log("\n工具面");
+
+await test("只注册加工型工具，薄包装不许回流", () => {
+  /**
+   * ⚠️ 这里**不能** import tools.js —— 它依赖宿主包 `@deepseek-ai/dsh-tools`，
+   * 在没有宿主的环境会直接抛（见 lib/tool-support.js 的说明）。
+   * 所以按本仓库惯例：读源码 + 先剥注释（注释里会引用工具名，不剥会骗过断言）。
+   */
+  const source = stripComments(readFileSync(new URL("./lib/tools.js", import.meta.url), "utf8"));
+
+  /**
+   * 注册表 = 源码里的 `[TOOL_NAMES.x]: y` 注册项。
+   *
+   * ⚠️ 不要锚 `return {` —— 各工具内部也有 return（例如 devicesTool），
+   * 会锚到第一个而拿到 0 项（第一版就是这么错的，测试报"实际 0"）。
+   * `[TOOL_NAMES.x]` 这种计算属性写法**只**出现在注册表里，是可靠的锚点。
+   */
+  const entries = [...source.matchAll(/\[TOOL_NAMES\.(\w+)\]/gu)].map((m) => m[1]);
+  assert.ok(entries.length > 0, "找不到任何 [TOOL_NAMES.x] 注册项");
+
+  assert.equal(entries.length, 11, `应注册 11 个工具，实际 ${entries.length}：${entries.join(", ")}`);
+
+  // 被删的 5 个不得回流
+  const REMOVED = ["tap", "swipe", "text", "button", "launchApp"];
+  for (const key of REMOVED) {
+    assert.ok(!entries.includes(key), `TOOL_NAMES.${key} 是薄包装，不该被注册`);
+  }
+  // 它们必须出现在 REMOVED_TOOL_NAMES 里（让调用方能分辨"删了"和"打错了"）
+  const removedBlock = source.slice(
+    source.indexOf("export const REMOVED_TOOL_NAMES = {"),
+    source.indexOf("};", source.indexOf("export const REMOVED_TOOL_NAMES = {")),
+  );
+  for (const key of REMOVED) {
+    assert.ok(
+      removedBlock.includes(key),
+      `${key} 既没注册也没进 REMOVED_TOOL_NAMES`,
+    );
+  }
+
+  // TOOL_NAMES 必须与注册表一致（index.js 会 re-export 它）
+  const namesStart = source.indexOf("export const TOOL_NAMES = {");
+  const declared = [
+    ...source.slice(namesStart, source.indexOf("};", namesStart)).matchAll(/^\s*(\w+):/gmu),
+  ].map((m) => m[1]);
+  assert.deepEqual(
+    [...declared].sort(),
+    [...entries].sort(),
+    `TOOL_NAMES 与注册表不一致：声明 ${declared.join(",")} / 注册 ${entries.join(",")}`,
+  );
+});
+
+await test("被删工具的关键知识必须留在 skill 里（否则是净损失）", () => {
+  const skill = readFileSync(new URL("./skills/mobilecli/SKILL.md", import.meta.url), "utf8");
+  /**
+   * 删掉工具时最容易犯的错：把知识与代码一起删。
+   * 下面每一条都是"看 --help 看不出来、踩过才知道"的细节。
+   */
+  const mustKeep = [
+    [/--duration/u, "io swipe 必须传 --duration（否则用平台默认 ~1000ms，慢动作）"],
+    [/(physical|物理).{0,12}pixel|physical pixels/iu, "坐标是物理像素"],
+    [/focus|聚焦/iu, "输入文本前必须先让输入框获得焦点"],
+    [/BACK/u, "io button 的键名（Android 上 BACK 是一等公民）"],
+    [/apps list|先列|list first/iu, "启动应用前先列应用，别猜包名"],
+    [/ADBKeyboard/u, "非 ASCII 不需要 ADBKeyboard（实测纠正过的事实）"],
+  ];
+  for (const [re, why] of mustKeep) {
+    assert.ok(re.test(skill), `skill 里丢了这条知识：${why}`);
+  }
+});
+
+await test("skill 的触发描述不许覆盖工具已能做的场景", async () => {
+  const { loadBundledSkill } = await import("./lib/skills.js");
+  const skill = loadBundledSkill();
+  assert.ok(skill !== null, "skill 未加载");
+
+  /**
+   * ⚠️ 这是本仓库**最贵的文案**：description + whenToUse 会进每轮的工具面索引，
+   * 而它们一旦诱导模型去载入 skill 正文，代价是 5137 tokens（实测），
+   * 且载入后留在历史里每轮重发。实测这笔误触发是工具瘦身收益的 ~15 倍。
+   *
+   * 老版本写的是 "Use whenever a task involves operating or inspecting a
+   * mobile device" —— 几乎覆盖所有场景。现在必须明确排除。
+   */
+  const text = `${skill.description} ${skill.whenToUse}`.toLowerCase();
+
+  assert.ok(
+    /do not|not for|skip this skill|no mobile_\* tool|do not cover/u.test(text),
+    "触发描述没有排除工具已覆盖的场景 —— 会让模型在本可直接调工具时载入 5137 tokens 正文",
+  );
+  // 正文（content）里保留全部细节是对的；这里只约束常驻的摘要
+  assert.ok(skill.content.length > 15000, "正文应保留完整参考（按需加载，不常驻）");
+});
+
 console.log(`\n结果：${passed} 通过，${failed} 失败`);
 process.exit(failed === 0 ? 0 : 1);

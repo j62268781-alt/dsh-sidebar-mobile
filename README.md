@@ -165,21 +165,41 @@ pnpm add @j62268781-alt/dsh-sidebar-mobile
 
 ### 模型工具
 
+只注册 **11 个**「工具能做得比 CLI 更好」的工具：
+
 | 工具 | 用途 |
 |---|---|
 | `mobile_devices` | 列出所有设备（**先跑这个**拿到 device id） |
 | `mobile_boot` | 启动设备并开始串流（画面出现在面板） |
 | `mobile_ui_tree` | **读界面首选**：类型、文本、identifier、坐标 |
 | `mobile_screenshot` | 截图（给人或多模态模型看，不是读界面的首选） |
-| `mobile_tap` / `mobile_swipe` | 坐标操作 |
 | `mobile_tap_element` | **按标识/文本点元素**（比坐标稳，可带 `expect_text` 一并验证） |
-| `mobile_type_text` | 输入文本（**需先点输入框获得焦点**） |
-| `mobile_press_button` | HOME / BACK / POWER / 音量 / ENTER / APP_SWITCH |
-| `mobile_list_apps` / `mobile_launch_app` | 列应用 / 启动应用 |
+| `mobile_list_apps` | 列已安装应用（启动前先列，别猜包名） |
 | `mobile_find_text` / `mobile_tap_text` | OCR 找文字 / 点文字（树读不到时的兜底） |
 | `mobile_wait_for` | 等文本出现或消失 |
 | `mobile_logs` | 读设备日志（logcat / unified log） |
 | `mobile_flutter_tree` | **读 Flutter 真实 widget 树**（需 debug 构建） |
+
+#### 为什么不给 tap / swipe / 输入 / 按键 / 启动应用注册工具
+
+这 5 个曾是工具，但只是 `mobilecli` 的薄包装（一次 `runJson` 加一句 `return`），
+没有任何加工 —— 而 agent 本来就有 shell，直接跑等价命令即可：
+
+```bash
+mobilecli io tap --device <id> 540,1200
+mobilecli io swipe --device <id> --duration 250 540,1800,540,700
+mobilecli io text --device <id> "hello"
+mobilecli io button --device <id> BACK
+mobilecli apps launch --device <id> com.example.app
+```
+
+它们的 schema 每次请求都要发，实测 11 个 = **1034 tokens/轮**（留着 16 个是 1487）
+—— **省 453 tokens/轮**。
+
+⚠️ 关键细节没跟着删，都在 skill 的「Driving the device from the shell」一节：
+坐标是**物理像素**、`io swipe` **必须传 `--duration`**（否则默认 1000ms 慢动作）、
+输入前必须**先聚焦**、`io button` 的键名、启动前先列应用。
+被删的名字留在 `REMOVED_TOOL_NAMES` 里，便于分辨「插件删了它」和「名字打错了」。
 
 工具描述里写明了"先用哪个、什么时候升级到下一个"，因为三种观察方式的代价差一个数量级：
 

@@ -1,6 +1,6 @@
 ---
 name: mobilecli
-description: Run mobile automation, app testing, and interact with iOS and Android devices, simulators, emulators, and apps using the mobilecli CLI tool or JSON-RPC API. Trigger this skill whenever the user wants to list connected devices, boot or shut down simulators/emulators, take mobile screenshots, start screen recordings, send key/touch inputs (tap, text, swipe, pinch, hardware buttons), manage apps (install, uninstall, launch, terminate, get foreground app), inspect webviews (query DOM, evaluate JS, navigate), download/upload files on-device, get crash reports, install mobilecli, or allocate and release remote real devices on Mobile Next cloud, even if they don't explicitly name "mobilecli". Requires the mobilecli npm package; the skill installs it if missing.
+description: Use the mobilecli CLI or JSON-RPC API directly for iOS/Android device operations that the built-in mobile_* tools do NOT cover — recording (screen/audio), pinch and multi-touch gestures, clipboard read/write, on-device file download/upload, WebView inspection (query DOM, evaluate JS, navigate), crash reports, app install/uninstall/terminate/clear-data, device boot/shutdown/reboot, locale and settings, remote real-device allocation on Mobile Next cloud, and installing or scripting mobilecli itself. Also load when a task needs mobilecli's raw JSON output or a command shape the tools do not expose. Do NOT load this skill for plain tap / swipe / text / key input, screenshots, UI-tree reads, app listing or launching, or log reading — the mobile_* tools already do those faster, with fewer tokens, and without a shell round-trip. Requires the mobilecli npm package; the skill installs it if missing.
 allowed-tools: Bash(mobilecli:*)
 ---
 
@@ -135,6 +135,45 @@ Here is a quick reference table mapping standard user actions to `mobilecli` com
 | **Key Press** | `mobilecli io button <BUTTON_NAME>` | Press hardware buttons (e.g. HOME, POWER) |
 | **Read Clipboard** | `mobilecli io clipboard get` | Read text from the device clipboard |
 | **Write Clipboard** | `mobilecli io clipboard set "<text>"` | Replace text on the device clipboard |
+
+---
+
+## Driving the device from the shell (when no mobile_* tool fits)
+
+The plugin ships `mobile_*` tools for the common cases — **prefer them**; they are
+cheaper and their output is already normalised. Reach for raw `mobilecli` when you
+need a command the tools do not expose, want the raw JSON, or the tools are not
+available in this session.
+
+The hard-won details below used to live in the tool descriptions. They are kept
+here because they are not obvious from `mobilecli --help`:
+
+- **Tap** — coordinates are **physical pixels**, not CSS or logical pixels. But
+  prefer a ref (`@e5` from `dump ui`) over coordinates: a coordinate breaks the
+  moment layout shifts.
+- **Swipe** — pass `--duration` explicitly. Without it mobilecli uses the platform
+  default, measured at **~1000 ms**, which makes every scroll feel like slow
+  motion. `--duration 200`–`300` matches a real fling. Also: on Android do not
+  start the gesture at the very screen edge — the system gesture navigation eats
+  it.
+- **Hardware buttons** — `mobilecli io button <NAME>`. Android:
+  `HOME / BACK / POWER / VOLUME_UP / VOLUME_DOWN / ENTER / APP_SWITCH`. iOS:
+  `HOME / POWER / VOLUME_UP / VOLUME_DOWN`. On Android, `BACK` is a first-class
+  action — hunting for an on-screen back arrow is usually slower and less reliable.
+- **Typing text** — the target field must **already have focus**, or the text goes
+  somewhere unpredictable. Tap the field first (prefer its `@ref`), then send text,
+  then re-dump to confirm it landed. Arbitrary Unicode works on Android (Chinese,
+  emoji, Japanese, Korean) with **no ADBKeyboard needed** — verified on a real
+  device. Do not trust the `{"status":"ok"}` alone: read the field back.
+- **Key presses** — `mobilecli io keys <combo...>`. Accepts multiple combos in one
+  call (do that: each CLI invocation costs ~100 ms). Names are case-insensitive:
+  `backspace delete forwarddelete enter tab escape up down left right home end
+  space pageup pagedown`, single letters/digits, and combos like `shift+a`,
+  `ctrl+a`, `cmd+a`, `alt+tab`, `ctrl+shift+z`.
+- **Launching an app** — pass a package name (Android) or bundle id (iOS). If you
+  are not certain of the id, list first (`mobilecli apps list`): a guessed id fails
+  in a way that looks exactly like "the app is not installed", which is very hard
+  to tell apart.
 
 ---
 

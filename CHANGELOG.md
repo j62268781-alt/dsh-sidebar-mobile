@@ -5,6 +5,42 @@
 
 ## [未发布]
 
+### 变更
+
+- **工具面从 16 个收到 11 个，省 453 tokens/轮**：删掉 5 个薄包装
+  （`mobile_tap` / `mobile_swipe` / `mobile_press_button` / `mobile_type_text` /
+  `mobile_launch_app`）——它们只是 `runJson(...)` 加一句 `return`，没有任何加工，
+  而 agent 本来就有 shell（`dsh-tool-bash` 在 dsh-base 里，恒可用），
+  直接跑等价命令即可。
+
+  按宿主自己的计价公式（`dsh-token-meter`：`ceil(chars/4)+4`）实测：
+
+  | | tokens/轮 |
+  |---|---|
+  | 改前 16 个 | 1487 |
+  | 改后 11 个 | **1034** |
+  | 省 | **453** |
+
+  ⚠️ **知识没跟着删**。被删命令的坑（坐标是物理像素、`io swipe` 必须传
+  `--duration` 否则默认 ~1000ms 慢动作、输入前必须先聚焦、`io button` 的键名、
+  启动应用前先列应用、非 ASCII 无需 ADBKeyboard）已写进
+  `skills/mobilecli/SKILL.md` 的「Driving the device from the shell」一节。
+  被删的名字留在 `REMOVED_TOOL_NAMES`，便于分辨"插件删了它"和"名字打错了"。
+
+- **收紧 skill 的触发描述（本次收益最大的一项）**：`description` + `whenToUse`
+  会进每轮的工具面索引，而它们一旦诱导模型在本可直接调工具的场景去载入技能，
+  代价是 **5137 tokens 的正文**（实测）——且正文载入后留在对话历史里，
+  此后每轮重发。
+
+  老版本写的是 "Use whenever a task involves operating or inspecting a mobile
+  device"，几乎覆盖全部场景，而这些场景**已经有工具**。现在明确两件事：
+  ① 只在工具做不到时用（录屏、pinch、剪贴板、文件传输、WebView、崩溃报告、
+  安装/卸载、开机/关机、区域设置、远程设备、脚本化 mobilecli）；
+  ② 明确列出"别为我载入"的场景（tap / swipe / 输入 / 按键 / 截图 / UI 树 /
+  列应用 / 启动应用 / 日志）。
+
+  实测这笔误触发是工具瘦身收益的 **~15 倍**（5137 vs 453），所以先修它。
+
 ### 修复
 
 - **点击/滑动有 300+ms 延迟（体感"不跟手"）**：交互热路径上挂着一个设备预检查
