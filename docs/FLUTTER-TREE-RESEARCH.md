@@ -361,7 +361,7 @@ dart pub add --dev patrol_mcp
 
 ## 附：原型与复现
 
-### `lib/device/flutter-vm.js`（未提交、未接线）
+### `docs/prototypes/flutter-vm.js`（未接线，仅供参照）
 
 调研期间写过一份原型，含：
 
@@ -370,8 +370,13 @@ dart pub add --dev patrol_mcp
 - 裁剪器 `shapeWidgetTree()`（`scope: app|all` + `maxNodes`/`maxDepth`）
 - IO 层 `FlutterVm`（adb 探测 → forward → VM Service RPC）
 
-**它从未接线，也随着 `mobile_flutter_tree` 的删除而失去归宿。** 保留在此仅为
+**它从未接线，也随着 `mobile_flutter_tree` 的删除而失去归宿。** 保留下来仅为
 记录"这个方案长什么样"；如果要重做，上面的协议细节比这份代码更值钱。
+
+⚠️ **为什么放在 `docs/prototypes/` 而不是 `lib/`**：`package.json` 的 `files`
+含 `lib` 但不含 `docs`。它没有任何调用方，放进 `lib/` 就会**随包发布 21.6 kB
+的死代码**给每一个安装者（`npm pack` 实测确认过）。放这里既能留档，又不进包。
+
 
 ### 复现本次调研的关键命令
 
