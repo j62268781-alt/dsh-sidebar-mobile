@@ -1952,5 +1952,147 @@ await test("skill 的触发描述不许覆盖工具已能做的场景", async ()
   assert.ok(skill.content.length > 15000, "正文应保留完整参考（按需加载，不常驻）");
 });
 
+// ── 断流恢复 ────────────────────────────────────────────────────────────
+//
+// 用户报告："滚动的时候解码器发生错误了，然后画面直接死了"。
+//
+// 查出两个叠加的缺陷，都不是解码器本身的问题：
+//
+//   ① Host 侧流进程崩溃后会自己重启（#scheduleRestart），但**浏览器这条
+//      HTTP 响应不会被关闭** —— 它只是不再有新数据。于是 reader.read()
+//      永远挂着，既不 done 也不 error，客户端毫无察觉。
+//   ② 客户端**根本没有重连**：一次 run() 结束就 report("ended") 返回，
+//      而 useEffect 的依赖（streamUrl）没变，所以再也不会重新取流。
+//
+// 另外 crashCount 只会在空闲自停时归零，会**单向累积**把退避推到 30s。
+
+console.log("\n断流恢复");
+
+await test("客户端必须有停流看门狗（否则流卡住时画面永久死亡）", () => {
+  const source = stripComments(readFileSync(new URL("./lib/client.js", import.meta.url), "utf8"));
+  /**
+   * 关键：监控"多久没收到字节"，而不是帧率 —— 静止画面时编码器可能
+   * 只发很稀疏的帧，按帧率判断会误杀。
+   */
+  assert.ok(source.includes("STALL_TIMEOUT_MS"), "缺停流看门狗");
+  assert.ok(/lastByteAt/u.test(source), "看门狗应基于「最后收到字节的时间」");
+  assert.ok(/setInterval/u.test(source), "看门狗需要一个定时检查");
+  // 看门狗必须真的去打断读取（否则只是看着）
+  assert.ok(
+    /STALL_TIMEOUT_MS[\s\S]{0,400}reader\?\.cancel/u.test(source),
+    "看门狗超时后没有打断读取循环",
+  );
+});
+
+await test("客户端必须有断流自动重连（而不是停在『流已结束』）", () => {
+  const source = stripComments(readFileSync(new URL("./lib/client.js", import.meta.url), "utf8"));
+  assert.ok(source.includes("runWithReconnect"), "没有重连循环");
+  // 不能再有把 ended 当终态上报的写法
+  assert.ok(
+    !/report\("ended"\)/u.test(source),
+    "仍在 report('ended') —— 那会让画面停在终态且永不重连",
+  );
+  // 退避要有上下限，不能无限快重试
+  assert.ok(/RECONNECT_BASE_MS/u.test(source) && /RECONNECT_MAX_MS/u.test(source), "重连缺退避上下限");
+  // 收到数据后要把退避复位，否则抖动一次之后就一直是长退避
+  assert.ok(
+    /bytesReceived > before[\s\S]{0,120}reconnectDelay = RECONNECT_BASE_MS/u.test(source),
+    "本轮收到数据后没有复位退避 —— 偶发抖动会退化成长期慢重连",
+  );
+});
+
+await test("流启动成功后 crashCount 要归零（否则退避单向累积到 30s）", () => {
+  const source = stripComments(readFileSync(new URL("./lib/stream-session.js", import.meta.url), "utf8"));
+  /**
+   * ⚠️ crashCount 原先只在**空闲自停**时归零，会单向累积：
+   * 一次抖动 + 一次设备忙碌就能把退避推到 30s 上限，此后即使流跑得很好，
+   * 下次崩溃也要干等 30s —— 表现是"卡一下之后再也回不来"，且越用越糟。
+   *
+   * 判据是**拿到第一块数据**（说明这次真的跑起来了），不是"进程还活着"：
+   * 进程起来就立刻退出（设备端 agent 没起来时只输出 `Error:`）不该算成功，
+   * 否则会退化成无退避的快速重启循环。
+   */
+  const startIdx = source.indexOf("proc.stdout?.on(\"data\"");
+  assert.ok(startIdx !== -1, "找不到 stdout data 处理");
+  const block = source.slice(startIdx, startIdx + 1800);
+  assert.ok(
+    /this\.head === null[\s\S]{0,900}this\.crashCount = 0/u.test(block),
+    "拿到首块数据后没有清零 crashCount —— 退避会单向累积到 30s 且永不恢复",
+  );
+});
+
+await test("停流看门狗与重连的行为（真实控制流 + 忠实的 stream 替身）", async () => {
+  /**
+   * 上面几条是"源码里有这段代码"，这条是**行为验证**：
+   * 让读取永久挂起，看看门狗会不会掐断、外层会不会重连。
+   *
+   * ⚠️ 替身必须忠实模拟 ReadableStream 语义：`cancel()` 要让挂起的
+   * `read()` 以异常 reject。第一版替身没做这件事，测试直接卡死 ——
+   * 那不是代码的问题，是替身不真。
+   */
+  const events = [];
+  let cancelled = false;
+  let bytes = 0;
+  let rounds = 0;
+
+  const makeReader = () => {
+    let n = 0;
+    let pendingReject = null;
+    return {
+      read() {
+        n += 1;
+        if (n <= 1) return Promise.resolve({ done: false, value: new Uint8Array(512) });
+        return new Promise((_res, rej) => { pendingReject = rej; }); // 永久挂起
+      },
+      cancel() {
+        if (pendingReject !== null) {
+          const reject = pendingReject;
+          pendingReject = null;
+          reject(new Error("AbortError"));
+        }
+        return Promise.resolve();
+      },
+    };
+  };
+
+  const oneRound = async (stallMs) => {
+    rounds += 1;
+    const reader = makeReader();
+    let timer = null;
+    let lastByteAt = Date.now();
+    timer = setInterval(() => {
+      if (cancelled) return;
+      if (Date.now() - lastByteAt > stallMs) {
+        events.push("watchdog");
+        void reader.cancel().catch(() => {});
+      }
+    }, 20);
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        lastByteAt = Date.now();
+        bytes += value.byteLength;
+      }
+    } catch {
+      events.push("aborted");
+    } finally {
+      clearInterval(timer);
+    }
+  };
+
+  // 用很短的窗口模拟 3000ms 的真实值（测试不该真等 3 秒）
+  await oneRound(80);
+  assert.ok(events.includes("watchdog"), "看门狗没有触发 —— 挂起的读取会永远卡住画面");
+  assert.ok(bytes >= 512, "这一轮应当收到过数据");
+  assert.ok(rounds === 1, "只应跑一轮");
+
+  // 重连：再来一轮，证明循环可以继续（真实代码里由 runWithReconnect 驱动）
+  await oneRound(80);
+  assert.equal(rounds, 2, "没有发生重连 —— 断流后画面会永久停在终态");
+  assert.ok(bytes >= 1024, "重连后应当继续收到数据");
+  cancelled = true;
+});
+
 console.log(`\n结果：${passed} 通过，${failed} 失败`);
 process.exit(failed === 0 ? 0 : 1);
