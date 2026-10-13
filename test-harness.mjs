@@ -17,9 +17,10 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import net from "node:net";
+import http from "node:http";
 import { Readable } from "node:stream";
 import { Mobilecli, resolveBinary } from "./lib/device/mobilecli.js";
-import { StreamRoutes } from "./lib/stream/routes.js";
+import { StreamRoutes, mountRoutes } from "./lib/stream/routes.js";
 import {
   resolveSocketPath,
   callDaemon,
@@ -2124,6 +2125,151 @@ await test("没人回执时如实报 opened:false —— 不许假装成功", as
     `应当给出可照做的原因，实际 ${JSON.stringify(result)}`,
   );
   assert.ok(result.waitedMs >= 70, `应当真的等满超时，实际 ${result.waitedMs}ms`);
+});
+
+await test("面板轮询不许忙等：除「正常超时」外每一轮都要先退避", () => {
+  /**
+   * 这条是**实际测出来的 bug 的回归护栏**（不是假想）。
+   *
+   * 第一版只在 fetch 抛异常时退避，其余分支一律 `continue` 立刻重来。而
+   * **404 是成功的 HTTP 响应** —— fetch 不抛，只有 `response.json()` 解析
+   * "not found" 会失败。那时 seq 是 null，于是浏览器以 fetch 的最快速度
+   * 一圈接一圈地打宿主。宿主跑旧代码时（正是升级窗口）必然踩中。
+   *
+   * 判据：pump 里的每个 `continue`，要么前面有 `sleep(...)`，要么是那一条
+   * 设计内的"长轮询正常超时"（`if (seq === null) continue;`）—— 正常超时
+   * 立刻重挂是**对的**，不算忙等。
+   */
+  const source = stripComments(
+    readFileSync(new URL("./src/client/index.jsx", import.meta.url), "utf8"),
+  );
+
+  const start = source.indexOf("const pump = async () => {");
+  assert.ok(start > 0, "找不到 pump()");
+
+  // 花括号配对取出函数体，别用固定缩进（缩进会随重排变）
+  let depth = 0;
+  let end = -1;
+  for (let i = source.indexOf("{", start); i < source.length; i += 1) {
+    if (source[i] === "{") depth += 1;
+    else if (source[i] === "}") {
+      depth -= 1;
+      if (depth === 0) { end = i; break; }
+    }
+  }
+  assert.ok(end > start, "pump() 的括号没配对");
+  const pump = source.slice(start, end);
+
+  const ALLOWED = "if (seq === null) continue;";
+  const lines = pump.split("\n");
+  const continues = lines.filter((l) => l.trim().endsWith("continue;"));
+  assert.ok(continues.length >= 3, `pump 里的 continue 太少（${continues.length}），抽取可能失效`);
+
+  /**
+   * ⚠️ 判据是**紧邻的上一行代码**，不能用"往前 N 个字符里有没有 sleep"。
+   *
+   * 第一版就是这么写的，结果**假阴性**：把 `seq === lastHandled` 那支的
+   * sleep 删掉后测试照样通过 —— 因为 600 字符窗口够宽，把**前一个分支**的
+   * `await sleep(RETRY_DELAY_MS)` 也框进来了。每个分支的退避必须各自成立。
+   */
+  const offenders = [];
+  for (let i = 0; i < lines.length; i += 1) {
+    if (!lines[i].trim().endsWith("continue;")) continue;
+    if (lines[i].includes(ALLOWED)) continue; // 设计内：长轮询正常超时，立刻再挂
+
+    // 往上找第一条非空、非注释的代码行
+    let j = i - 1;
+    while (j >= 0 && (lines[j].trim() === "" || lines[j].trim().startsWith("//"))) j -= 1;
+    const prev = (lines[j] ?? "").trim();
+    if (!prev.includes("sleep(")) offenders.push(`${lines[i].trim()}   ← 上一行是 ${prev || "(空)"}`);
+  }
+
+  assert.deepEqual(
+    offenders,
+    [],
+    `这些 continue 没有紧邻的退避，会忙等打宿主：\n    ${offenders.join("\n    ")}`,
+  );
+});
+
+await test("端到端（真 HTTP）：路由真的挂在那个 URL 上，长轮询真的会挂住", async () => {
+  /**
+   * 前面几条用的是假 req/res —— 验的是 routes 内部逻辑。这条走**真实 socket**，
+   * 补上假对象验不到的那部分：
+   *
+   *   · mountRoutes 的 prefix + 路由名拼出来到底是不是那个 URL
+   *     （写错一个字符 = 404，而浏览器只会静默重试，没有人会报错）
+   *   · 传输层围栏、方法检查（GET / POST）在真请求上是否放行
+   *   · 长轮询在真连接上是否真的**挂住**，而不是立刻返回空
+   *
+   * 换句话说：这条过了，就只剩"浏览器里的 openTab 到底有没有打开侧边栏"
+   * 那一件事需要人来确认了。
+   */
+  const PREFIX = "/_dsh/dsh-sidebar-mobile";
+
+  const client = {
+    async listDevices() { return []; },
+    async runJson() { return {}; },
+  };
+  const routes = new StreamRoutes({
+    client, pool: { acquire: () => ({}) }, access: { mint: () => "t" }, log: () => {},
+  });
+
+  // 用桩 webServer 抓 mountRoutes 注册的 handler，再挂到真 http server 上
+  let mounted = null;
+  const ctx = {
+    webServer: {
+      register(route) { mounted = route; return () => {}; },
+    },
+  };
+  const dispose = mountRoutes(ctx, routes, PREFIX);
+  assert.ok(mounted !== null, "mountRoutes 没注册 handler");
+  assert.equal(mounted.kind, "prefix");
+  assert.equal(mounted.path, PREFIX, "挂载前缀与客户端拼的 PREFIX 不一致");
+
+  const server = http.createServer((req, res) => {
+    void mounted.handler(req, res);
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const { port } = server.address();
+  const base = `http://127.0.0.1:${port}${PREFIX}`;
+
+  try {
+    // ① 客户端挂上长轮询 —— 必须挂住（判"没立刻返回"）
+    let settled = false;
+    const held = fetch(`${base}/panel-open`)
+      .then((r) => r.json())
+      .then((j) => { settled = true; return j; });
+
+    await new Promise((r) => setTimeout(r, 120));
+    assert.equal(settled, false, "没有待处理请求时，真连接上的长轮询也必须挂住");
+
+    // ② 工具发起 → 挂住的那条立刻带号返回
+    const opening = routes.requestPanelOpen(5000);
+    const carried = await held;
+    assert.equal(carried.request, 1, `应当带回请求号，实际 ${JSON.stringify(carried)}`);
+
+    // ③ 客户端回执（真实 POST）
+    const ackRes = await fetch(`${base}/panel-open-ack`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ request: 1 }),
+    });
+    assert.equal(ackRes.status, 200, "回执 POST 应当被接受");
+
+    const result = await opening;
+    assert.equal(result.opened, true, "真 HTTP 链路上，回执后工具必须拿到 opened:true");
+
+    // ④ 方法检查：GET 打回执路由应当被拒
+    const wrongMethod = await fetch(`${base}/panel-open-ack`, { method: "GET" });
+    assert.equal(wrongMethod.status, 405, "回执路由必须只收 POST");
+
+    // ⑤ 路由前缀写错就该 404 —— 证明这条测试真的在验 URL
+    const wrong = await fetch(`http://127.0.0.1:${port}${PREFIX}-typo/panel-open`);
+    assert.equal(wrong.status, 404, "错误前缀应当 404");
+  } finally {
+    dispose();
+    await new Promise((resolve) => server.close(resolve));
+  }
 });
 
 await test("迟到的回执不算数（不能替下一次请求开门）", async () => {

@@ -1727,23 +1727,71 @@ window.__ModuleLoader__.load({
             /** 已处理过的请求号。宿主那边单调递增，所以记住号就天然幂等。 */
             let lastHandled = 0;
 
+            /**
+             * 退避间隔。
+             *
+             * ⚠️ 这个常量是**必需**的，不是保守起见。第一版只在 fetch 抛异常时
+             * 退避，其余分支一律 `continue` 立刻重来 —— 而那几条路都会变成忙等：
+             *
+             *   · 宿主还是旧代码（路由 404）：404 是**成功的 HTTP 响应**，
+             *     fetch 不抛，但 `response.json()` 解析 "not found" 会失败。
+             *     那时 seq 是 null，于是一圈接一圈地打宿主，没有间歇。
+             *   · 宿主返回了非 JSON 或空体：同上。
+             *   · 宿主一直挂着同一个已处理过的号（回执丢了）：seq 永远等于
+             *     lastHandled，也是原地空转。
+             *
+             * 所以这里的原则是：**只有"健康且拿到新号"才立刻进入下一轮**，
+             * 其余一切情况都先睡一下。长轮询的正常超时（healthy 但 seq 为 null）
+             * 仍然立刻重挂 —— 那是设计内的，不算异常。
+             */
+            const RETRY_DELAY_MS = 2000;
+            const STUCK_DELAY_MS = 1000;
+
+            const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
             const pump = async () => {
               while (!stopped) {
                 let seq = null;
+                /** 这一轮拿到了一个**可解析**的宿主响应。 */
+                let healthy = false;
+
                 try {
                   const response = await fetch(`${PREFIX}/${ROUTE_PANEL_OPEN}`, { method: "GET" });
                   if (stopped) return;
-                  const payload = await response.json().catch(() => ({}));
-                  seq = typeof payload?.request === "number" ? payload.request : null;
+                  if (response.ok) {
+                    const payload = await response.json().catch(() => null);
+                    if (payload !== null) {
+                      healthy = true;
+                      seq = typeof payload.request === "number" ? payload.request : null;
+                    }
+                  }
                 } catch {
-                  // 宿主重启 / 网络抖动：退避后重试。
-                  // 不能立刻重来 —— 那会在宿主没起来时变成忙等。
-                  if (stopped) return;
-                  await new Promise((resolve) => setTimeout(resolve, 2000));
+                  // 网络层失败（宿主重启、连接被掐）
+                }
+
+                if (stopped) return;
+
+                if (!healthy) {
+                  // 路由不存在 / 非 JSON / 连不上：退避，别空转
+                  await sleep(RETRY_DELAY_MS);
                   continue;
                 }
 
-                if (stopped || seq === null || seq === lastHandled) continue;
+                // 长轮询正常超时（没有待处理请求）——设计内的，立刻再挂
+                if (seq === null) continue;
+
+                if (seq === lastHandled) {
+                  // 宿主还挂着我们已经处理过的号 → 说明上次的回执丢了。
+                  // 补一次回执（自愈），然后退避 —— 否则这一支也是空转。
+                  try {
+                    await api(ROUTE_PANEL_OPEN_ACK, { request: seq });
+                  } catch {
+                    // 补不上就下次再说
+                  }
+                  await sleep(STUCK_DELAY_MS);
+                  continue;
+                }
+
                 lastHandled = seq;
 
                 try {
@@ -1758,7 +1806,8 @@ window.__ModuleLoader__.load({
                 try {
                   await api(ROUTE_PANEL_OPEN_ACK, { request: seq });
                 } catch {
-                  // 回执没送到不影响"面板已经打开"这个事实，下次轮询会补上
+                  // 回执没送到不影响"面板已经打开"这个事实；
+                  // 下一轮会看到同一个号并把回执补上（上面那一支）。
                 }
               }
             };
