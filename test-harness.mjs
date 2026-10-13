@@ -1326,6 +1326,60 @@ function extractFunction(name) {
   throw new Error(`函数 ${name} 的大括号不配对`);
 }
 
+/**
+ * 去掉 JS 源码里的注释（行注释与块注释）。
+ *
+ * ⚠️ 为什么需要它：这个项目里注释写得很多，而且**注释里经常引用真实代码**
+ * （例如解释某个属性为什么必须存在时会把 `keepMounted: true` 原样写进注释）。
+ * 于是"断言某段代码存在"的测试会被注释骗过去 —— 删掉真代码，测试照样通过。
+ * 断言源码前先剥注释，才能测到真正生效的那份。
+ *
+ * 不处理字符串里的 `//`（会把 URL 里的 `//` 误当注释）——所以先保护字符串。
+ *
+ * @param {string} source
+ * @returns {string} 剥掉注释后的源码
+ */
+function stripComments(source) {
+  let out = "";
+  let i = 0;
+  const n = source.length;
+  while (i < n) {
+    const ch = source[i];
+    const next = source[i + 1];
+
+    // 字符串 / 模板串：原样搬过去（含里面的 // 和 /*）
+    if (ch === '"' || ch === "'" || ch === "`") {
+      const quote = ch;
+      out += ch;
+      i += 1;
+      while (i < n) {
+        if (source[i] === "\\") { out += source[i] + (source[i + 1] ?? ""); i += 2; continue; }
+        out += source[i];
+        if (source[i] === quote) { i += 1; break; }
+        i += 1;
+      }
+      continue;
+    }
+
+    // 行注释
+    if (ch === "/" && next === "/") {
+      while (i < n && source[i] !== "\n") i += 1;
+      continue;
+    }
+    // 块注释
+    if (ch === "/" && next === "*") {
+      i += 2;
+      while (i < n && !(source[i] === "*" && source[i + 1] === "/")) i += 1;
+      i += 2;
+      continue;
+    }
+
+    out += ch;
+    i += 1;
+  }
+  return out;
+}
+
 /** 把抽出来的函数包成可调用的形式。 */
 function loadCodecHelpers() {
   const body = ["codecStringFromSps", "nalType", "concatBytes"]
@@ -1632,6 +1686,164 @@ await test("sendInput 拼出的命令形状正确", async () => {
 
   await assert.rejects(() => session.sendInput(run, { action: "nope" }), /不支持的操作/);
   session.stop();
+});
+
+// ── 键盘透传 ────────────────────────────────────────────────────────────
+//
+// 目标：点开设备里的输入框，用电脑键盘打字。手机输入法在侧边栏里没法用。
+//
+// 实测依据（一加 12 / Android 16，全部验证过）：
+//   · `io keys` 真的送达 —— 计算器收到 "7" "8" "9" 后显示 789，再发 "1" "2" "3" 显示 123
+//   · 一次可发多个键，耗时与发一个相同（每条命令约 100ms，逐字符发没法用）
+//   · 非 ASCII 走 `io text` —— 中文/emoji/日文/韩文/带音标拉丁文都能送达，
+//     **不需要 ADBKeyboard**（设备上根本没装，当前输入法是微信键盘）
+
+console.log("\n键盘透传");
+
+await test("keys 传给 mobilecli 的形状正确（一个 --device，多个键）", async () => {
+  const session = new StreamSession({
+    deviceId: "dev-1",
+    spawn: () => fakeStream().proc,
+    idleStopMs: 100_000,
+  });
+  const seen = [];
+  const run = async (args) => { seen.push(args); return {}; };
+
+  await session.sendInput(run, { action: "keys", keys: ["h", "e", "l"] });
+  assert.deepEqual(
+    seen[0],
+    ["io", "keys", "--device", "dev-1", "h", "e", "l"],
+    "合批的多个键应在同一次调用里，否则每条 100ms 会让打字没法用",
+  );
+
+  await session.sendInput(run, { action: "keys", keys: ["ctrl+a"] });
+  assert.deepEqual(seen[1], ["io", "keys", "--device", "dev-1", "ctrl+a"]);
+  session.stop();
+});
+
+await test("keys 白名单：合法按键通过", () => {
+  for (const keys of [
+    ["a"], ["enter"], ["backspace"], ["space"], ["escape"],
+    ["up"], ["down"], ["left"], ["right"], ["home"], ["end"],
+    ["shift+a"], ["ctrl+shift+z"], ["cmd+a"], ["alt+tab"],
+    ["a", "b", "c"],
+  ]) {
+    const r = validateInput("keys", { keys });
+    assert.equal(r.ok, true, `${JSON.stringify(keys)} 应通过，实际：${r.error}`);
+  }
+});
+
+await test("keys 白名单：参数注入必须被拒（字符串直接进 argv）", () => {
+  // 这些不是"奇怪的按键"，是**安全边界**：按键名直接进子进程 argv，
+  // 一个名叫 `--device` 的"按键"会改变命令语义。
+  for (const keys of [
+    ["--device"], ["--fps"], ["a", "--bitrate"], ["a b"], ["a;b"],
+    ["a/b"], ["../x"], [""], ["a\nb"], ["A+B+C+D+E"], ["x".repeat(25)],
+  ]) {
+    const r = validateInput("keys", { keys });
+    assert.equal(r.ok, false, `${JSON.stringify(keys)} 必须被拒，但它通过了`);
+  }
+});
+
+await test("keys 结构校验：非数组 / 空 / 非字符串 / 超量都要拒", () => {
+  assert.equal(validateInput("keys", { keys: "a" }).ok, false);
+  assert.equal(validateInput("keys", { keys: [] }).ok, false);
+  assert.equal(validateInput("keys", { keys: [1, 2] }).ok, false);
+  assert.equal(validateInput("keys", {}).ok, false);
+  assert.equal(
+    validateInput("keys", { keys: Array.from({ length: 65 }, () => "a") }).ok,
+    false,
+    "超过 64 个应拒绝",
+  );
+});
+
+await test("面板捕获按键但不吞 DSH 快捷键（作用域 + 放行规则）", () => {
+  const raw = readFileSync(new URL("./lib/client.js", import.meta.url), "utf8");
+  // ⚠️ 先剥注释：下面几个标记在注释里也出现过，不剥就会"删掉代码仍然通过"
+  const source = stripComments(raw);
+
+  // 必须挂在媒体元素上（聚焦才捕获），不能挂 window/document
+  assert.ok(!/window\.addEventListener\(\s*["']key/u.test(source), "不得全局监听 keydown");
+  assert.ok(!/document\.addEventListener\(\s*["']key/u.test(source), "不得在 document 上监听 keydown");
+  // 画面要可聚焦
+  assert.ok(source.includes("tabIndex: interactive ? 0 : undefined"), "画面元素缺 tabIndex，无法聚焦");
+  // ⌘/Ctrl 组合除编辑键外要放行
+  assert.ok(source.includes("EDIT_KEYS"), "缺少修饰键放行名单，会吞掉 ⌘R 等浏览器快捷键");
+  // 必须合批（逐字符发 = 每字符 100ms，没法用）
+  assert.ok(source.includes("KEY_BATCH_MS"), "缺少按键合批");
+  // 事件必须真的绑到媒体元素上，而不是定义完没人用
+  assert.ok(/\.\.\.keyboardHandlers/u.test(source), "keyboardHandlers 没有展开到媒体元素上");
+});
+
+await test("非 ASCII 按键走 io text 通道（不需要 ADBKeyboard）", () => {
+  const raw = readFileSync(new URL("./lib/client.js", import.meta.url), "utf8");
+  const source = stripComments(raw);
+  const fn = source.match(/function translateKey\([\s\S]*?\n      \}/u)?.[0] ?? "";
+  assert.ok(fn.length > 0, "找不到 translateKey");
+  // ASCII 走 key
+  assert.ok(/kind: "key"/u.test(fn), "ASCII 应走 keys 通道");
+  // 非 ASCII 走 text
+  assert.ok(/kind: "text"/u.test(fn), "非 ASCII 应走 io text 通道");
+  // 必须排除修饰键本身，否则按一下 Shift 就会给设备发一个无意义的键
+  for (const mod of ["Shift", "Control", "Alt", "Meta"]) {
+    assert.ok(fn.includes(`"${mod}"`), `translateKey 未排除修饰键 ${mod}`);
+  }
+  /**
+   * ⚠️ emoji 是代理对（"🎉".length === 2）。用 key.length !== 1 判断
+   * "不是单字符"会把整个 emoji 丢掉 —— 实测确实丢了（改前 emoji → 不发送）。
+   * 必须按码点判断。
+   */
+  assert.ok(
+    !/key\.length !== 1/u.test(fn),
+    "用 key.length 判断单字符 —— emoji（代理对）会被丢掉，应用 Array.from",
+  );
+  assert.ok(/Array\.from\(key\)/u.test(fn), "应按码点判断字符数（Array.from）");
+});
+
+await test("输入法合成（中文拼音）必须处理 compositionend", () => {
+  const source = stripComments(readFileSync(new URL("./lib/client.js", import.meta.url), "utf8"));
+  /**
+   * ⚠️ 少了这个，**中文根本打不进来**。macOS 拼音输入法合成期间发的
+   * keydown 里 key 是 "Process"（那时还没定下输入什么，translateKey
+   * 认不出是对的），真正的文本只在 compositionend 的 data 里。
+   * 而中文正是最需要物理键盘的场景 —— 侧边栏里没法用手机输入法。
+   */
+  assert.ok(
+    source.includes("onCompositionEnd"),
+    "没处理 compositionend —— 用输入法打中文会静默丢失",
+  );
+  assert.ok(
+    /onCompositionEnd[\s\S]{0,240}kind: "text"/u.test(source),
+    "compositionend 应把整段文本交给 io text 通道",
+  );
+});
+
+// ── 切换会话保留面板 ────────────────────────────────────────────────────
+//
+// 用户报告："切换会话后侧边栏画面流变成重新加载了"。
+// 根因：tab 类型没声明 keepMounted，sidebar-right 的 prune() 在切走后
+// 因 hasRetainedTabs === false 而 retire 掉 view → React 子树卸载 →
+// 解码器被拆掉、切回来要重新等关键帧（实测 IDR 间隔可达 3–4 秒）。
+
+console.log("\n切换会话保留");
+
+await test("tab 类型声明了 keepMounted（否则切会话会 dispose 重建）", () => {
+  const source = readFileSync(new URL("./lib/client.js", import.meta.url), "utf8");
+  /**
+   * ⚠️ 必须**先剥掉注释**再断言。
+   *
+   * 第一版直接对源码做 /keepMounted:\s*true/ 匹配，结果匹配到的是上面那段
+   * 解释性注释里引用的文字。故意删掉真正的 `keepMounted: true` 之后测试
+   * 依然通过 —— 假阴性，等于没测。凡是"断言某段代码存在"的测试都有这个坑。
+   */
+  const code = stripComments(source);
+  const start = code.indexOf("ctx.sidebarRightTabs.register({");
+  assert.ok(start !== -1, "找不到 tab 注册");
+  const reg = code.slice(start, start + 4096);
+  assert.ok(
+    /keepMounted:\s*true/u.test(reg),
+    "缺 keepMounted —— 切换会话时 sidebar-right 会 retire 掉这个 view，画面流会重连",
+  );
 });
 
 console.log(`\n结果：${passed} 通过，${failed} 失败`);
