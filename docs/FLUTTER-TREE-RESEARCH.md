@@ -32,7 +32,8 @@ daemon 的 `device.flutter.vmServiceUri` 返回 `method not found`。
 
 一个**描述骗人的工具比没有这个工具更糟** —— agent 会以为读到了 Flutter 树
 并据此下结论。它同时还与 `mobile_ui_tree` 完全重复，白占约
-**124 tokens/轮** 的 schema 成本（11 个工具 1034 → 10 个 910，实测）。
+**124 tokens/轮** 的 schema 成本（删它时 11 个工具 1034 → 10 个 910，实测；
+后来加了 `mobile_open_panel`，当前是 11 个 **964**）。
 
 名字保留在 `REMOVED_TOOL_NAMES` 里（本仓库惯例），这样调用方拿到
 `mobile_flutter_tree is not a tool` 时能分辨"插件删了它"和"名字打错了"。
@@ -242,6 +243,15 @@ launch_app tool"**。而 `launch_app` 需要 Flutter **工程根目录**（本�
 > 参考：`flutter attach` 在 Android 上找 URI 用的**也是扫 logcat**。
 > 这不是实现偷懒，是 Android 上独立启动的 Flutter App 就这么暴露自己。
 
+> **后续（2026-10-13）**：`dart-mcp-server` 已经从 profile 里**删除**了
+> （`skills-mcp-manager` 的 `servers` 现在只剩 `gitnexus` 与 `framelink-figma`）。
+> 上述实测仍然成立 —— 它记录的是"这条路走不通"的证据，而删除的理由是它
+> **26 个工具常驻约 6867 tokens/轮**（见第 4 节），其中过半与 shell 命令等价。
+>
+> 影响：现在要读 Flutter widget 树，**只剩下面两条路** —— VM Service 直连
+> （第 1 节的全部协议细节）或 Patrol（第 2 节）。原来那句"优先用已经配好的
+> dart-mcp-server"不再成立。
+
 ---
 
 ## 2. 路线 B：Patrol / integration_test（脚本化复现）
@@ -352,10 +362,19 @@ dart pub add --dev patrol_mcp
    —— 否则会静默给出错误的树，比报错更糟。
 4. 若目标应用是自己人写的（如 `tcl_jiguang`），**`creationLocation` ↔ 本机源码**
    是最有价值的产出 —— 值得单独做个能力。
-5. 若在 `tcl_jiguang` 工作区，**优先用已经配好的 `dart-mcp-server`** 的
-   `get_widget_tree`：它由 `launch_app` 自行持有 URI，**不需要抓鉴权码**。
-   ⚠️ 但它 26 个 schema 常驻约 **6867 tokens/轮**（是本插件全部 10 个工具的
-   7.5 倍），建议用 `--exclude-tool` 排掉与 shell 命令等价的那些。
+5. ~~若在 `tcl_jiguang` 工作区，优先用已经配好的 `dart-mcp-server`……~~
+   **这条已失效** —— `dart-mcp-server` 已从 profile 删除（2026-10-13）。
+   删除的理由是成本：它 **26 个 schema 常驻约 6867 tokens/轮**，是本插件全部
+   11 个工具（964）的 **7.1 倍**，而其中 12 个与 shell 命令等价、4 个是需要
+   编辑器光标上下文的 LSP（agent 基本用不上）。
+   真正独有、值得的只有 `launch_app` / `hot_reload` / `get_runtime_errors` /
+   `get_widget_tree` 这几个运行时工具，而它们**都能用 shell 手工做**——
+   第 1 节记的协议细节就是那份"手工做法"。
+
+   所以现状是：**Flutter 运行时观测这件事，本机目前没有现成工具**。
+   要用时按第 1 节手工做，或走 Patrol。若以后发现需要频繁做，
+   合理的做法是**写一份 skill** 承载那份协议细节，而不是重新装回 26 个工具的
+   MCP —— 成本差 7 倍，而 skill 正文只在真正用到时才进上下文。
 
 ---
 
