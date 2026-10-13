@@ -1936,6 +1936,60 @@ await test("只注册加工型工具，薄包装不许回流", () => {
   );
 });
 
+console.log("\n工具输出的呈现");
+
+await test("render 必须按 (args, value) 两参签名 —— 否则工具会回显入参", () => {
+  /**
+   * 这条钉的是本插件一个**长期 bug 的根因**，不是风格洁癖。
+   *
+   * DSH 的 `ToolOutputDefinition` 在类型和调用点两处都写死两个参数：
+   *
+   *     render(args: unknown, value: JsonValue): ContentBlock[]
+   *     rawRender(args, value)
+   *
+   * 而插件原先写的是 `renderJson(value)` —— 于是 harness 传进来的 **`args`
+   * 被当成了结果**：
+   *
+   *   · 无参数工具（mobile_devices / mobile_open_panel）：args 是 `{}`
+   *     → 所有调用一律显示 `{}`
+   *   · 有参数工具：显示的是**刚传进去的入参** —— 看起来像个正常结果，
+   *     其实完全不是。比显示空更糟，因为它不可疑。
+   *
+   * 这就是"所有 mobile_* 工具返回空结果"那个长期未解之谜的答案。
+   */
+  const source = stripComments(
+    readFileSync(new URL("./lib/agent/tools.js", import.meta.url), "utf8"),
+  );
+
+  const m = source.match(/export function renderJson\(([^)]*)\)\s*\{([\s\S]*?)\n\}/u);
+  assert.ok(m !== null, "找不到 renderJson");
+
+  const params = m[1].split(",").map((s) => s.trim()).filter((s) => s !== "");
+  assert.equal(
+    params.length,
+    2,
+    `renderJson 必须收 (args, value) 两个参数，实际 ${params.length} 个：(${m[1]})`,
+  );
+  assert.match(
+    params[0],
+    /^_/u,
+    `第一个参数必须显式忽略（下划线开头），实际 "${params[0]}" —— 它会被 harness 传成 args`,
+  );
+  assert.ok(
+    /JSON\.stringify\(\s*value/u.test(m[2]),
+    "renderJson 里序列化的必须是**第二个**参数 value（= 工具返回值）",
+  );
+
+  // 所有工具必须共用同一个 render（别有人另写一个又踩回单参）
+  const renders = [...source.matchAll(/render:\s*(\w+)/gu)].map((x) => x[1]);
+  assert.ok(renders.length >= 10, `render 挂载点太少（${renders.length}）`);
+  assert.deepEqual(
+    [...new Set(renders)],
+    ["renderJson"],
+    `所有工具应共用 renderJson，实际用了 ${[...new Set(renders)].join(", ")}`,
+  );
+});
+
 console.log("\n打开面板（mobile_open_panel）");
 
 await test("面板打开的路由名在宿主与客户端两处必须一致", () => {

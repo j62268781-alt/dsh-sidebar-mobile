@@ -5,6 +5,42 @@
 
 ## [未发布]
 
+### 修复
+
+- **所有 `mobile_*` 工具的输出都是错的 —— 根因是 `render` 少了一个参数。**
+
+  这是一个**长期 bug**，也是"所有 mobile_* 工具返回空结果"那个一直没查明的
+  现象的答案。
+
+  DSH 的 `ToolOutputDefinition` 在**类型和调用点两处**都写死了两个参数：
+
+  ```ts
+  render(args: unknown, value: JsonValue): ContentBlock[]
+  ```
+  ```js
+  const rawRender = output.render;
+  rawRender(args, value)        // harness 里的实际调用
+  ```
+
+  而插件写的是 `renderJson(value)` —— 只收一个参数。于是 harness 传进来的
+  **`args` 被当成了结果**。后果按工具有没有参数分成两种：
+
+  | 工具 | harness 传的 args | 原先显示成 |
+  |---|---|---|
+  | 无参数的（`mobile_devices` / `mobile_open_panel`） | `{}` | **`{}`** |
+  | 有参数的（其余 9 个） | 你刚传的入参 | **入参回显** |
+
+  第二种比第一种更糟：它看起来像个正常结果，**不可疑**，所以没人发现。
+  实测确认过 —— 传入 `{device:"784999f3"}`、返回 `{opened:true,waitedMs:3}`，
+  修复前渲染出的是 `{"device":"784999f3"}`。
+
+  修法就是补上第一个参数并显式忽略：`renderJson(_args, value)`。注意 DSH 自己
+  的工具正是这么写的（`render: (_args, value) => [...]`），本插件是抄漏了参数。
+
+  新增护栏测试「render 必须按 (args, value) 两参签名」，钉住三件事：参数必须
+  是两个、第一个必须以下划线开头、序列化的必须是第二个。已复验改回单参会被抓住。
+
+  测试 146 → 147。
 ### 新增
 
 - **`mobile_open_panel`：让模型能把侧边栏的移动设备面板打开给用户看。**
