@@ -3,44 +3,15 @@
 本项目遵循[语义化版本](https://semver.org/lang/zh-CN/)，
 变更记录格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
-## [未发布]
+## [0.1.0] - 2026-10-15
 
-### 修复
+首个版本：把 mobilecli 封装成 DSH 右侧边栏的移动设备面板。
 
-- **所有 `mobile_*` 工具的输出都是错的 —— 根因是 `render` 少了一个参数。**
+> **这是首次发布** —— npm 上从未发过更早的版本，git 也没有更早的 tag。
+> 下面的记录覆盖整个开发期：工具面从 16 个收敛到 **11 个**，并修掉了两个
+> 影响**所有**工具输出的 bug。所以「新增 / 变更 / 修复」合在一起才是这个
+> 版本的真实内容，而不是只列最后一刀。
 
-  这是一个**长期 bug**，也是"所有 mobile_* 工具返回空结果"那个一直没查明的
-  现象的答案。
-
-  DSH 的 `ToolOutputDefinition` 在**类型和调用点两处**都写死了两个参数：
-
-  ```ts
-  render(args: unknown, value: JsonValue): ContentBlock[]
-  ```
-  ```js
-  const rawRender = output.render;
-  rawRender(args, value)        // harness 里的实际调用
-  ```
-
-  而插件写的是 `renderJson(value)` —— 只收一个参数。于是 harness 传进来的
-  **`args` 被当成了结果**。后果按工具有没有参数分成两种：
-
-  | 工具 | harness 传的 args | 原先显示成 |
-  |---|---|---|
-  | 无参数的（`mobile_devices` / `mobile_open_panel`） | `{}` | **`{}`** |
-  | 有参数的（其余 9 个） | 你刚传的入参 | **入参回显** |
-
-  第二种比第一种更糟：它看起来像个正常结果，**不可疑**，所以没人发现。
-  实测确认过 —— 传入 `{device:"784999f3"}`、返回 `{opened:true,waitedMs:3}`，
-  修复前渲染出的是 `{"device":"784999f3"}`。
-
-  修法就是补上第一个参数并显式忽略：`renderJson(_args, value)`。注意 DSH 自己
-  的工具正是这么写的（`render: (_args, value) => [...]`），本插件是抄漏了参数。
-
-  新增护栏测试「render 必须按 (args, value) 两参签名」，钉住三件事：参数必须
-  是两个、第一个必须以下划线开头、序列化的必须是第二个。已复验改回单参会被抓住。
-
-  测试 146 → 147。
 ### 新增
 
 - **`mobile_open_panel`：让模型能把侧边栏的移动设备面板打开给用户看。**
@@ -76,6 +47,47 @@
   DOM 元素，而模型发起的打开没有元素可给。
 
   工具面 10 → 11，schema 常驻 910 → **964 tokens/轮**。
+
+- **tab 标签图标**：注册 `sidebar.right.pane.tab.title`，标签上显示手机图标 + 标题
+  （官方 files/browser/terminal 都注册了这个 seat）。图标跟随标签前景色
+  （`currentColor`），与官方 `IconGlobeOutlineRegular` 一致，暗色主题下不会突兀。
+
+- **快捷键**：`⌘⇧M`（桌面）/ `⌘⌥M`（浏览器）打开移动设备面板。
+  键位与 DSH 自带的 8 条绑定无冲突，桌面端刻意避开 `⌘M`
+  （macOS 系统「最小化」占用，原生菜单会先吃掉）。
+  可在 **设置 → 快捷键** 里改。
+
+- **入口图标**：自绘一幅手机 artwork，颜色（`#539CFA`）与尺寸契约
+  （`viewBox 0 0 36 36`、默认 36、`aria-hidden`）与官方
+  `GuideArtworkBrowser` 一致，纵向边缘逐像素对齐。
+  官方没有手机图标（`primitives` 的 378 个 `Icon*` 里没有 phone/mobile），
+  所以自绘而不是去引入第三方图标集。
+
+- **右侧边栏面板**（`ctx.sidebarRightTabs` + `sidebar.right.pane.tab`）
+  - 实时画面：Android 走 AVC/H.264（实测 104fps），iOS 模拟器走 MJPEG（实测 131fps）
+  - 画面上直接点击/拖拽，等比例换算回设备坐标
+  - 工具栏：主屏幕 / 返回 / 旋转 / 重连 / 外观切换
+  - 状态栏显示流格式与设备信息
+
+- **11 个模型工具**（开发期从 16 个收敛到 11 个，收敛过程见下面「变更」）
+  - 设备：`mobile_devices`、`mobile_boot`
+  - 观察：`mobile_ui_tree`、`mobile_screenshot`
+  - 交互：`mobile_tap_element`
+  - 应用：`mobile_list_apps`
+  - OCR 兜底：`mobile_find_text`、`mobile_tap_text`、`mobile_wait_for`
+  - 诊断：`mobile_logs`
+  - 面板：`mobile_open_panel`
+
+- **打包并注册 mobilecli 自带的 skill**：上游的 `SKILL.md` 与 `reference.md` 原样打进包，
+  加载时剥离 frontmatter 后注册，不需要用户自己往 `.agents/` 抄
+
+- **流路由**：`grant` / `stream` / `devices` / `switch-device` / `control` / `device-action` / `status`
+
+- **安全模型**：HMAC-SHA256 签名 capability（10 分钟过期、绑定设备）
+  + loopback 传输层围栏（含 DNS rebinding 防护）
+  + 可配置的 `trustedAuthorities`（反向代理场景）
+
+- **单流多播**：一个设备一条流，多个消费者共享；空闲 5 分钟自停；崩溃自动重启（带退避）
 
 ### 变更
 
@@ -168,7 +180,102 @@
   自测 134 → 138（新增 4 条守新约定：源码不许退回手写 `h(...)`、样式必须待在
   `styles.css`、构建必须设 utf8 与 jsxFactory=h、`lib/` 根下只许有产物）。
 
+- **交互指令改走 daemon 的 unix socket，延迟降低约 90%**：CLI 路径每条指令都要
+  新起一个 node 进程（mobilecli 是 `#!/usr/bin/env node`），实测固定开销约 66ms。
+  改用 daemon socket 的 JSON-RPC 后：
+
+  | 操作 | 改前（CLI） | 改后（RPC） |
+  |---|---|---|
+  | `tap` | 104.2 ms | **7.3 ms** |
+  | `swipe --duration 300` | 411 ms | 314.9 ms |
+  | （其中固定开销） | 111 ms | **14 ms** |
+
+  **关键：这条路径不需要 `server start`。** mobilecli 的 daemon 本来就在运行
+  （CLI 每条命令都会把它拉起来），它的 socket 直接吃 JSON-RPC —— 所以不新增
+  进程、不占端口、没有会话过期，正好绕开 ARCHITECTURE 里「不用 server 模式」
+  的三条理由。
+
+  协议细节（都是实测出来的）：传输是 **newline-delimited JSON 而非 HTTP**
+  （`curl --unix-socket` 会被拒）；**一请求一连接**（daemon 回完就主动关闭，
+  连发 3 个只回 1 个）；参数是**独立字段**而非 CLI 的逗号串。
+
+  ⚠️ **`rotate` 仍走 CLI** —— daemon 不暴露 orientation（实测多个候选方法名
+  全部 `method not found`）。CLI 始终是兜底：daemon 没起、版本不支持、
+  动作无 RPC 实现时都回退，功能不丢。连接层失败会标记通道不可用（不逐次
+  白等超时），但业务失败不标记（否则一次设备错误就永久降级）。
+
+  配置 `useDaemonRpc: false` 可强制全部走 CLI。自测 115 → 127。
+
+- **工具面从 16 个收到 11 个，省 453 tokens/轮**：删掉 5 个薄包装
+  （`mobile_tap` / `mobile_swipe` / `mobile_press_button` / `mobile_type_text` /
+  `mobile_launch_app`）——它们只是 `runJson(...)` 加一句 `return`，没有任何加工，
+  而 agent 本来就有 shell（`dsh-tool-bash` 在 dsh-base 里，恒可用），
+  直接跑等价命令即可。
+
+  按宿主自己的计价公式（`dsh-token-meter`：`ceil(chars/4)+4`）实测：
+
+  | | tokens/轮 |
+  |---|---|
+  | 改前 16 个 | 1487 |
+  | 改后 11 个 | **1034** |
+  | 省 | **453** |
+
+  ⚠️ **知识没跟着删**。被删命令的坑（坐标是物理像素、`io swipe` 必须传
+  `--duration` 否则默认 ~1000ms 慢动作、输入前必须先聚焦、`io button` 的键名、
+  启动应用前先列应用、非 ASCII 无需 ADBKeyboard）已写进
+  `skills/mobilecli/SKILL.md` 的「Driving the device from the shell」一节。
+  被删的名字留在 `REMOVED_TOOL_NAMES`，便于分辨"插件删了它"和"名字打错了"。
+
+- **收紧 skill 的触发描述（本次收益最大的一项）**：`description` + `whenToUse`
+  会进每轮的工具面索引，而它们一旦诱导模型在本可直接调工具的场景去载入技能，
+  代价是 **5137 tokens 的正文**（实测）——且正文载入后留在对话历史里，
+  此后每轮重发。
+
+  老版本写的是 "Use whenever a task involves operating or inspecting a mobile
+  device"，几乎覆盖全部场景，而这些场景**已经有工具**。现在明确两件事：
+  ① 只在工具做不到时用（录屏、pinch、剪贴板、文件传输、WebView、崩溃报告、
+  安装/卸载、开机/关机、区域设置、远程设备、脚本化 mobilecli）；
+  ② 明确列出"别为我载入"的场景（tap / swipe / 输入 / 按键 / 截图 / UI 树 /
+  列应用 / 启动应用 / 日志）。
+
+  实测这笔误触发是工具瘦身收益的 **~15 倍**（5137 vs 453），所以先修它。
+
 ### 修复
+
+- **所有 `mobile_*` 工具的输出都是错的 —— 根因是 `render` 少了一个参数。**
+
+  这是一个**长期 bug**，也是"所有 mobile_* 工具返回空结果"那个一直没查明的
+  现象的答案。
+
+  DSH 的 `ToolOutputDefinition` 在**类型和调用点两处**都写死了两个参数：
+
+  ```ts
+  render(args: unknown, value: JsonValue): ContentBlock[]
+  ```
+  ```js
+  const rawRender = output.render;
+  rawRender(args, value)        // harness 里的实际调用
+  ```
+
+  而插件写的是 `renderJson(value)` —— 只收一个参数。于是 harness 传进来的
+  **`args` 被当成了结果**。后果按工具有没有参数分成两种：
+
+  | 工具 | harness 传的 args | 原先显示成 |
+  |---|---|---|
+  | 无参数的（`mobile_devices` / `mobile_open_panel`） | `{}` | **`{}`** |
+  | 有参数的（其余 9 个） | 你刚传的入参 | **入参回显** |
+
+  第二种比第一种更糟：它看起来像个正常结果，**不可疑**，所以没人发现。
+  实测确认过 —— 传入 `{device:"784999f3"}`、返回 `{opened:true,waitedMs:3}`，
+  修复前渲染出的是 `{"device":"784999f3"}`。
+
+  修法就是补上第一个参数并显式忽略：`renderJson(_args, value)`。注意 DSH 自己
+  的工具正是这么写的（`render: (_args, value) => [...]`），本插件是抄漏了参数。
+
+  新增护栏测试「render 必须按 (args, value) 两参签名」，钉住三件事：参数必须
+  是两个、第一个必须以下划线开头、序列化的必须是第二个。已复验改回单参会被抓住。
+
+  测试 146 → 147。
 
 - **离线设备「看得到却选不中」（用户报告）**：面板的设备列表来自 `#status`
   （`includeOffline: true`，所以关着的模拟器**看得见**），但点它时走
@@ -215,36 +322,6 @@
 
   自测 127 → 131。
 
-### 变更
-
-- **交互指令改走 daemon 的 unix socket，延迟降低约 90%**：CLI 路径每条指令都要
-  新起一个 node 进程（mobilecli 是 `#!/usr/bin/env node`），实测固定开销约 66ms。
-  改用 daemon socket 的 JSON-RPC 后：
-
-  | 操作 | 改前（CLI） | 改后（RPC） |
-  |---|---|---|
-  | `tap` | 104.2 ms | **7.3 ms** |
-  | `swipe --duration 300` | 411 ms | 314.9 ms |
-  | （其中固定开销） | 111 ms | **14 ms** |
-
-  **关键：这条路径不需要 `server start`。** mobilecli 的 daemon 本来就在运行
-  （CLI 每条命令都会把它拉起来），它的 socket 直接吃 JSON-RPC —— 所以不新增
-  进程、不占端口、没有会话过期，正好绕开 ARCHITECTURE 里「不用 server 模式」
-  的三条理由。
-
-  协议细节（都是实测出来的）：传输是 **newline-delimited JSON 而非 HTTP**
-  （`curl --unix-socket` 会被拒）；**一请求一连接**（daemon 回完就主动关闭，
-  连发 3 个只回 1 个）；参数是**独立字段**而非 CLI 的逗号串。
-
-  ⚠️ **`rotate` 仍走 CLI** —— daemon 不暴露 orientation（实测多个候选方法名
-  全部 `method not found`）。CLI 始终是兜底：daemon 没起、版本不支持、
-  动作无 RPC 实现时都回退，功能不丢。连接层失败会标记通道不可用（不逐次
-  白等超时），但业务失败不标记（否则一次设备错误就永久降级）。
-
-  配置 `useDaemonRpc: false` 可强制全部走 CLI。自测 115 → 127。
-
-### 修复
-
 - **流中断后画面永久死亡（用户报告"滚动的时候画面直接死了"）**：两个叠加的缺陷，
   都不在解码器本身。
 
@@ -272,44 +349,6 @@
   实测：隔离环境下用真实 `StreamSession` + 真实 `StreamRoutes` 验证，
   消费保持订阅时杀进程 → Host 重启 → **同一条 HTTP 响应继续收到数据**
   （8 → 15 字节）。
-
-### 变更
-
-- **工具面从 16 个收到 11 个，省 453 tokens/轮**：删掉 5 个薄包装
-  （`mobile_tap` / `mobile_swipe` / `mobile_press_button` / `mobile_type_text` /
-  `mobile_launch_app`）——它们只是 `runJson(...)` 加一句 `return`，没有任何加工，
-  而 agent 本来就有 shell（`dsh-tool-bash` 在 dsh-base 里，恒可用），
-  直接跑等价命令即可。
-
-  按宿主自己的计价公式（`dsh-token-meter`：`ceil(chars/4)+4`）实测：
-
-  | | tokens/轮 |
-  |---|---|
-  | 改前 16 个 | 1487 |
-  | 改后 11 个 | **1034** |
-  | 省 | **453** |
-
-  ⚠️ **知识没跟着删**。被删命令的坑（坐标是物理像素、`io swipe` 必须传
-  `--duration` 否则默认 ~1000ms 慢动作、输入前必须先聚焦、`io button` 的键名、
-  启动应用前先列应用、非 ASCII 无需 ADBKeyboard）已写进
-  `skills/mobilecli/SKILL.md` 的「Driving the device from the shell」一节。
-  被删的名字留在 `REMOVED_TOOL_NAMES`，便于分辨"插件删了它"和"名字打错了"。
-
-- **收紧 skill 的触发描述（本次收益最大的一项）**：`description` + `whenToUse`
-  会进每轮的工具面索引，而它们一旦诱导模型在本可直接调工具的场景去载入技能，
-  代价是 **5137 tokens 的正文**（实测）——且正文载入后留在对话历史里，
-  此后每轮重发。
-
-  老版本写的是 "Use whenever a task involves operating or inspecting a mobile
-  device"，几乎覆盖全部场景，而这些场景**已经有工具**。现在明确两件事：
-  ① 只在工具做不到时用（录屏、pinch、剪贴板、文件传输、WebView、崩溃报告、
-  安装/卸载、开机/关机、区域设置、远程设备、脚本化 mobilecli）；
-  ② 明确列出"别为我载入"的场景（tap / swipe / 输入 / 按键 / 截图 / UI 树 /
-  列应用 / 启动应用 / 日志）。
-
-  实测这笔误触发是工具瘦身收益的 **~15 倍**（5137 vs 453），所以先修它。
-
-### 修复
 
 - **点击/滑动有 300+ms 延迟（体感"不跟手"）**：交互热路径上挂着一个设备预检查
   —— 每次点击都先 `listDevices({includeOffline:true})` 复核设备还在不在。
@@ -400,9 +439,11 @@
   `Button`（`size="sm"` = 28px、`variant="ghost"` 自带 hover 填充、focus ring、
   disabled 透明度）与 `Tooltip`，图标也从 "⌂/▢/◯" 字符换成官方规格的 SVG
   （字符的字重与基线跟旁边图标对不齐）。
+
 - **设备下拉左右间距不对称**：原生 `<select>` 的下拉箭头会吃掉右侧内边距
   （左 8px / 右 0）。现在 `appearance: none` 关掉原生箭头，右侧自绘官方 chevron，
   左右视觉一致。保留 `<select>` 本身是为了键盘与无障碍。
+
 - **tab 标签里的手机图标比旁边的文件夹/地球小一圈**：根因不是 `size`，
   而是官方对同一图形有**两套留白比例** —— guide artwork 占 viewBox 56.4%，
   tab 图标占 76.1%。同样 16px 下按 guide 比例只画出 9.0px，而官方是 12.2px。
@@ -410,29 +451,29 @@
   同时去掉标签图标多余的 `margin-right`（dockkit 的 `.tabTitle` 已有 `gap:5px`，
   叠加会变成 9px，官方「文件」是 5px）。
 
-### 新增
-
-- **tab 标签图标**：注册 `sidebar.right.pane.tab.title`，标签上显示手机图标 + 标题
-  （官方 files/browser/terminal 都注册了这个 seat）。图标跟随标签前景色
-  （`currentColor`），与官方 `IconGlobeOutlineRegular` 一致，暗色主题下不会突兀。
-- **快捷键**：`⌘⇧M`（桌面）/ `⌘⌥M`（浏览器）打开移动设备面板。
-  键位与 DSH 自带的 8 条绑定无冲突，桌面端刻意避开 `⌘M`
-  （macOS 系统「最小化」占用，原生菜单会先吃掉）。
-  可在 **设置 → 快捷键** 里改。
-- **入口图标**：自绘一幅手机 artwork，颜色（`#539CFA`）与尺寸契约
-  （`viewBox 0 0 36 36`、默认 36、`aria-hidden`）与官方
-  `GuideArtworkBrowser` 一致，纵向边缘逐像素对齐。
-  官方没有手机图标（`primitives` 的 378 个 `Icon*` 里没有 phone/mobile），
-  所以自绘而不是去引入第三方图标集。
-
 ### 说明
 
 - 自测新增 4 条外观用例（按钮尺寸与变体、下拉内边距对称、标签图标不重复加间距、
   图标 aria-label），并把图标的填充比例与描边宽度改成断言「有效值」而非写死的常数。
+
 - `shortcuts` / `sidebarRight` 都是**可选**注入：宿主没提供时插件其余部分照常工作，
   面板仍从「开始」页入口打开，只是没有快捷键与徽标。
   `@deepseek-ai/dsh-client-ui-primitives` 则**不需要**注入声明 —— 它是 web shell 的
   平台 seed 模块，永远可 require（官方 terminal 插件同样这么用）。
+
+- **零运行时依赖**：`react` 用宿主那份。客户端源码是 JSX + 独立样式文件，但**构建产物 `lib/client.js` 已提交进仓库** —— 安装方无需任何工具链，加载的就是那份产物
+
+- **流格式从首块字节嗅探**：因为实测 iOS 模拟器上 `--format avc` 会静默降级成 MJPEG，
+  相信请求参数会给出错误的 `content-type`，前端必然黑屏
+
+- **UI 树递归展平**：mobilecli 返回嵌套树，直接读顶层实测只有 0 个元素，展平后 92 个
+
+### 已知边界
+
+- mobilecli 会独占设备的 UiAutomation，导致 `uiautomator dump` / Appium 不可用
+  （实测确认；`mobilecli daemon stop` 后恢复）。进程内的 Flutter 测试不受影响
+
+- mobilecli 的 `--fps` 参数当前不生效（请求 15 / 30 都得到 ~104fps）
 
 ### 已知副作用（上游行为，非本插件 bug）
 
@@ -441,51 +482,4 @@
   已经是 4 个，本插件必然是第 5 个。已确认接受该代价以换取入口；
   要恢复副标题只能把入口挪到 `conversation.session.header.utilities`。
 
-## [0.1.0] - 2026-10-12
-
-首个版本：把 mobilecli 封装成 DSH 右侧边栏的移动设备面板。
-
-### 新增
-
-- **右侧边栏面板**（`ctx.sidebarRightTabs` + `sidebar.right.pane.tab`）
-  - 实时画面：Android 走 AVC/H.264（实测 104fps），iOS 模拟器走 MJPEG（实测 131fps）
-  - 画面上直接点击/拖拽，等比例换算回设备坐标
-  - 工具栏：主屏幕 / 返回 / 旋转 / 重连 / 外观切换
-  - 状态栏显示流格式与设备信息
-
-- **16 个模型工具**
-  - 设备：`mobile_devices`、`mobile_boot`
-  - 观察：`mobile_ui_tree`、`mobile_screenshot`、`mobile_flutter_tree`
-  - 交互：`mobile_tap`、`mobile_tap_element`、`mobile_swipe`、`mobile_type_text`、`mobile_press_button`
-  - 应用：`mobile_list_apps`、`mobile_launch_app`
-  - OCR 兜底：`mobile_find_text`、`mobile_tap_text`、`mobile_wait_for`
-  - 诊断：`mobile_logs`
-
-- **打包并注册 mobilecli 自带的 skill**：上游的 `SKILL.md` 与 `reference.md` 原样打进包，
-  加载时剥离 frontmatter 后注册，不需要用户自己往 `.agents/` 抄
-
-- **流路由**：`grant` / `stream` / `devices` / `switch-device` / `control` / `device-action` / `status`
-
-- **安全模型**：HMAC-SHA256 签名 capability（10 分钟过期、绑定设备）
-  + loopback 传输层围栏（含 DNS rebinding 防护）
-  + 可配置的 `trustedAuthorities`（反向代理场景）
-
-- **单流多播**：一个设备一条流，多个消费者共享；空闲 5 分钟自停；崩溃自动重启（带退避）
-
-### 说明
-
-- **零运行时依赖**：`react` 用宿主那份；客户端单文件、无构建步骤
-- **流格式从首块字节嗅探**：因为实测 iOS 模拟器上 `--format avc` 会静默降级成 MJPEG，
-  相信请求参数会给出错误的 `content-type`，前端必然黑屏
-- **UI 树递归展平**：mobilecli 返回嵌套树，直接读顶层实测只有 0 个元素，展平后 92 个
-
-### 已知边界
-
-- mobilecli 会独占设备的 UiAutomation，导致 `uiautomator dump` / Appium 不可用
-  （实测确认；`mobilecli daemon stop` 后恢复）。进程内的 Flutter 测试不受影响
-- mobilecli 的 `--fps` 参数当前不生效（请求 15 / 30 都得到 ~104fps）
-- iOS 真机的 Flutter render tree 支持未验证（已知实现在模拟器路径上）
-- Flutter render tree 需要 debug 构建（JVMTI 只能 attach 可调试应用）
-
-[未发布]: https://github.com/j62268781-alt/dsh-sidebar-mobile/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/j62268781-alt/dsh-sidebar-mobile/releases/tag/v0.1.0
