@@ -3,8 +3,7 @@
 ## 发布前检查
 
 ```bash
-npm run verify        # 语法检查 + 43 项自测
-node --check lib/client.js
+npm run verify        # build:check + 语法检查 + 147 项自测
 ```
 
 自测在无设备时也能全跑完（有设备时额外验证真实调用）。
@@ -17,11 +16,11 @@ node --check lib/client.js
 
 | 面 | 变更影响 |
 |---|---|
-| 工具名（`TOOL_NAMES`） | **破坏性**：模型已记住的名字会失效 |
+| 工具名（`TOOL_NAMES`） | **破坏性**：模型已记住的名字会失效。删掉的名字记得进 `REMOVED_TOOL_NAMES` |
 | 路由路径（`ROUTES`） | **破坏性**：客户端缓存了 URL |
 | `cordis.patch.yml` 的配置键 | 加键是兼容的，改语义不是 |
 | 打包的 mobilecli skill | 内容变更只影响模型行为，不影响 API |
-| `lib/client.js` | 单文件，无构建，改完刷新即生效 |
+| `lib/client.js` | **构建产物**，由 `src/client/` 生成 —— 改完源码必须 `npm run build` 并一起提交 |
 
 ## 同步上游 skill
 
@@ -41,14 +40,56 @@ npm test              # 验证 frontmatter 仍能被正确剥离
 
 ## 发包
 
-```bash
-npm version patch      # 或 minor / major
-npm publish            # prepublishOnly 会自动跑 verify
+## 发包
 
+### 自动化（推荐）：打 tag 即发布
+
+`.github/workflows/release.yml` 在推 `v*` tag 时自动发布。人工步骤只有两步：
+
+```bash
+# 1. 先 bump 版本（用 npm version 会顺手把改动提交并打上同名的 tag）
+npm version patch        # 或 minor / major
+
+# 2. 推上去，CI 接手：版本一致性门禁 → verify → npm publish → 建 GitHub Release
 git push && git push --tags
 ```
 
-`files` 白名单决定了包内容：`index.js`、`lib`、`skills`、`cordis.patch.yml`、`README.md`、`CHANGELOG.md`、`LICENSE`。**`docs/` 不进包**（它是仓库文档，不是运行时需要的东西）。
+**唯一需要手动配的东西**：仓库 Secrets 里加一个 `NPM_TOKEN`。用
+**Granular Access Token**（Permissions 选 read and write，scope 覆盖
+`@j62268781-alt`）—— 旧的 Automation token 已经不能新建了。
+
+工作流里三个刻意写死的点，都是踩过的坑，改之前先读那段注释：
+
+| 写死的东西 | 为什么 |
+|---|---|
+| `--registry=https://registry.npmjs.org/` | 本机默认 registry 是 `registry.npmmirror.com`（**只读镜像**），登录/发布会打错地方 |
+| tag 必须等于 `package.json` 的 version | 否则 npm 上的版本和 GitHub Release 指向的东西对不上 |
+| 发布前显式跑 `npm run verify` | 不依赖 `prepublishOnly`，让失败停在"测试"而不是"发布" |
+
+也支持手动触发（Actions → Release → Run workflow），勾 **dry-run** 可以完整走一遍
+`npm publish --dry-run` 而不真的发布 —— 首次验证流程或改完 workflow 后用它。
+
+> 若以后要发**私有**仓库，把 `--provenance` 去掉（它要求公开仓库）。
+
+### 手动发布
+
+`npm version` 之后直接：
+
+```bash
+npm publish --registry=https://registry.npmjs.org/
+```
+
+`prepublishOnly` 会自动跑 verify。**务必带 `--registry`** —— 见上表的镜像问题。
+`package.json` 的 `publishConfig.access: public` 已声明，scoped 包不会发成 private。
+
+### 包内容
+
+`files` 白名单：`index.js`、`lib`、`src`、`scripts`、`skills`、
+`cordis.patch.yml`、`README.md`、`CHANGELOG.md`、`LICENSE`（加 `package.json`
+与 `LICENSE`，共 21 个文件）。
+
+**`docs/` 不进包**（仓库文档，运行时不需要）—— 所以 `docs/prototypes/` 下的
+原型归档也不会随包发布，那是刻意的。
 
 打包前确认：
 
@@ -61,6 +102,10 @@ npm pack --dry-run
 ## 更新 CHANGELOG
 
 按 [Keep a Changelog](https://keepachangelog.com/) 格式。每次发版把 `[未发布]` 段落到新版本号下。
+
+> ⚠️ 一个版本号只能对应一套内容。**发布前确认 CHANGELOG 里没有重复的版本标题** ——
+> 0.1.0 就发生过一次：顶部是 `[未发布]`、底部另有一个 `[0.1.0]`，两者内容不同，
+> 直接发布会让 npm 上的版本和 CHANGELOG 对不上。
 
 ## 上架 DSH 插件市场
 
