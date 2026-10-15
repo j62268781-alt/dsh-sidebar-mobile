@@ -17,7 +17,7 @@
 
 - 📺 **实时画面**：Android 走 AVC/H.264（实测 **104fps**），iOS 模拟器走 MJPEG（实测 **131fps**）
 - 👆 **直接在画面上操作**：点击即点击、拖拽即滑动，等比例换算回设备坐标
-- 🧰 **10 个模型工具**：读 UI 树、按标识点元素、启动应用、读日志、等文本出现
+- 🧰 **11 个模型工具**：读 UI 树、按标识点元素、读日志、等文本出现、**把面板打开给你看**
 - 📱 **一套 API 两端通用**：真机、模拟器、模拟机走同一条路径，没有平台分支
 - 🎓 **自带 mobilecli 的 skill**：把上游 playbook 打包注册给模型，不用自己往 `.agents/` 抄
 - 🔐 **浏览器从不接触设备端口**：只经 DSH 自己的 web 源，签名令牌 + loopback 围栏
@@ -155,6 +155,7 @@ pnpm add @j62268781-alt/dsh-sidebar-mobile
 | `stream.idleStopSeconds` | `300` | 无消费者后多久停流 |
 | `stream.restartDelayMs` | `5000` | 流崩溃后的重启延迟 |
 | `stream.defaultScale` | `1.0` | 缩放。`0.5` 在 iOS 上实测 104fps/6.6Mbps（全分辨率 131fps/20.6Mbps） |
+| `useDaemonRpc` | `true` | 交互指令优先走 mobilecli daemon 的 unix socket（实测 `io tap` 7.3ms，CLI 是 104.2ms）。排查时设 `false` 强制走 CLI |
 | `trustedAuthorities` | `[]` | 经反向代理访问时显式列出对外 authority |
 
 `binaryPath` 为 `null` 时的**四级解析**顺序：
@@ -208,8 +209,12 @@ mobilecli io button --device <id> BACK
 mobilecli apps launch --device <id> com.example.app
 ```
 
-它们的 schema 每次请求都要发，实测 11 个 = **964 tokens/轮**（16 个时是 1487）
-—— **省 453 tokens/轮**。
+这 5 个的 schema 每次请求都要发 —— **删掉它们实测省 453 tokens/轮**
+（16 个 = 1487 → 11 个 = 1034）。
+
+> 此后又删了 `mobile_flutter_tree`（与 `mobile_ui_tree` 重复），
+> 并加了 `mobile_open_panel`。**当前是 11 个 = 964 tokens/轮** ——
+> 数的个数一样，但不是同一批工具，别把这个差值和上面的 453 混起来。
 
 ⚠️ 关键细节没跟着删，都在 skill 的「Driving the device from the shell」一节：
 坐标是**物理像素**、`io swipe` **必须传 `--duration`**（否则默认 1000ms 慢动作）、
