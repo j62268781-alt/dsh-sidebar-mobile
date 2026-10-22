@@ -28,17 +28,21 @@
         routePrefix: '/_dsh/dsh-sidebar-mobile'
 
         # 交互指令是否优先走 daemon 的 unix socket（JSON-RPC）。
-        #   true（默认）→ 优先 RPC，失败自动回退 CLI
+        #   true（默认）→ 优先 RPC；停用不可用通道，仅连接确认未建立时回退 CLI
         #   false       → 全部走 CLI（排查用）
         #
-        # 为什么：CLI 每条指令都要新起一个 node 进程，实测固定开销约 66ms，
-        # 一条 `io tap` 总共 104ms。而 daemon **本来就在运行**，它的 socket
-        # 直接吃 JSON-RPC（一请求一连接），tap 只要 7.3ms —— 快 93%。
-        # 关键是它不需要新起进程、不需要端口、没有会话过期。
-        #
-        # ⚠️ `rotate` 没有 RPC 实现（daemon 不暴露 orientation），
-        #    无论这个开关怎么设都走 CLI。
+        # 历史实测 tap 7.3ms vs 104.2ms 只代表一加 12 样本。Windows Node 可能收到
+        # EACCES/EPERM（连接前失败）：当前操作回退 CLI，之后直接走 CLI。业务错误或
+        # 响应中断不回放当前操作，避免不确定时重复点击。`rotate` 没有 RPC 实现。
         useDaemonRpc: true
+
+        # judgment 驱动的有界 mobile loop，默认关闭。
+        # 开启前须在 DSH 注册 dsh-judgment，并配置这里指定的 purpose。
+        # 每次判断会发送目标和最多 12 个控件标签；只遮蔽邮箱/长数字并截断，不是通用隐私脱敏。
+        # 不发送截图或完整 UI 树；不要在包含敏感信息的屏幕启用。
+        mobileLoop:
+          enabled: false
+          purpose: 'mobile.action'
 
         # 是否把 mobilecli 自带的 skill（skills/mobilecli/*.md）注册给模型。
         # 关掉只影响「模型知不知道这套命令」，不影响面板与工具本身。

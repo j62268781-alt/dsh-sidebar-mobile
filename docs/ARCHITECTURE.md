@@ -67,12 +67,11 @@ mobilecli 有 `server start` + JSON-RPC，返回 `sessionUrl` 供二次连接。
 | spawn CLI | 104.2 ms | 411 ms（固定开销 111ms）|
 | daemon socket | **7.3 ms** | 314.9 ms（固定开销 14ms）|
 
-差在**每条命令新起一个 node 进程**（mobilecli 是 `#!/usr/bin/env node`），实测约 66ms。
+差在**每条命令新起一个 node 进程**（该 POSIX 样本的 mobilecli 使用 `#!/usr/bin/env node`），实测约 66ms。Windows 上解析为原生可执行文件，启动开销不同；不能直接套用这组数字。
 
-关键是：**这条路不需要 server 模式**。mobilecli 的 daemon 本来就在运行（CLI 每条
-命令都会把它拉起来，空闲 30 分钟自退），而它的 unix socket 直接吃 JSON-RPC。
-所以「不用 server 模式」的三条理由在这里都不成立 —— 不新增进程、不占端口、
-没有会话。
+关键是：**这条路不需要 server 模式**。在支持的 POSIX 环境，mobilecli 的 daemon 本来就在运行（CLI 每条
+命令都会把它拉起来，空闲 30 分钟自退），unix socket 直接吃 JSON-RPC。Windows 上
+Node 访问 socket 可能收到 EACCES/EPERM，插件会停用 RPC 并回退 CLI，因此先按平台测量。
 
 协议细节（都是实测出来的，写错任何一条都会静默变慢或失败）：
 
@@ -472,7 +471,7 @@ crashCount  1  2  3  4  5  6 → 上限
 |---|---|---|
 | 浏览器 POST → Host | 5 | 同机 loopback |
 | Host 解析 + 校验 | 1 | 纯 JS |
-| **mobilecli 进程启动** | **62** | CLI 每条命令新起一个 node 进程 |
+| **mobilecli 进程启动** | **62** | POSIX Node CLI 样本；Windows 原生 binary 的启动开销不同 |
 | daemon IPC + adb 往返 | 41 | 实测 |
 | 下一条编码帧 | 17 | ~60fps 编码周期 |
 | adb/USB 回传 | 20 | 1080p 帧 ~35KB |

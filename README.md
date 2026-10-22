@@ -152,10 +152,14 @@ pnpm add @j62268781-alt/dsh-sidebar-mobile
 | `homeDir` | `null` | `MOBILECLI_HOME`。`null` 用 mobilecli 默认的 `~/.mobilecli` |
 | `routePrefix` | `/_dsh/dsh-sidebar-mobile` | 路由前缀 |
 | `registerSkills` | `true` | 是否把 mobilecli 的 skill 注册给模型 |
+| `mobileLoop.enabled` | `false` | 显式开启后注册 judgment-backed `mobile_loop` |
+| `mobileLoop.purpose` | `mobile.action` | dsh_judgment 中已配置且可用的 purpose |
 | `stream.idleStopSeconds` | `300` | 无消费者后多久停流 |
 | `stream.restartDelayMs` | `5000` | 流崩溃后的重启延迟 |
+| `stream.bitrate` | `8000000` | AVC 码率（bps）；默认已较高，需实机 A/B |
+| `stream.maxFps` | `30` | 请求上游帧率（当前测试设备上参数无效）；浏览器仍以 30 FPS 绘制 |
 | `stream.defaultScale` | `1.0` | 缩放。`0.5` 在 iOS 上实测 104fps/6.6Mbps（全分辨率 131fps/20.6Mbps） |
-| `useDaemonRpc` | `true` | 交互指令优先走 mobilecli daemon 的 unix socket（实测 `io tap` 7.3ms，CLI 是 104.2ms）。排查时设 `false` 强制走 CLI |
+| `useDaemonRpc` | `true` | 优先走 daemon JSON-RPC；可用时历史 tap 实测 7.3ms vs CLI 104.2ms。Windows socket 权限错误会停用 RPC 并回退；排查时设 `false` |
 | `trustedAuthorities` | `[]` | 经反向代理访问时显式列出对外 authority |
 
 `binaryPath` 为 `null` 时的**四级解析**顺序：
@@ -183,7 +187,7 @@ pnpm add @j62268781-alt/dsh-sidebar-mobile
 
 ### 模型工具
 
-只注册 **11 个**「工具能做得比 CLI 更好」的工具：
+默认注册 **11 个**「工具能做得比 CLI 更好」的工具；`mobile_loop` 默认关闭，仅在显式启用 judgment 后额外注册：
 
 | 工具 | 用途 |
 |---|---|
@@ -197,6 +201,19 @@ pnpm add @j62268781-alt/dsh-sidebar-mobile
 | `mobile_wait_for` | 等文本出现或消失 |
 | `mobile_logs` | 读设备日志（logcat / unified log） |
 | `mobile_open_panel` | **把侧边栏的移动设备面板打开给用户看**（跨进程，需要客户端在跑） |
+| `mobile_loop` | **可选**：由 dsh_judgment 选择下一步低风险控件，最多自动点 5 步；默认不注册 |
+
+带 `device` 参数时请传 `mobile_devices` 返回的 **id**。显式 id 直接交给 mobilecli，不再先运行一次 `devices` 枚举；这省掉了历史样本中约 381ms 的设备查询，但不代表当前机器的固定 SLA。省略 id 时仍会枚举，并要求恰好一台在线设备。名称不再作为 `device` 参数解析。
+
+`mobile_tap_element` 和面板点击会优先尝试 daemon JSON-RPC；POSIX 的历史实测约 7.3ms vs CLI 104.2ms。Windows 的 Node socket 连接可能被系统拒绝，插件会停用该会话的 RPC 并回退 CLI。请先用 `useDaemonRpc: false` 做对照，再按设备记录端到端延迟。
+
+#### Judgment-backed mobile loop
+
+默认关闭；在 `cordis.patch.yml` 中设置 `mobileLoop.enabled: true` 后才注册 `mobile_loop`，purpose 默认是 `mobile.action`，可通过 `mobileLoop.purpose` 改名。DSH 必须提供 dsh_judgment API v1 且对应 purpose 可用；未配置时工具会报告不可用，不会换成别的模型或默认答案。
+
+每次判断会把用户目标和最多 12 个控件标签发给配置的 judgment 服务；只做邮箱/长数字遮蔽与长度截断，不发送截图或完整 UI 树，因此并非通用隐私脱敏。loop 上限 5 步，只点击控件；会排除输入框和明显涉及提交、发送、支付、删除、授权、权限、上传、分享、保存、安装等标签，点击前重新读取 UI 并核对 judgment fingerprint。弃答、低置信度、无效响应或 UI 变化都会停止，不会自动重试。不要在含敏感信息的屏幕启用它。它是受限的结构化 UI loop，不是完整视觉 agent。
+
+性能方面，默认视频已经是 `scale: 1.0`、8 Mbps；mobilecli 的 `--fps` 在已测设备上无效，浏览器 H.264 绘制上限是 30 FPS（仍逐帧解码保留参考链）。没有在线设备时不盲目提高码率/DPR/FPS；要更清晰可保持 `defaultScale: 1.0` 并在真实设备上测 8–10 Mbps，要更流畅需先做 30/60 FPS 解码与主线程对照，再决定是否开放配置。
 
 #### 为什么不给 tap / swipe / 输入 / 按键 / 启动应用注册工具
 
@@ -226,7 +243,7 @@ mobilecli apps launch --device <id> com.example.app
 工具描述里写明了"先用哪个、什么时候升级到下一个"，因为三种观察方式的代价差一个数量级：
 
 ```
-mobile_ui_tree    ~100–300ms   结构化，首选
+mobile_ui_tree    ~100–300ms   结构化，首选；该历史范围不含可省略的设备枚举时间
 mobile_screenshot ~200–400ms   给人看
 mobile_find_text  ~1s          OCR，兜底
 ```
@@ -277,7 +294,7 @@ scripts/build-client.mjs
 
 ```bash
 npm run build       # 由 src/client/ 生成 lib/client.js —— 改完客户端必须跑
-npm test            # 147 项，无设备也能跑完（有设备时额外验证真实调用）
+npm test            # 150 项，无设备也能跑完（有设备时额外验证真实调用）
 npm run check       # Host 半边语法检查
 npm run build:check # 校验 lib/client.js 与 src/client/ 是否同步
 npm run verify      # build:check + check + test（提交前跑这个）
@@ -291,7 +308,7 @@ npm run verify      # build:check + check + test（提交前跑这个）
 `lib/` 按职责分目录（`device/` 怎么跟设备说话、`stream/` 视频流链路、
 `agent/` 给模型的那一面），唯一放在根下的 `client.js` 就是上面那个构建产物。
 
-自测覆盖：二进制四级解析（含 Windows shim 回归）、adb 体检与六类失败诊断、错误归一化、令牌签名与篡改检测、loopback 围栏（含 DNS rebinding）、流格式嗅探、交互输入校验（含 swipe duration 透传）、路由匹配、skill frontmatter 剥离、客户端构建产物是否过期。
+自测覆盖：二进制四级解析（含 Windows shim 回归）、adb 体检与六类失败诊断、错误归一化、令牌签名与篡改检测、loopback 围栏（含 DNS rebinding）、流格式嗅探、交互输入校验（含 swipe duration 透传）、路由匹配、显式设备 id 免枚举、judgment mobile loop 的脱敏/风险过滤/置信度/新鲜度检查、RPC 安全回退、skill frontmatter 剥离、客户端构建产物是否过期。
 
 ## 更多文档
 

@@ -3,7 +3,7 @@
 ## 发布前检查
 
 ```bash
-npm run verify        # build:check + 语法检查 + 147 项自测
+npm run verify        # build:check + 语法检查 + 150 项自测
 ```
 
 自测在无设备时也能全跑完（有设备时额外验证真实调用）。

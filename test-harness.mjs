@@ -20,10 +20,17 @@ import net from "node:net";
 import http from "node:http";
 import { Readable } from "node:stream";
 import { Mobilecli, resolveBinary } from "./lib/device/mobilecli.js";
+import { resolveDevice } from "./lib/agent/device-resolution.js";
+import {
+  createMobileLoopRequest,
+  isJudgmentUsable,
+  runMobileLoop,
+} from "./lib/agent/mobile-loop.js";
 import { StreamRoutes, mountRoutes } from "./lib/stream/routes.js";
 import {
   resolveSocketPath,
   callDaemon,
+  isSafeCliFallbackError,
   rpcForInput,
   rpcForDeviceAction,
   DaemonRpc,
@@ -47,6 +54,32 @@ async function test(name, fn) {
     console.log(`  ❌ ${name}`);
     console.log(`     ${error?.message ?? error}`);
   }
+}
+
+function makeJudge(answers, purpose = "mobile.action") {
+  const fingerprint = (state, questions, options) =>
+    JSON.stringify({ state, questions, purpose: options?.purpose });
+  return {
+    apiVersion: 1,
+    status: () => ({ purposes: [{ purpose, usable: true }] }),
+    fingerprint,
+    async ask(state, questions, options) {
+      const answer = answers.shift();
+      if (answer instanceof Error) throw answer;
+      return {
+        answers: { next_step: answer },
+        fingerprint: fingerprint(state, questions, options),
+      };
+    },
+  };
+}
+
+async function testUnixSocket(name, fn) {
+  if (process.platform === "win32") {
+    console.log(`  - skipped on Windows: ${name}`);
+    return;
+  }
+  await test(name, fn);
 }
 
 console.log("mobilecli 客户端自测\n");
@@ -2555,12 +2588,140 @@ await test("停流看门狗与重连的行为（真实控制流 + 忠实的 stre
 
 // ── daemon RPC（交互加速通道）────────────────────────────────────────
 //
-// 交互指令优先走 daemon 的 unix socket：实测 device.io.tap 7.3ms
-// vs CLI 的 104.2ms（省掉每条命令约 66ms 的 node 进程启动）。
-// daemon 本来就在运行，所以不需要新起进程、不需要端口、没有会话过期。
+// POSIX socket 样本实测 device.io.tap 7.3ms vs CLI 104.2ms；Windows 上 Node
+// 访问 daemon socket 可能被拒，插件会停用 RPC。测试分别覆盖协议与连接前回退。
 //
 // 下面用**本地假 socket 服务器**验证协议，不依赖真机或真 daemon。
 // 守的都是实测得来的事实 —— 错了会让交互静默变慢或失败。
+
+console.log("\nAgent device fast path and mobile loop");
+
+await test("explicit device id skips slow device enumeration", async () => {
+  let listCalls = 0;
+  const device = await resolveDevice({
+    async listDevices() { listCalls += 1; return []; },
+  }, "android-1", "mobile_ui_tree");
+  assert.equal(device.id, "android-1");
+  assert.equal(listCalls, 0);
+});
+
+await test("mobile loop request redacts labels and excludes risky controls", () => {
+  const request = createMobileLoopRequest("Open the next screen", [
+    { type: "TextView", text: "user@example.com 555 123 4567", rect: { x: 1, y: 1, width: 20, height: 10 } },
+    { type: "EditText", text: "secret", rect: { x: 2, y: 2, width: 20, height: 10 } },
+    { type: "Button", text: "Pay now", rect: { x: 3, y: 3, width: 20, height: 10 } },
+    { type: "Button", text: "Allow access", rect: { x: 5, y: 5, width: 20, height: 10 } },
+    { type: "Button", text: "Share", rect: { x: 6, y: 6, width: 20, height: 10 } },
+    { type: "Button", text: "Save changes", rect: { x: 7, y: 7, width: 20, height: 10 } },
+    { type: "Button", text: "Next", rect: { x: 4, y: 4, width: 20, height: 10 } },
+  ]);
+  assert.deepEqual(request.controls.map((control) => control.label), ["[email] [number]", "Next"]);
+  assert.equal(request.questions.next_step.kind, "choice");
+  assert.deepEqual(Object.keys(request.questions.next_step.options), ["done", "stop", "tap_1", "tap_2"]);
+  assert.equal(isJudgmentUsable(makeJudge([])), true);
+  assert.equal(isJudgmentUsable({ ...makeJudge([]), apiVersion: 2 }), false);
+});
+
+await test("mobile loop taps only a fresh high-confidence choice and stops on done", async () => {
+  const answers = [
+    { kind: "choice", optionId: "tap_1", probabilities: { tap_1: 0.9, done: 0.05, stop: 0.05 } },
+    { kind: "choice", optionId: "done", probabilities: { tap_1: 0.02, done: 0.96, stop: 0.02 } },
+  ];
+  const judge = makeJudge(answers);
+  let askCalls = 0;
+  const ask = judge.ask.bind(judge);
+  judge.ask = async (...args) => { askCalls += 1; return ask(...args); };
+  let listCalls = 0;
+  let dumpCalls = 0;
+  const taps = [];
+  const client = {
+    async listDevices() { listCalls += 1; return []; },
+    async runJson() {
+      dumpCalls += 1;
+      return { elements: [{ type: "Button", text: "Next", rect: { x: 10, y: 20, width: 40, height: 20 } }] };
+    },
+  };
+  const result = await runMobileLoop({
+    client,
+    judge,
+    device: "android-1",
+    goal: "Open the next screen",
+    performTap: async (tap) => taps.push(tap),
+    wait: async () => {},
+  });
+  assert.equal(result.status, "goal_reported");
+  assert.equal(result.actions[0].status, "tapped");
+  assert.deepEqual(taps, [{ deviceId: "android-1", x: 30, y: 30 }]);
+  assert.equal(dumpCalls, 3);
+  assert.equal(askCalls, 2);
+  assert.equal(listCalls, 0);
+});
+
+await test("mobile loop 不会把低置信度的 done 报为完成", async () => {
+  const judge = makeJudge([
+    { kind: "choice", optionId: "done", probabilities: { done: 0.6, stop: 0.4 } },
+  ]);
+  const result = await runMobileLoop({
+    client: { async runJson() { return { elements: [] }; } },
+    judge,
+    device: "android-1",
+    goal: "Open the next screen",
+    performTap: async () => { throw new Error("should not tap"); },
+    wait: async () => {},
+  });
+  assert.equal(result.status, "stopped");
+  assert.equal(result.reason, "low_completion_probability");
+});
+
+await test("mobile loop stops without tapping if the UI changes after judgment", async () => {
+  const judge = makeJudge([
+    { kind: "choice", optionId: "tap_1", probabilities: { tap_1: 0.9, done: 0.05, stop: 0.05 } },
+  ]);
+  let dumpCalls = 0;
+  let tapCalls = 0;
+  const client = {
+    async runJson() {
+      dumpCalls += 1;
+      return { elements: [{ type: "Button", text: "Next", rect: { x: dumpCalls === 1 ? 10 : 11, y: 20, width: 40, height: 20 } }] };
+    },
+  };
+  const result = await runMobileLoop({
+    client,
+    judge,
+    device: "android-1",
+    goal: "Open the next screen",
+    performTap: async () => { tapCalls += 1; },
+    wait: async () => {},
+  });
+  assert.equal(result.reason, "ui_changed_after_judgment");
+  assert.equal(tapCalls, 0);
+});
+
+await test("mobile loop does not retry dsh_judgment invalid-response", async () => {
+  const failure = Object.assign(new Error("invalid judgment response"), { code: "invalid-response" });
+  const judge = makeJudge([failure]);
+  let askCalls = 0;
+  const ask = judge.ask.bind(judge);
+  judge.ask = async (...args) => { askCalls += 1; return ask(...args); };
+  let tapCalls = 0;
+  const client = {
+    async runJson() {
+      return { elements: [{ type: "Button", text: "Next", rect: { x: 10, y: 20, width: 40, height: 20 } }] };
+    },
+  };
+  const result = await runMobileLoop({
+    client,
+    judge,
+    device: "android-1",
+    goal: "Open the next screen",
+    performTap: async () => { tapCalls += 1; },
+    wait: async () => {},
+  });
+  assert.equal(result.reason, "judgment_error");
+  assert.equal(result.errorCode, "invalid-response");
+  assert.equal(askCalls, 1);
+  assert.equal(tapCalls, 0);
+});
 
 console.log("\ndaemon RPC");
 
@@ -2605,8 +2766,18 @@ function fakeDaemon(handler, { keepOpen = false } = {}) {
 
 await test("resolveSocketPath 跟随 MOBILECLI_HOME（与 CLI 同一规则）", () => {
   assert.equal(resolveSocketPath(null), join(process.env.HOME, ".mobilecli", "daemon.sock"));
-  assert.equal(resolveSocketPath("/tmp/custom"), "/tmp/custom/daemon.sock");
+  assert.equal(resolveSocketPath("/tmp/custom"), join("/tmp/custom", "daemon.sock"));
   assert.equal(resolveSocketPath(null).endsWith("daemon.sock"), true);
+});
+
+await test("CLI fallback 仅用于确定尚未建立连接的错误", () => {
+  for (const code of ["ENOENT", "ECONNREFUSED", "EACCES", "EPERM"]) {
+    assert.equal(isSafeCliFallbackError({ code }), true, `${code} 应允许回退`);
+  }
+  for (const code of ["ECONNRESET", "ETIMEDOUT", "EPIPE"]) {
+    assert.equal(isSafeCliFallbackError({ code }), false, `${code} 结果不明，不应重放`);
+  }
+  assert.equal(isSafeCliFallbackError(new Error("remote device error")), false);
 });
 
 await test("RPC 参数形状与 CLI 不同：独立字段，不是逗号串", () => {
@@ -2636,7 +2807,7 @@ await test("rotate 没有 RPC 实现（必须回退 CLI）", () => {
   assert.equal(rpcForDeviceAction("power", "d1").params.button, "POWER");
 });
 
-await test("callDaemon 发的是 newline-delimited JSON（不是 HTTP）", async () => {
+await testUnixSocket("callDaemon 发的是 newline-delimited JSON（不是 HTTP）", async () => {
   const daemon = await fakeDaemon((msg) => ({ jsonrpc: "2.0", id: msg.id, result: { status: "ok" } }));
   try {
     const result = await callDaemon("device.io.tap", { deviceId: "d1", x: 1, y: 2 }, { socketPath: daemon.socketPath });
@@ -2650,7 +2821,7 @@ await test("callDaemon 发的是 newline-delimited JSON（不是 HTTP）", async
   }
 });
 
-await test("JSON-RPC error 会抛出，且优先用 error.data 里的具体原因", async () => {
+await testUnixSocket("JSON-RPC error 会抛出，且优先用 error.data 里的具体原因", async () => {
   const daemon = await fakeDaemon((msg) => ({
     jsonrpc: "2.0", id: msg.id,
     error: { code: -32000, message: "Server error", data: "error finding device: device not found: NOPE" },
@@ -2666,7 +2837,7 @@ await test("JSON-RPC error 会抛出，且优先用 error.data 里的具体原�
   }
 });
 
-await test("daemon 不回就关闭 → 报错而不是永久挂起", async () => {
+await testUnixSocket("daemon 不回就关闭 → 报错而不是永久挂起", async () => {
   const daemon = await fakeDaemon(() => undefined); // 不回，直接 destroy
   try {
     await assert.rejects(
@@ -2682,7 +2853,10 @@ await test("socket 不存在 → ENOENT，且通道被标记为不可用（不�
   const logs = [];
   const rpc = new DaemonRpc({ home: "/tmp/definitely-not-here-dsh", log: (l, m) => logs.push(`${l}:${m}`) });
   assert.equal(rpc.available, true);
-  await assert.rejects(() => rpc.call("device.io.tap", {}), (e) => e.code === "ENOENT");
+  await assert.rejects(
+    () => rpc.call("device.io.tap", {}),
+    (error) => ["ENOENT", "EACCES", "EPERM"].includes(error.code),
+  );
   assert.equal(rpc.available, false, "连接层失败后应标记不可用，避免每次交互都白等一次超时");
   assert.ok(logs.some((l) => l.includes("daemon socket 不可用")), "应记录日志");
 
@@ -2694,7 +2868,7 @@ await test("socket 不存在 → ENOENT，且通道被标记为不可用（不�
   assert.equal(rpc.available, true);
 });
 
-await test("业务失败不标记通道不可用（否则一次设备错误就永久降级）", async () => {
+await testUnixSocket("业务失败不标记通道不可用（否则一次设备错误就永久降级）", async () => {
   const daemon = await fakeDaemon((msg) => ({
     jsonrpc: "2.0", id: msg.id,
     error: { code: -32000, message: "Server error", data: "gesture rejected" },
@@ -2712,7 +2886,7 @@ await test("业务失败不标记通道不可用（否则一次设备错误就�
   }
 });
 
-await test("超时会抛错（设备卡住时不至于无限等）", async () => {
+await testUnixSocket("超时会抛错（设备卡住时不至于无限等）", async () => {
   const daemon = await fakeDaemon(() => null); // 连着但不回 → 只能被超时打断
   try {
     await assert.rejects(
@@ -2793,11 +2967,14 @@ await test("路由真正走 RPC，且 rotate 回退 CLI", async () => {
   assert.ok(cliCalls.length > before, "rotate 应当回退到 CLI");
 });
 
-await test("RPC 失败要回退 CLI，而不是让交互失败", async () => {
+await test("RPC 在连接建立前失败时回退 CLI", async () => {
   const cliCalls = [];
   const stubRpc = {
     available: true,
-    async call() { throw new Error("daemon 挂了"); },
+    async call() {
+      this.available = false;
+      throw Object.assign(new Error("daemon socket denied"), { code: "EACCES" });
+    },
   };
   const client = {
     async listDevices() { return [{ id: "d1", name: "d", platform: "android", state: "online" }]; },
@@ -2832,6 +3009,43 @@ await test("RPC 失败要回退 CLI，而不是让交互失败", async () => {
   assert.equal(res.statusCode, 200, "RPC 失败不该让用户看到错误");
   assert.ok(cliCalls.length > 0, "应当回退到 CLI");
   assert.ok(warns.some((w) => w.includes("回退 CLI")), "应记录回退日志，便于排查");
+});
+
+await test("RPC 回包不明时不回退，避免重复点击", async () => {
+  const cliCalls = [];
+  const stubRpc = {
+    available: true,
+    async call() {
+      this.available = false;
+      throw Object.assign(new Error("response lost"), { code: "ECONNRESET" });
+    },
+  };
+  const client = {
+    async runJson(args) { cliCalls.push(args.join(" ")); return {}; },
+  };
+  const pool = { acquire: () => ({ sendInput: (run, input) => run(["io", input.action]) }) };
+  const routes = new StreamRoutes({ client, pool, access: { mint: () => "t" }, log: () => {}, rpc: stubRpc });
+  routes.activeDeviceId = "d1";
+  const req = new Readable({ read() {} });
+  req.method = "POST";
+  req.url = "/control";
+  req.headers = {
+    host: "127.0.0.1:19387", origin: "http://127.0.0.1:19387",
+    "content-type": "application/json",
+  };
+  req.socket = { remoteAddress: "127.0.0.1" };
+  const res = {
+    statusCode: 0, body: "", headersSent: false,
+    writeHead(c) { this.statusCode = c; this.headersSent = true; },
+    end(p) { this.body = p ?? ""; },
+    write() {}, on() {}, setHeader() {},
+  };
+  req.push(Buffer.from(JSON.stringify({ action: "tap", x: 1, y: 2 })));
+  req.push(null);
+  await routes.handle("control", req, res);
+
+  assert.equal(res.statusCode, 500);
+  assert.equal(cliCalls.length, 0, "结果不明时不能重新执行同一个 tap");
 });
 
 await test("rpc 为 null 时全部走 CLI（配置可强制关闭）", async () => {

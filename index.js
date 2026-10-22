@@ -34,8 +34,9 @@ import {
   prepareStreamAccessKey,
 } from "./lib/stream/access.js";
 import { StreamRoutes, mountRoutes } from "./lib/stream/routes.js";
-import { DaemonRpc } from "./lib/device/daemon-rpc.js";
-import { TOOL_NAMES, createTools } from "./lib/agent/tools.js";
+import { DaemonRpc, isSafeCliFallbackError, rpcForInput } from "./lib/device/daemon-rpc.js";
+import { MOBILE_LOOP_PURPOSE, MOBILE_LOOP_TOOL_NAME } from "./lib/agent/mobile-loop.js";
+import { TOOL_NAMES, createMobileLoopTool, createTools } from "./lib/agent/tools.js";
 
 /** Cordis 插件名，也是挂载 id。 */
 export const name = "dsh-sidebar-mobile";
@@ -276,9 +277,9 @@ export function apply(ctx, config = {}) {
    * 交互指令的加速通道。
    *
    * daemon 的 unix socket 直接吃 JSON-RPC，而 daemon 本来就在运行
-   * （CLI 每条命令都会把它拉起来）—— 所以这条路径**不需要新起进程、
-   * 不需要端口、没有会话过期**，却省掉每条命令约 66ms 的 node 进程启动。
-   * 实测 `device.io.tap` 7.3ms vs CLI 104.2ms。
+   * （CLI 每条命令都会把它拉起来）—— 这条路径无需额外启动 CLI 进程，也不需要端口。
+   * POSIX 历史样本中 `device.io.tap` 为 7.3ms vs CLI 104.2ms；Windows socket 被拒时
+   * 会停用 RPC 并回退 CLI，不能把 POSIX 数值当成 Windows 端到端延迟。
    *
    * 配置 `useDaemonRpc: false` 可强制走 CLI（排查时用）。
    */
@@ -291,6 +292,19 @@ export function apply(ctx, config = {}) {
       ? "交互指令走 CLI（daemon RPC 已按配置禁用）"
       : `交互指令优先走 daemon RPC：${rpc.socketPath}`,
   );
+
+  const performTap = async ({ deviceId, x, y }) => {
+    const mapped = rpcForInput({ action: "tap", deviceId, x, y });
+    if (rpc !== null && rpc.available && mapped !== null) {
+      try {
+        return await rpc.call(mapped.method, mapped.params);
+      } catch (error) {
+        if (!isSafeCliFallbackError(error)) throw error;
+        log("warn", `daemon RPC 点击不可用，回退 CLI（${error?.code ?? error?.message ?? error}）`);
+      }
+    }
+    return guardedClient.runJson(["io", "tap", "--device", deviceId, `${x},${y}`]);
+  };
 
   const routes = new StreamRoutes({
     client: guardedClient,
@@ -329,15 +343,29 @@ export function apply(ctx, config = {}) {
     client: guardedClient,
     // 工具的 streaming 状态与面板共用同一个会话池，两端看到的是一致的
     acquireSession: (deviceId) => pool.acquire(deviceId),
-    /**
-     * `mobile_open_panel` 的实现：请求浏览器把侧边栏面板打开，并等回执。
-     *
-     * 跨进程的活由 routes 那边做（客户端长轮询 + 回执），这里只是把能力
-     * 交给工具。routes 在没挂上 webServer 时仍然是可用对象，但没人会来
-     * 轮询 —— 那种情况工具会如实回 opened:false。
-     */
     openPanel: () => routes.requestPanelOpen(),
+    performTap,
   });
+
+  if (config.mobileLoop?.enabled === true) {
+    const configuredPurpose = config.mobileLoop.purpose;
+    const purpose = typeof configuredPurpose === "string" && configuredPurpose.trim() !== ""
+      ? configuredPurpose.trim()
+      : MOBILE_LOOP_PURPOSE;
+    tools[MOBILE_LOOP_TOOL_NAME] = createMobileLoopTool({
+      client: guardedClient,
+      purpose,
+      performTap,
+      getJudge: () => {
+        try {
+          return typeof ctx.get === "function" ? ctx.get("judgment") : undefined;
+        } catch {
+          return undefined;
+        }
+      },
+    });
+    log("info", `已启用 judgment mobile loop（purpose: ${purpose}）`);
+  }
 
   for (const [toolName, definition] of Object.entries(tools)) {
     disposers.push(
