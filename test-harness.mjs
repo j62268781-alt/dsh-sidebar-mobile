@@ -3577,6 +3577,54 @@ await test("画布宽度上限 = 设备原生像素 / DPR（拖宽面板能变�
   setDevicePixelWidth(0);
 });
 
+await test("设备掉线时画面消失，而不是把最后一帧冻在屏幕上", () => {
+  // 用户原始反馈（verbatim）："设备断开应该画面消失才对"。
+  // 之前为了重连不闪黑，everPainted 一旦为真就永久显示 —— 设备拔掉后画面
+  // 冻在那里，用户对着一张死图点来点去。现在 hasFrame = 画过帧 && 在线。
+  const { stageOverlay } = client.plugin.__test;
+
+  const offline = stageOverlay({ state: "playing", detail: null, hasFrame: false, deviceState: "offline" });
+  assert.equal(offline.visible, true, "掉线时要显示说明，否则只剩一块空白");
+  assert.equal(offline.text, "设备已断开，正在等待重新连接…");
+  assert.equal(offline.floating, false, "掉线时没有画面，提示是空状态，不该是贴在底部的小胶囊");
+  assert.equal(offline.dim, false, "不是错误，别加暗底让人以为坏了");
+
+  // 正常播放且在线：什么都不显示
+  const playing = stageOverlay({ state: "playing", detail: null, hasFrame: true, deviceState: "online" });
+  assert.equal(playing.visible, false);
+});
+
+await test("有画面时提示贴在底部，不居中压在页面上方", () => {
+  // 用户反馈（verbatim）："中间还有可能会正在链接设备覆盖页面上方"。
+  // 旧实现里 .mbm-hint 是 position:absolute; inset:0 的居中浮层，重连期间
+  // 正好盖住用户正在看的页面顶部。
+  const { stageOverlay, hintText } = client.plugin.__test;
+
+  const reconnecting = stageOverlay({
+    state: "connecting",
+    detail: "画面卡住了，正在重连…",
+    hasFrame: true,
+    deviceState: "online",
+  });
+  assert.equal(reconnecting.visible, true);
+  assert.equal(reconnecting.floating, true, "有画面时必须走 floating 胶囊，否则会挡住内容");
+  assert.equal(reconnecting.text, "画面卡住了，正在重连…", "底层报告的具体原因要透出来");
+
+  // 首连（还没出过画面）：居中的空状态，且文案要说明为什么要等
+  const firstConnect = stageOverlay({ state: "connecting", detail: null, hasFrame: false, deviceState: "online" });
+  assert.equal(firstConnect.floating, false);
+  assert.ok(firstConnect.text.includes("首次"), `首连文案要解释等待原因，实际=${firstConnect.text}`);
+  // 已经有画面时不该再提"首次"（用户看到会以为连接从头开始了）
+  assert.equal(hintText("connecting", null, true), "正在重连…");
+
+  // 错误：没有画面时加暗底（真的坏了），有画面时只贴底部（别把内容盖黑）
+  const errBlind = stageOverlay({ state: "error", detail: "流测试失败", hasFrame: false, deviceState: "online" });
+  assert.equal(errBlind.dim, true);
+  const errWithFrame = stageOverlay({ state: "error", detail: "流测试失败", hasFrame: true, deviceState: "online" });
+  assert.equal(errWithFrame.dim, false);
+  assert.equal(errWithFrame.floating, true);
+});
+
 await test("重新申请流不重挂画面组件（key 不含 token，否则每次都会黑一下）", () => {
   const bundle = readFileSync(new URL("./lib/client.js", import.meta.url), "utf8");
   assert.ok(

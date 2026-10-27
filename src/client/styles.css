@@ -144,6 +144,17 @@
   align-items: center; justify-content: center; text-align: center; padding: 16px;
   color: var(--dsw-alias-label-tertiary, #667085); line-height: 1.6; }
 .mbm-hint[data-overlay="1"] { background: rgba(16,17,20,.72); color: #fff; }
+/* 有画面时的提示：贴在舞台底部的一条小胶囊。
+   默认的 `inset: 0` 居中铺开会正好压住用户正在看的页面顶部（真机反馈：
+   "正在连接设备…" 盖住了状态栏那一带），而它只是一句说明，不该挡住内容。
+   用 position:absolute + bottom 定位，pointer-events:none 保证不拦点击。 */
+.mbm-hint[data-floating="1"] {
+  inset: auto 8px 8px; display: block; padding: 5px 10px;
+  border-radius: 999px; background: rgba(16,17,20,.66); color: #fff;
+  font-size: 11px; line-height: 1.5; text-align: center;
+  /* 单行省略：胶囊只有一行高，长文案换行会把画面底部的按钮也盖住 */
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  pointer-events: none; backdrop-filter: blur(6px); }
 .mbm-dot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; margin-right: 5px; }
 .mbm-dot[data-on="1"] { background: #22c55e; }
 .mbm-dot[data-on="0"] { background: #9aa4b2; }

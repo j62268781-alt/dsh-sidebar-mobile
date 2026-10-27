@@ -1319,14 +1319,19 @@ window.__ModuleLoader__.load({
      *
      * @param {{deviceId: string|null, streamToken: string|null, format: string,
      *   frame: "bezel"|"device"|"frameless", deviceKind: string|null,
+     *   deviceState: "online"|"offline"|null,
      *   frameSizeRef: {current: {width: number, height: number}},
      *   onError?: (message: string) => void}} props
      *   deviceKind 是平台的 "ios"/"android"，只用来决定开孔样式
      *   （灵动岛 vs 挖孔），不参与任何布局或坐标计算。
+     *   deviceState 来自 /status 的设备列表：!= "online" 时画面必须消失，
+     *   不能把最后一帧冻在屏幕上（离线设备点下去毫无反应，会骗人）。
      *   frameSizeRef 由外层（MobilePanel）持有：面板要拿"当前流的真实帧宽"来判断
      *   分辨率够不够（见 decideRegrant），组件的私有 ref 它读不到。
      */
-    function StreamView({ deviceId, streamToken, format, frame, deviceKind, frameSizeRef, onError }) {
+    function StreamView({
+      deviceId, streamToken, format, frame, deviceKind, deviceState, frameSizeRef, onError,
+    }) {
       const [state, setState] = useState("idle");
       const [detail, setDetail] = useState(null);
       const canvasRef = useRef(null);
@@ -1350,6 +1355,38 @@ window.__ModuleLoader__.load({
        * 用户看（这也是"重取期间不黑屏"的实现基础）。
        */
       const [everPainted, setEverPainted] = useState(false);
+
+      /**
+       * 设备此刻是不是真的在线。
+       *
+       * `deviceState` 来自面板每 5 秒轮询的 /status 设备列表：只有明确是
+       * "online" 才算在线，null（还没拿到列表）不算离线 —— 否则面板一打开
+       * 就会先闪一下"设备已断开"。
+       */
+      const offline = deviceState === "offline";
+      /**
+       * 此刻屏幕上是否**真的**有一帧可看。
+       *
+       * 与 everPainted 的区别：device 掉线后 everPainted 仍然是 true，但画布上
+       * 那帧是死的。离线必须把它藏起来（用户的原始诉求："设备断开应该画面消失"），
+       * 否则用户会对着一张冻结的图点来点去。
+       */
+      const hasFrame = everPainted && !offline;
+      /**
+       * 掉线时把画布擦干净。
+       *
+       * 藏起来（visibility:hidden）+ 擦干净是两道保险：设备重新上线的那一瞬间
+       * hasFrame 就变 true 了，而新流的第一帧可能还要等几十到几百毫秒。若画布上
+       * 还留着掉线前那一帧，用户会先看到一张"假活"的图再跳成新的。
+       */
+      useEffect(() => {
+        if (!offline) return;
+        const canvas = canvasRef.current;
+        if (canvas === null) return;
+        const ctx = canvas.getContext("2d");
+        if (ctx === null) return;
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+      }, [offline]);
 
       const streamUrl = streamToken === null ? null : `${PREFIX}/stream/${encodeURIComponent(streamToken)}`;
 
@@ -1465,7 +1502,9 @@ window.__ModuleLoader__.load({
         [deviceId, isMjpeg, onError],
       );
 
-      const interactive = deviceId !== null && (state === "playing" || isMjpeg);
+      // 离线时一律不可交互：画面已经藏了，再接受点击只会把操作发到一台不在的手机上
+      // （Host 侧会走 CLI 兜底，白等 166ms 且静默失败）。
+      const interactive = deviceId !== null && !offline && (state === "playing" || isMjpeg);
 
       /**
        * ── 物理键盘透传 ────────────────────────────────────────────────
@@ -1693,7 +1732,14 @@ window.__ModuleLoader__.load({
           }}
           {...pointerHandlers}
           {...keyboardHandlers}
-          style={{ cursor: interactive ? "crosshair" : "default", touchAction: "none" }}
+          style={{
+            cursor: interactive ? "crosshair" : "default",
+            touchAction: "none",
+            // 离线时把画面藏起来（设备断开 = 没有画面可看）。
+            // 用 visibility 而不是 display：display:none 会让机身盒子塌成 12×12，
+            // 整个面板跟着跳一下；visibility:hidden 保留布局，只是不显示内容。
+            visibility: hasFrame ? "visible" : "hidden",
+          }}
         />
       ) : (
         <canvas
@@ -1709,6 +1755,9 @@ window.__ModuleLoader__.load({
             // playing（connecting），若按 state 隐藏画布，正在看的那一帧会闪黑 ——
             // 而画布上本来就留着上一帧，让它继续显示才是连续的。
             display: everPainted ? "block" : "none",
+            // 设备真的掉线了才藏画面（hasFrame = 画过帧 && 在线）。
+            // visibility 而不是 display：保留盒子尺寸，面板不会跟着跳。
+            visibility: hasFrame ? "visible" : "hidden",
           }}
         />
       );
@@ -1748,14 +1797,22 @@ window.__ModuleLoader__.load({
         </div>
       );
 
+      const overlay = stageOverlay({ state, detail, hasFrame, deviceState });
+
       return (
         <div className="mbm-stage" data-frame={frame}>
           {chassis}
-          {state === "playing" ? null : (
-            <div className="mbm-hint" data-overlay={state === "error" ? "1" : "0"}>
-              <span>{hintText(state, detail)}</span>
+          {overlay.visible ? (
+            <div
+              className="mbm-hint"
+              data-overlay={overlay.dim ? "1" : "0"}
+              // floating：贴在舞台底部的小胶囊。有画面时绝不能居中原样铺开 ——
+              // 那会正好压住用户正在看的页面顶部（真机反馈过）。
+              data-floating={overlay.floating ? "1" : "0"}
+            >
+              <span>{overlay.text}</span>
             </div>
-          )}
+          ) : null}
         </div>
       );
     }
@@ -1854,12 +1911,16 @@ window.__ModuleLoader__.load({
     }
 
     /** 把内部状态翻成给人看的一句话。 */
-    function hintText(state, detail) {
+    function hintText(state, detail, hasFrame = false) {
       switch (state) {
         case "idle":
           return "选一台设备开始";
         case "connecting":
-          return "正在连接设备…（首次可能要等 on-device agent 启动）";
+          // detail 是底层报告的更具体原因（"画面卡住了，正在重连…"），有就说它。
+          // "首次可能要等 on-device agent 启动" 只在**还没出过画面**时才成立：
+          // 已经有画面的人看到这句会以为连接从头开始了。
+          if (typeof detail === "string" && detail !== "") return detail;
+          return hasFrame ? "正在重连…" : "正在连接设备…（首次可能要等 on-device agent 启动）";
         case "playing":
           return "";
         /**
@@ -1875,6 +1936,38 @@ window.__ModuleLoader__.load({
         default:
           return "";
       }
+    }
+
+    /**
+     * 舞台上的提示浮层该怎么呈现。
+     *
+     * 三条规则，每条都对应一次真机反馈：
+     * 1. **设备真的不在了就什么都不显示**（画面消失）。曾经为了重连不闪黑，
+     *    把最后一帧永久留着 —— 设备拔掉后画面冻在那里，用户以为还在实时看，
+     *    点下去却毫无反应。宁可空白也不要撒谎。
+     * 2. **还有画面时，提示只能贴在底部当小胶囊**。居中浮层会正好压在
+     *    用户正在看的页面顶部（"正在连接设备…"盖住状态栏那一带），
+     *    而它只是说明，不该挡住内容。
+     * 3. 没有画面时它是真正的空状态：居中、占满舞台。错误才加暗底，
+     *    普通"正在连接"不加（暗底会让人以为坏了）。
+     *
+     * @param {{state: string, detail: unknown, hasFrame: boolean, deviceState: string|null}} spec
+     *   hasFrame  此刻是否真有一帧可看（设备在线且画过帧）
+     *   deviceState "online" / "offline" / null（未知，还没拿到设备列表）
+     * @returns {{visible: boolean, text: string, floating: boolean, dim: boolean}}
+     */
+    function stageOverlay({ state, detail, hasFrame, deviceState }) {
+      // 设备离线：画面已经被藏起来，这里只剩一句"为什么没有画面"。
+      if (deviceState === "offline") {
+        return { visible: true, text: "设备已断开，正在等待重新连接…", floating: false, dim: false };
+      }
+      if (state === "playing") return { visible: false, text: "", floating: false, dim: false };
+      return {
+        visible: true,
+        text: hintText(state, detail, hasFrame),
+        floating: hasFrame,
+        dim: state === "error" && !hasFrame,
+      };
     }
 
     // ── 手机图标 ────────────────────────────────────────────────────────
@@ -2083,6 +2176,14 @@ window.__ModuleLoader__.load({
        * 是这条信息唯一能到达用户的路径。
        */
       const [adb, setAdb] = useState(null);
+      /**
+       * 是否成功拿到过至少一次 /status 的设备列表。
+       *
+       * 用来区分"列表里没有这台 = 掉线"与"还没查过 = 未知"。少了这个断言，
+       * 面板一打开 devices 还是空数组，activeId 就已经有值了 —— 会先闪一下
+       * "设备已断开"再出画面。
+       */
+      const [statusSeen, setStatusSeen] = useState(false);
 
       /**
        * H.264 的真实帧尺寸（设备像素）。
@@ -2303,6 +2404,9 @@ window.__ModuleLoader__.load({
         if (activeId === null) return undefined;
         const timer = setInterval(() => {
           if (busyRef.current) return; // grant 进行中不重入
+          // 设备不在线时一切都是白做：grant 只会白等一次失败的 CLI 探测，
+          // 还会把错误横幅刷到面板上，盖住"设备已断开"这条真正的原因。
+          if (offlineRef.current) return;
           const now = performance.now();
           const needPx = preferredStreamWidth();
           const framePx = frameSizeRef.current.width;
@@ -2376,6 +2480,9 @@ window.__ModuleLoader__.load({
             setFormat(status.format ?? "unknown");
             if (Array.isArray(status.devices)) rememberDevices(status.devices);
             setAdb(status.adb ?? null);
+            // 拿到过至少一次设备列表之后，"列表里没有这台"才可以解释成掉线。
+            // 在那之前 devices 是空数组，误判会让面板一打开就闪"设备已断开"。
+            setStatusSeen(true);
           } catch {
             // 状态查询失败不该打断画面，静默重试
           }
@@ -2407,6 +2514,27 @@ window.__ModuleLoader__.load({
         () => devices.find((d) => d.id === activeId) ?? null,
         [devices, activeId],
       );
+
+      /**
+       * 当前设备在线吗：`"online"` / `"offline"` / `null`（未知）。
+       *
+       * 判定很保守 —— 只有**明确知道**它不在线才返回 "offline"：
+       *   · 还没查过列表（statusSeen=false）→ 未知
+       *   · 列表里没有这台机器，或者 state 不是 online → 掉线
+       * 保守是为了不误报：画面一旦被藏起来，用户会以为出故障了。
+       *
+       * Host 侧 listDevices 带 15s 的 stale 缓存（DEVICE_PRUNE_TTL_MS），
+       * 所以拔线后最多十几秒这里才翻转 —— 那之前画面会保持最后状态，
+       * 再久也不会无限期冻住。
+       */
+      const deviceState = activeId === null
+        ? null
+        : active === null
+          ? (statusSeen ? "offline" : null)
+          : (active.state === "online" ? "online" : "offline");
+      /** 给 250ms 判定节拍读的同步副本（见自适应取流的 useEffect）。 */
+      const offlineRef = useRef(false);
+      offlineRef.current = deviceState === "offline";
 
       /**
        * 工具栏按钮：官方 Button（sm = 28px 高）+ Tooltip。
@@ -2583,6 +2711,8 @@ window.__ModuleLoader__.load({
             frame={frame}
             // 只给开孔样式用（iOS 灵动岛 / Android 挖孔），不参与布局与坐标
             deviceKind={active?.platform ?? null}
+            // 设备是否还在线：掉线时画面必须消失（见 StreamView 的 hasFrame）
+            deviceState={deviceState}
             // 自适应取流要读"当前流的真实帧宽"，所以这个 ref 由面板持有
             frameSizeRef={frameSizeRef}
             onError={(message) => setError(message)}
@@ -2647,6 +2777,9 @@ window.__ModuleLoader__.load({
         newRegrantStreak,
         neededPixelWidth,
         maxMediaCssWidth,
+        /** 舞台浮层的呈现规则（掉线藏画面 / 有画面时提示不压内容）。 */
+        stageOverlay,
+        hintText,
         /** 直接设"设备原生宽度"，供 maxMediaCssWidth 的用例用（0 = 未知 → 兜底 1080）。 */
         setDevicePixelWidth(width) { devicePixelWidth = width; },
         nextCooldownMs,
