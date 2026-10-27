@@ -33,11 +33,13 @@
    只留 2px padding 接住侧键伸出的那 2px，否则会被 overflow:hidden 裁掉。 */
 .mbm-stage[data-frame="device"] {
   margin: 0 -8px -8px; padding: 2px; border: none; border-radius: 0;
-  /* stage 是"取景框"底色，恒为深色（与主题无关）：亮画面在上面才有对比。
-     但不能是死黑——旧值 #101114 与机身最暗处几乎同色，整台手机糊进背景，
-     用户看到的就是"一片黑"。改成石墨蓝径向渐变，上半部亮一档，
-     机身才有"浮在取景框里"的层次。 */
-  background: radial-gradient(125% 85% at 50% 4%, #2d323b 0%, #1e222a 50%, #171a20 100%);
+  /* 底色必须是透明的，让主题背景透上来。
+     这里曾经写死过深色渐变（"取景框"思路），结果在浅色主题下整个面板成了
+     一块黑底——用户直接反馈"页面的底色都是黑色"。手机壳自己已经是黑色了，
+     再垫一层深色底板只会让机身糊进背景，且和宿主主题打架。
+     透明之后：浅色主题 = 黑机身浮在白底上，深色主题 = 黑机身浮在深底上，
+     两种主题都靠机身的 1px 亮描边 + 外阴影勾边。 */
+  background: transparent;
 }
 .mbm-stage[data-frame="frameless"] { border: none; background: transparent; }
 /* 媒体元素：CSS 尺寸由 JS 按帧的真实宽高比算好写进 style（见 fitCanvasToFrame）。
@@ -74,15 +76,16 @@
    画布就比可用空间窄 2px。 */
 .mbm-stage[data-frame="device"] .mbm-chassis {
   position: relative; display: inline-flex; flex: none; padding: 5px;
-  border: 1px solid rgba(255, 255, 255, .2);
+  border: 1px solid rgba(255, 255, 255, .14);
   border-radius: calc(var(--mbm-device-radius, 14px) + 6px);
-  /* 机身必须明显比 stage 亮，否则"手机"和背景糊成一片（用户反馈"底色是黑的"）：
-     旧渐变从 #6b7078 走到 #1b1d21，下半段与背景几乎同色，等于只有一半边框看得见。
-     现在整体抬到钛银区间（最暗处 #4a5058 仍比 stage 亮 ~1.8 倍），
-     155° 让左上受光、右下背光，保留金属纵深感。 */
-  background: linear-gradient(155deg, #d3d8df 0%, #aeb3bc 9%, #8b909a 28%, #6d737d 52%,
-    #575d66 76%, #4a5058 100%);
-  box-shadow: 0 16px 34px rgba(0, 0, 0, .65), 0 2px 6px rgba(0, 0, 0, .5);
+  /* 机身统一黑色（用户明确要求）。早先试过钛银渐变，浅色主题下确实"立得住"，
+     但观感像模型渲染图、不像手机；真机边框本来就是黑的。
+     但纯黑会死平，所以仍是三段近黑渐变（顶面 #1c1f24 → 底 #0a0b0e），
+     首尾只差约 20 级灰阶 —— 看上去"就是一块黑"，只是受光面不死平。
+     那 1px rgba(255,255,255,.14) 描边是勾边用的：深色主题下黑机身贴着
+     深色背景时，全靠这一圈极暗的亮线才看得出边界。 */
+  background: linear-gradient(160deg, #1c1f24 0%, #121419 45%, #0a0b0e 100%);
+  box-shadow: 0 12px 28px rgba(0, 0, 0, .45), 0 1px 3px rgba(0, 0, 0, .35);
 }
 /* 还没画出第一帧时机身只剩 5px 内边距（12×12 的小方块），会在深色 stage 上
    留个突兀的点。整个机身先藏起来，有画面再显形（只动 opacity，不改布局）。 */
@@ -98,8 +101,10 @@
 .mbm-stage[data-frame="device"] .mbm-sideKey {
   display: block; position: absolute; width: 3px; border-radius: 2px;
   pointer-events: none;
-  background: linear-gradient(180deg, #6a7079 0%, #474d56 55%, #33373e 100%);
-  box-shadow: 0 0 3px rgba(0, 0, 0, .55);
+  /* 机身是黑的，侧键反而要略亮一档才看得见（真机也是"深灰键骑在黑框上"）。
+     最亮处 #565c66 对机身 #121419 约 4 倍亮度差，缩到 3px 宽仍在。 */
+  background: linear-gradient(180deg, #565c66 0%, #3a3f47 55%, #262a30 100%);
+  box-shadow: 0 0 3px rgba(0, 0, 0, .7);
 }
 .mbm-stage[data-frame="device"] .mbm-sideKey[data-side="power"] {
   right: -2px; top: 22%; height: 7.5%; }
