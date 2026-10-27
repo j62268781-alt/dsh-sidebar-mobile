@@ -37,8 +37,85 @@
 .mbm-media:focus { outline: none; }
 .mbm-media:focus-visible { outline: 2px solid var(--dsw-alias-brand-primary, #4d6bfe);
   outline-offset: 2px; }
-.mbm-stage[data-frame="device"] .mbm-media { border-radius: 18px; }
 .mbm-stage[data-frame="bezel"] .mbm-media { border-radius: 10px; }
+/* 屏幕圆角跟随机身：半径由 JS 按画布宽度算好写进 CSS 变量（见 fitCanvasToFrame）,
+   纯 CSS 拿不到"画布现在多宽"，百分比圆角又是相对元素自身的，会跟机身错位。 */
+.mbm-stage[data-frame="device"] .mbm-media { border-radius: var(--mbm-device-radius, 14px); }
+/* ── 仿真整机外壳（只有 device 档真的生成盒子）────────────────────────────
+   目标观感：像 iOS/Android 模拟器那样一眼看出「这是一台手机」——
+   机身、四角圆角、右侧电源键、左侧音量键、屏幕顶部的灵动岛 / 挖孔。
+
+   全部是 DOM + CSS，不引入任何图片/字体：styles.css 构建时被内联成一个
+   字符串常量（见 scripts/build-client.mjs），加资源会让构建与发布都变复杂。
+
+   bezel / frameless 两档必须完全保持原样，所以默认 display:contents ——
+   外壳盒子"不存在"，画布仍是 .mbm-stage 的直接 flex 子项。这一点是必须的：
+   canvas 的 max-width/max-height 是百分比，中间多一层 auto 宽的盒子会让
+   百分比失参照（缩不进去）。 */
+.mbm-chassis { display: contents; }
+
+/* device 档：机身盒子。shrink-wrap 画布（inline-flex + flex:none），
+   绝不自己撑满 stage —— 否则画布的可用空间算不准。
+   padding 5 + 1px 描边 = 单边 6px，必须与 index.jsx 的 CHASSIS_INSET 一致：
+   fitCanvasToFrame 会从 stage 内容盒里扣掉两侧各 6px。描边写成真 border 而不是
+   inset box-shadow —— 后者不占布局，量出来的机身会比 CHASSIS_INSET 少 1px/边，
+   画布就比可用空间窄 2px。 */
+.mbm-stage[data-frame="device"] .mbm-chassis {
+  position: relative; display: inline-flex; flex: none; padding: 5px;
+  border: 1px solid rgba(255, 255, 255, .2);
+  border-radius: calc(var(--mbm-device-radius, 14px) + 6px);
+  /* 机身必须明显比 stage(#101114) 亮，否则"手机"和背景糊成一片：
+     实测旧渐变的中段只有 rgb(30,32,37)，与背景差 14，屏幕上根本看不出来。
+     现在的钛灰从 #6b7078 走到 #1b1d21，中段 ≈ rgb(74,78,86)，差 58。 */
+  background: linear-gradient(155deg, #6b7078 0%, #4a4e56 22%, #2b2e34 65%, #1b1d21 100%);
+  box-shadow: 0 16px 34px rgba(0, 0, 0, .65), 0 2px 6px rgba(0, 0, 0, .5);
+}
+/* 还没画出第一帧时机身只剩 5px 内边距（12×12 的小方块），会在深色 stage 上
+   留个突兀的点。整个机身先藏起来，有画面再显形（只动 opacity，不改布局）。 */
+.mbm-stage[data-frame="device"] .mbm-chassis[data-media="off"] { opacity: 0; }
+
+/* 装饰件默认不显示；全部 pointer-events:none —— 指针坐标由 canvas 自己的
+   矩形换算成帧像素（见 sendPointer），装饰件绝不能拦事件或改变 canvas 位置。 */
+.mbm-sideKey, .mbm-island, .mbm-punch { display: none; }
+
+/* 侧键：3px 宽的实体键骑在机身边沿上（1px 在机身内、2px 伸到外沿之外）。
+   纵向用 % 吃机身高度，窄屏/高屏都不会错位。stage 的 device 档有 10px
+   padding，正好接住伸出去的这 2px，不会被 stage 的 overflow:hidden 裁掉。 */
+.mbm-stage[data-frame="device"] .mbm-sideKey {
+  display: block; position: absolute; width: 3px; border-radius: 2px;
+  pointer-events: none;
+  background: linear-gradient(180deg, #565a64 0%, #34373e 55%, #22252a 100%);
+  box-shadow: 0 0 3px rgba(0, 0, 0, .65);
+}
+.mbm-stage[data-frame="device"] .mbm-sideKey[data-side="power"] {
+  right: -2px; top: 22%; height: 7.5%; }
+.mbm-stage[data-frame="device"] .mbm-sideKey[data-side="volumeUp"] {
+  left: -2px; top: 18%; height: 5.5%; }
+.mbm-stage[data-frame="device"] .mbm-sideKey[data-side="volumeDown"] {
+  left: -2px; top: 26%; height: 5.5%; }
+
+/* iOS 灵动岛：悬浮在画面顶部中央的黑色胶囊（真机约占屏宽 30%、屏高 4.3%）。
+   宽高都用 %，机身变窄它自己跟着缩；min/max 兜住极端面板尺寸。 */
+.mbm-stage[data-frame="device"] .mbm-chassis[data-device-kind="ios"] .mbm-island {
+  display: block; position: absolute; top: 7px; left: 50%;
+  transform: translateX(-50%); width: 30%; height: 4.3%;
+  min-height: 13px; max-height: 26px; border-radius: 999px;
+  background: #05060a; pointer-events: none;
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, .06);
+}
+/* 胶囊右侧的前摄：一个偏蓝的小圆点，纯装饰 */
+.mbm-stage[data-frame="device"] .mbm-chassis[data-device-kind="ios"] .mbm-island::after {
+  content: ""; position: absolute; right: 12%; top: 50%;
+  transform: translateY(-50%); width: 4px; height: 4px; border-radius: 50%;
+  background: radial-gradient(circle at 35% 30%, #24406e, #05070c 70%); }
+
+/* Android 前置挖孔：屏顶居中的小圆点（约占屏宽 4%） */
+.mbm-stage[data-frame="device"] .mbm-chassis[data-device-kind="android"] .mbm-punch {
+  display: block; position: absolute; top: 9px; left: 50%;
+  transform: translateX(-50%); width: 4%; min-width: 9px; max-width: 16px;
+  aspect-ratio: 1 / 1; border-radius: 50%;
+  background: #05060a; pointer-events: none;
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, .07); }
 .mbm-hint { position: absolute; inset: 0; display: flex; flex-direction: column; gap: 6px;
   align-items: center; justify-content: center; text-align: center; padding: 16px;
   color: var(--dsw-alias-label-tertiary, #667085); line-height: 1.6; }

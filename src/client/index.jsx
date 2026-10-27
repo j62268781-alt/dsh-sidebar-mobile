@@ -325,6 +325,18 @@ window.__ModuleLoader__.load({
     let panelPixelWidth = 0;
 
     /**
+     * 「仿真整机」外壳吃掉的内边距，单位 CSS px，**单边**。
+     *
+     * = .mbm-chassis 的 padding 5 + 1px 描边（见 styles.css）。
+     * 画布是按 .mbm-stage 的内容盒 contain 出来的，加上外壳后机身整体又要
+     * 占两侧各 6px，所以可用宽高都得先扣掉 2×6 —— 不扣的话机身会跟内容盒
+     * 一样宽，而 .mbm-stage 是 overflow:hidden，两侧伸出去的侧键会被切掉。
+     *
+     * ⚠️ 改 styles.css 里机身的 padding/描边，必须同步改这里。
+     */
+    const CHASSIS_INSET = 6;
+
+    /**
      * 一条空的布局缓存。
      *
      * availWidth/availHeight 用 NaN 而不是 0 表示"还没量过"：0 是"量过，
@@ -343,6 +355,8 @@ window.__ModuleLoader__.load({
         cssHeight: 0,
         bufferWidth: 0,
         bufferHeight: 0,
+        // 机身圆角（CSS px），随 CSS 宽度算出来，只在变化时才写进 CSS 变量。
+        radius: 0,
       };
     }
 
@@ -402,10 +416,12 @@ window.__ModuleLoader__.load({
     function fitCanvasToFrame(canvas, frameWidth, frameHeight) {
       if (!(frameWidth > 0) || !(frameHeight > 0)) return null;
 
-      // 可用空间取父容器（.mbm-stage）的内容盒。不能用 canvas 自己的矩形：
-      // 那正是上面说的循环依赖。
+      // 可用空间取容器的内容盒。不能用 canvas 自己的矩形：那正是上面说的循环依赖。
+      // canvas 外面可能还包着一层机身（.mbm-chassis），要往上找到 .mbm-stage ——
+      // 机身是 shrink-wrap 画布的，量它等于绕回"画布自己"。
       const parent = canvas.parentElement;
       if (parent === null) return null;
+      const stage = parent.parentElement ?? parent;
 
       let layout = stageLayout.get(canvas);
       if (layout === undefined) {
@@ -416,12 +432,16 @@ window.__ModuleLoader__.load({
       // 这时直接放弃这一帧，别每帧都去强制布局。
       // layout.manual = 没有 ResizeObserver 维护缓存，只能退回"每帧量一次"。
       if (layout.manual || Number.isNaN(layout.availWidth) || Number.isNaN(layout.availHeight)) {
-        const measured = measureStage(parent);
+        const measured = measureStage(stage);
         layout.availWidth = measured.availWidth;
         layout.availHeight = measured.availHeight;
       }
-      const availWidth = layout.availWidth;
-      const availHeight = layout.availHeight;
+      // device 档机身两侧各占 CHASSIS_INSET，可用空间先扣掉，否则机身会跟内容盒
+      // 一样宽、侧键被 .mbm-stage 的 overflow:hidden 切掉。模式直接读 DOM 上的
+      // data-frame（React 提交时就写好了），不依赖任何模块级状态或 effect 时序。
+      const chassisInset = stage.getAttribute("data-frame") === "device" ? CHASSIS_INSET * 2 : 0;
+      const availWidth = Math.max(0, layout.availWidth - chassisInset);
+      const availHeight = Math.max(0, layout.availHeight - chassisInset);
       if (availWidth <= 0 || availHeight <= 0) return null; // 还没布局出来（或面板收起），等下一帧
 
       // contain：等比缩放到刚好装进容器
@@ -456,6 +476,17 @@ window.__ModuleLoader__.load({
       // 后备存储上：既不浪费解码，也不用浏览器再降采样一次。
       panelPixelWidth = bufferWidth;
 
+      // 机身圆角必须由画布宽度推出来：纯 CSS 拿不到"画布现在多宽"这个动态值
+      // （百分比圆角是相对元素**自身**算的，而机身比画布宽 12px，比例会错位）。
+      // 取 0.045：281px 宽的画面 → 内圆角 13px、机身外沿 19px；clamp 8–28
+      // 保证窄面板仍有可见圆角、宽面板不会圆到失真。只在变化时才写，
+      // 否则每帧 setProperty 都会让样式失效一次。
+      const radius = Math.round(Math.min(28, Math.max(8, cssWidth * 0.045)));
+      if (radius !== layout.radius) {
+        layout.radius = radius;
+        parent.style.setProperty("--mbm-device-radius", `${radius}px`);
+      }
+
       // 降采样倍数（>1 表示浏览器要把帧缩小后再画）。
       return { width: cssWidth, height: cssHeight, downscale: frameWidth / bufferWidth };
     }
@@ -474,12 +505,17 @@ window.__ModuleLoader__.load({
      * 所以 contentRect 恰好等于 "clientWidth - padding"，直接可用，
      * 不需要再 getComputedStyle。
      *
+     * ⚠️ 必须观察 **.mbm-stage**：画布外面还包着一层机身（.mbm-chassis），
+     * 机身是 shrink-wrap 画布的 —— 观察它等于"自己量自己"，宽度变化永远
+     * 收不到通知（机身跟着画布一起变，contentRect 里看不出差值）。
+     *
      * @param {HTMLCanvasElement} canvas
      * @returns {() => void} 取消监听
      */
     function watchStageSize(canvas) {
       const parent = canvas.parentElement;
       if (parent === null) return () => {};
+      const stage = parent.parentElement ?? parent;
       if (typeof ResizeObserver === "undefined") {
         // 没有 ResizeObserver 就没人刷新缓存 → 打开 manual，让 fitCanvasToFrame
         // 每次绘制自己量（正确性优先，回到每帧强制布局的老代价）。
@@ -505,7 +541,7 @@ window.__ModuleLoader__.load({
         layout.availWidth = entry.contentRect.width;
         layout.availHeight = entry.contentRect.height;
       });
-      observer.observe(parent);
+      observer.observe(stage);
       return () => {
         observer.disconnect();
       };
@@ -1022,8 +1058,14 @@ window.__ModuleLoader__.load({
      * 实时画面。按 Host 嗅探出的格式选渲染路径。
      *
      * 点击/拖拽都换算成设备坐标再发给 Host。
+     *
+     * @param {{deviceId: string|null, streamToken: string|null, format: string,
+     *   frame: "bezel"|"device"|"frameless", deviceKind: string|null,
+     *   onError?: (message: string) => void}} props
+     *   deviceKind 是平台的 "ios"/"android"，只用来决定开孔样式
+     *   （灵动岛 vs 挖孔），不参与任何布局或坐标计算。
      */
-    function StreamView({ deviceId, streamToken, format, frame, onError }) {
+    function StreamView({ deviceId, streamToken, format, frame, deviceKind, onError }) {
       const [state, setState] = useState("idle");
       const [detail, setDetail] = useState(null);
       const canvasRef = useRef(null);
@@ -1392,9 +1434,41 @@ window.__ModuleLoader__.load({
         />
       );
 
+      /**
+       * 「仿真整机」外壳。
+       *
+       * 只在 device 档真正生成盒子；bezel / frameless 档靠 CSS 的
+       * `display: contents` 让它"消失"，画面仍是 .mbm-stage 的直接 flex 子项。
+       *
+       * ⚠️ 为什么不做成"只有 device 档才包这层"（条件渲染）：
+       * 那样切换档位时 React 会把 canvas **重新挂载**，而 ResizeObserver 是在
+       * effect 里对着**挂载时的那个 canvas 元素**建的缓存（stageLayout 以元素为键），
+       * 新元素永远等不到尺寸更新 → 之后每帧都退回强制布局。DOM 稳定是前提。
+       *
+       * 所有装饰件都 `pointer-events: none`：指针坐标由 sendPointer 用
+       * canvas.getBoundingClientRect() 换算帧像素，装饰件既不能拦事件，
+       * 也不能改变 canvas 自己的位置和尺寸（否则坐标整体偏）。
+       */
+      const chassis = (
+        <div
+          className="mbm-chassis"
+          data-device-kind={deviceKind ?? "unknown"}
+          data-media={state === "playing" ? "on" : "off"}
+        >
+          {media}
+          {/* 侧键：电源在右、音量上/下在左，绝对定位在机身内边距带里 */}
+          <i className="mbm-sideKey" data-side="power" />
+          <i className="mbm-sideKey" data-side="volumeUp" />
+          <i className="mbm-sideKey" data-side="volumeDown" />
+          {/* 前置开孔：iOS 灵动岛 / Android 挖孔，由 data-device-kind 决定显隐 */}
+          <i className="mbm-island" />
+          <i className="mbm-punch" />
+        </div>
+      );
+
       return (
         <div className="mbm-stage" data-frame={frame}>
-          {media}
+          {chassis}
           {state === "playing" ? null : (
             <div className="mbm-hint" data-overlay={state === "error" ? "1" : "0"}>
               <span>{hintText(state, detail)}</span>
@@ -1701,7 +1775,12 @@ window.__ModuleLoader__.load({
       const [activeId, setActiveId] = useState(null);
       const [token, setToken] = useState(null);
       const [format, setFormat] = useState("unknown");
-      const [frame, setFrame] = useState("bezel");
+      /**
+       * 外观档位：bezel（圆角 + 浅底板）/ device（仿真整机）/ frameless（无边框）。
+       *
+       * 默认 device：用户要的就是"看得出这是一台手机"的观感。
+       */
+      const [frame, setFrame] = useState("device");
       const [busy, setBusy] = useState(false);
       /** 面板根节点：只在估算取流宽度时用（见 preferredStreamWidth）。 */
       const rootRef = useRef(null);
@@ -1739,14 +1818,22 @@ window.__ModuleLoader__.load({
         if (panelPixelWidth > 0) return panelPixelWidth;
         const stage = rootRef.current === null ? null : rootRef.current.querySelector(".mbm-stage");
         if (stage === null) return 0;
+        // device 档画布外面还包着机身（.mbm-chassis），它的 padding + 描边要占两侧，
+        // 可用宽度得先扣掉 —— 否则上报的 preferredWidth 比真实画布宽 12px，
+        // Host 会按这个偏大的值算 scale，多送的像素全都白费。
+        //
+        // ⚠️ 只能按 data-frame 判断，不能按"dom 里有没有 .mbm-chassis"：外壳是**无条件**
+        // 渲染的（条件渲染会让 canvas 重挂、尺寸缓存失效），bezel / frameless 两档靠
+        // display:contents 让它不参与布局 —— 文件里在、布局里不在。按存在性判断会在
+        // 这两档少报 12px，Host 算出偏小的 scale，画布就把 562 宽的帧拉成 586 显示（发糊）。
+        const staged = stage.getAttribute("data-frame") === "device" ? CHASSIS_INSET * 2 : 0;
         const dpr = Math.min(window.devicePixelRatio || 1, 2);
-        const availWidth = measureStage(stage).availWidth;
+        const availWidth = measureStage(stage).availWidth - staged;
         if (!(availWidth > 0)) return 0;
         return Math.max(1, Math.round(availWidth * dpr));
       };
 
       /** 申请 token 并选定设备。token 决定设备，所以换设备必须重新申请。 */
-
       const grant = useCallback(
         async (deviceId) => {
           setBusy(true);
@@ -2018,6 +2105,8 @@ window.__ModuleLoader__.load({
             streamToken={token}
             format={format}
             frame={frame}
+            // 只给开孔样式用（iOS 灵动岛 / Android 挖孔），不参与布局与坐标
+            deviceKind={active?.platform ?? null}
             onError={(message) => setError(message)}
           />
           {status}

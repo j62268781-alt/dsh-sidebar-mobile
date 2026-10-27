@@ -1148,6 +1148,96 @@ await test("标签图标不再自带 margin（dockkit 已给 gap:5px）", () => 
   );
 });
 
+// ── 仿真整机外壳（device 档）───────────────────────────────────────────
+//
+// 用户的原话是"像模拟器那样一眼看出这是一台手机"。外壳是纯 DOM + CSS
+// （不引入图片/字体），所以最容易在后续重构里"顺手"掉的就是那几颗装饰节点。
+// 这里同时锁三件事：外壳真的渲染、尺寸自洽（不会被 stage 裁掉）、
+// 装饰件绝不参与指针坐标换算。
+
+await test("device 档把画面包进仿真机身：外壳 + 三颗侧键 + 前置开孔", () => {
+  const source = readFileSync(new URL("./lib/client.js", import.meta.url), "utf8");
+  assert.ok(source.includes('className: "mbm-chassis"'), "device 档没有渲染 .mbm-chassis 外壳");
+  assert.ok(
+    source.includes('"data-device-kind": deviceKind'),
+    "外壳没把平台下传：iOS 灵动岛 / Android 挖孔没法区分",
+  );
+  for (const side of ["power", "volumeUp", "volumeDown"]) {
+    assert.ok(source.includes(`"data-side": "${side}"`), `缺少 ${side} 侧键`);
+  }
+  assert.ok(source.includes('className: "mbm-island"'), "缺少 iOS 灵动岛节点");
+  assert.ok(source.includes('className: "mbm-punch"'), "缺少 Android 挖孔节点");
+});
+
+await test("机身内边距与 CHASSIS_INSET 一致（否则画布窄 2px 或侧键被裁）", () => {
+  const css = panelCss();
+  const source = readFileSync(new URL("./lib/client.js", import.meta.url), "utf8");
+  const rule = css.match(/\.mbm-stage\[data-frame="device"\]\s+\.mbm-chassis\s*\{([^}]*)\}/u)?.[1] ?? "";
+  assert.ok(
+    rule.includes("display: inline-flex"),
+    "机身必须 shrink-wrap（inline-flex）：自己撑满 stage 的话，画布可用空间就算不准",
+  );
+  assert.ok(rule.includes("flex: none"), "机身必须 flex:none，否则会被 stage 压扁");
+  assert.ok(rule.includes("position: relative"), "侧键/开孔靠绝对定位挂在机身上");
+  assert.ok(rule.includes("var(--mbm-device-radius"), "机身圆角要跟随画布宽度（CSS 变量由 JS 写）");
+  const padding = Number(rule.match(/padding:\s*(\d+)px/u)?.[1] ?? NaN);
+  const border = Number(rule.match(/border:\s*(\d+)px/u)?.[1] ?? NaN);
+  const inset = Number(source.match(/const CHASSIS_INSET = (\d+)/u)?.[1] ?? NaN);
+  assert.ok(Number.isFinite(padding) && Number.isFinite(border), `机身缺 padding/border：${rule}`);
+  assert.equal(
+    padding + border,
+    inset,
+    `CHASSIS_INSET(${inset}) 必须 = 机身 padding(${padding}) + 描边(${border})：` +
+      "对不上时画布会比可用空间窄（浪费清晰度），或侧键伸出 stage 被 overflow:hidden 切掉",
+  );
+});
+
+await test("侧键与开孔是纯装饰：不挡指针、不改 canvas 的坐标基准", () => {
+  const css = panelCss();
+  assert.ok(
+    /\.mbm-sideKey,\s*\.mbm-island,\s*\.mbm-punch\s*\{\s*display:\s*none/u.test(css),
+    "装饰件默认必须隐藏：bezel / frameless 两档要保持原样",
+  );
+  // 只给"真正生成盒子"的规则（display:block / position:absolute）要求
+  // pointer-events:none；纯位置微调规则（right:-2px 之类）继承基础规则即可，
+  // ::after 这种伪元素本身不参与命中测试，也不需要再写一遍。
+  for (const m of css.matchAll(/\.mbm-(?:sideKey|island|punch)[^{]*\{([^}]*)\}/gu)) {
+    if (m[0].includes("::")) continue;
+    if (!/display:\s*block|position:\s*absolute/u.test(m[1])) continue;
+    assert.ok(
+      m[1].includes("pointer-events: none"),
+      `装饰件必须 pointer-events:none，否则会截走画布上的点击/滑动：${m[1]}`,
+    );
+  }
+  const source = readFileSync(new URL("./lib/client.js", import.meta.url), "utf8");
+  assert.ok(
+    source.includes("element.getBoundingClientRect()"),
+    "指针坐标必须仍以媒体元素自己的矩形换算 —— 外面包一层机身不能改变这个基准",
+  );
+});
+
+await test("默认外观就是整机；开孔按平台切换，三档仍然都在", () => {
+  const source = readFileSync(new URL("./lib/client.js", import.meta.url), "utf8");
+  assert.ok(
+    source.includes('useState("device")'),
+    "默认外观必须是整机：用户要的就是打开面板第一眼看出这是一台手机",
+  );
+  const css = panelCss();
+  assert.ok(
+    css.includes('.mbm-chassis[data-device-kind="ios"] .mbm-island'),
+    "缺 iOS 灵动岛规则",
+  );
+  assert.ok(
+    css.includes('.mbm-chassis[data-device-kind="android"] .mbm-punch'),
+    "缺 Android 挖孔规则",
+  );
+  // frameless 必须仍是"完全无边框无背景"，不能被外壳样式带歪
+  assert.ok(
+    /\.mbm-stage\[data-frame="frameless"\]\s*\{[^}]*border:\s*none[^}]*background:\s*transparent/u.test(css),
+    "frameless 档必须保持无边框无背景",
+  );
+});
+
 await test("工具栏按钮走官方 Tooltip，且每个都有可读的 aria-label", () => {
   const source = readFileSync(new URL("./lib/client.js", import.meta.url), "utf8");
   // 本文件不用 JSX，走 h(Tooltip, ...) 工厂
