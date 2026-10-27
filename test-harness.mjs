@@ -3561,6 +3561,22 @@ await test("需要的像素 = CSS 宽 × 当前 DPR，且被设备宽封顶", ()
   assert.equal(neededPixelWidth(0, 2, 0), 0);
 });
 
+await test("画布宽度上限 = 设备原生像素 / DPR（拖宽面板能变大，但不放大插值）", () => {
+  // 用户诉求：侧边栏拖宽时画面跟着变大，"字也大一点"。上限取设备原生像素，
+  // 再宽就只是把 ≤1080 宽的流放大 —— 字更大但更糊，不如停住。
+  const { maxMediaCssWidth, setDevicePixelWidth } = client.plugin.__test;
+  setDevicePixelWidth(1080);
+  assert.equal(maxMediaCssWidth(2), 540, "Retina 2× 屏：1080 原生像素 → 540 CSS 封顶");
+  assert.equal(maxMediaCssWidth(1), 1080, "DPR 1 的外接屏可以一直宽到原生像素");
+  // 还不知道设备宽时按 1080 兜底，别把画布卡得太窄
+  setDevicePixelWidth(0);
+  assert.equal(maxMediaCssWidth(2), 540);
+  // 老设备（720 宽）不该报出比它更大的画布
+  setDevicePixelWidth(720);
+  assert.equal(maxMediaCssWidth(2), 360);
+  setDevicePixelWidth(0);
+});
+
 await test("重新申请流不重挂画面组件（key 不含 token，否则每次都会黑一下）", () => {
   const bundle = readFileSync(new URL("./lib/client.js", import.meta.url), "utf8");
   assert.ok(

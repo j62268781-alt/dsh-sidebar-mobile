@@ -332,17 +332,31 @@ window.__ModuleLoader__.load({
      *
      * 宿主的 `ui-sidebar-right` 用 `computeColumns()` 把右栏夹在
      * `clampWidth(rightbar, 300, viewport * 0.7)` 之间 —— 也就是右栏最窄 300 CSS px。
-     * 面板被拖宽时不该把手机一路放大：画布越宽，同一帧被放大得越多（看起来更糊），
-     * 观感也会变成"面板里的巨屏手机"。所以画布到 300 就停住，剩下的空间由
-     * .mbm-stage 的 justify-content / align-items 居中吃掉。
+     * 面板被拖宽时画面跟着放大，**止于设备原生像素**：再宽就只是把一条最多
+     * 1080 宽的流放大显示 —— 字更大但更糊，还不如原地停住。
      *
-     * 取的是**画布**（手机屏幕）的宽度，不含机身那 12px —— 用户说的是"页面最大宽度"，
-     * 页面 = 屏幕上显示的内容。侧边栏拖到 312 以上才真的开始封顶，所以当前
-     * 315 宽的面板观感不变，只有把它拖得更宽时手机才不再跟着长。
+     * 一开始这里写死 300（= 宿主 ui-sidebar-right 的最小宽度，computeColumns 里的
+     * clampWidth(rightbar, 300, …)），理由是"面板拖宽时别把手机吹成巨屏"。真机用下来
+     * 这条理由不成立：侧边栏最小宽度下手机只有 280 CSS 宽，字也跟着小到看不清，
+     * 而用户把面板拖宽恰恰就是"我想看大一点"。所以上限改成**设备原生像素 / DPR**
+     * （1080 / 2 = 540 CSS），拖宽到 540 之前画面一路变大且一路更清晰
+     * （scale 跟着涨到 1.0 = 原生 1:1），再宽就停住、余下的空间由 .mbm-stage
+     * 的居中排布吃掉。
      *
-     * ⚠️ 300 是宿主侧的数字（ui-sidebar-right 的 computeColumns），宿主改了要同步这里。
+     * 取的是**画布**（手机屏幕）的宽度，不含机身那 12px。
      */
-    const MAX_MEDIA_CSS_WIDTH = 300;
+    function maxMediaCssWidth(dpr) {
+      const native = devicePixelWidth > 0 ? devicePixelWidth : DEVICE_WIDTH_FALLBACK;
+      return Math.max(1, Math.round(native / Math.max(1, dpr)));
+    }
+
+    /**
+     * 设备原生像素宽（0 = 还不知道），由组件在 grant 回包里同步。
+     *
+     * 放模块级而不是 React ref：fitCanvasToFrame / preferredStreamWidth 都在
+     * 模块作用域里（不在组件闭包里），它们拿不到 ref。
+     */
+    let devicePixelWidth = 0;
 
     /**
      * 面板**实际**占的 CSS 宽度（= fitCanvasToFrame 算出的 cssWidth）。
@@ -524,7 +538,7 @@ window.__ModuleLoader__.load({
      * 纯函数：调用方负责把 panelCssWidth / DPR / 设备宽喂进来。
      * 单独抽出来是为了能单测四种组合（含设备宽封顶），不必渲染 React。
      *
-     * @param {number} cssWidth 画布 CSS 宽（已含 contain 与 MAX_MEDIA_CSS_WIDTH 封顶）
+     * @param {number} cssWidth 画布 CSS 宽（已含 contain 与 maxMediaCssWidth 封顶）
      * @param {number} dpr 当前 devicePixelRatio（已按上限 2 夹过）
      * @param {number} deviceWidth 设备逻辑宽（0/null = 不知道，按兜底值）
      * @returns {number} 物理像素宽；算不出时为 0
@@ -650,12 +664,15 @@ window.__ModuleLoader__.load({
       // data-frame（React 提交时就写好了），不依赖任何模块级状态或 effect 时序。
       const frameMode = stage.getAttribute("data-frame");
       const chassisInset = frameMode === "device" ? CHASSIS_INSET * 2 : 0;
-      // 宽度再夹一道上限（见 MAX_MEDIA_CSS_WIDTH）：面板被拖宽时手机停止放大，
-      // 多出来的空间由 .mbm-stage 的居中排布吃掉。高度不用单独夹 —— contain
-      // 之后高度由宽度决定，宽度封顶高度自然跟着封顶。
+      // DPR 上限 2：先按物理像素 1:1 映射（DPR 2 的屏上 315 CSS → 630 像素），
+      // 再往上每加 0.5 倍像素量翻倍，而手机源最多 1080 宽。
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      // 宽度再夹一道上限（见 maxMediaCssWidth）：面板被拖宽时画面跟着变大，
+      // 但止于设备原生像素 —— 超过就是放大插值，字更大更糊。高度不用单独夹：
+      // contain 之后高度由宽度决定，宽度封顶高度自然跟着封顶。
       const availWidth = Math.max(0, Math.min(
         layout.availWidth - chassisInset,
-        MAX_MEDIA_CSS_WIDTH,
+        maxMediaCssWidth(dpr),
       ));
       const availHeight = Math.max(0, layout.availHeight - chassisInset);
       if (availWidth <= 0 || availHeight <= 0) return null; // 还没布局出来（或面板收起），等下一帧
@@ -674,10 +691,6 @@ window.__ModuleLoader__.load({
         canvas.style.height = `${cssHeight}px`;
       }
 
-      // ⚠️ 上限 2：先按物理像素 1:1 映射（DPR 2 的屏上 315 CSS → 630 像素），
-      // 再往上每加 0.5 倍像素量翻倍，而手机源最多 1080 宽 —— 实测 630×1400
-      // 与 945×2079 的峰值信噪都早已饱和，多出来的只是绘制成本。
-      const dpr = Math.min(window.devicePixelRatio || 1, 2);
       const bufferWidth = Math.max(1, Math.round(cssWidth * dpr));
       const bufferHeight = Math.max(1, Math.round(cssHeight * dpr));
       if (bufferWidth !== layout.bufferWidth || bufferHeight !== layout.bufferHeight) {
@@ -2130,7 +2143,7 @@ window.__ModuleLoader__.load({
         // 宽度，否则 Host 按偏大的值算 scale，多送的像素照样被降采样丢掉。
         const availWidth = Math.min(
           measureStage(stage).availWidth - staged,
-          MAX_MEDIA_CSS_WIDTH,
+          maxMediaCssWidth(dpr),
         );
         if (!(availWidth > 0)) return 0;
         return neededPixelWidth(availWidth, dpr, deviceWidthRef.current);
@@ -2195,6 +2208,8 @@ window.__ModuleLoader__.load({
             // 比从设备列表里猜可靠；拿不到就保持 0（按 1080 兜底）。
             if (typeof result.deviceWidth === "number" && result.deviceWidth > 0) {
               deviceWidthRef.current = result.deviceWidth;
+              // 画布宽度上限要按设备原生像素算（见 maxMediaCssWidth），同步一份出去
+              devicePixelWidth = result.deviceWidth;
             }
             /**
              * 记录"这次申请到底换来了多宽的流"，用来决定下一次冷却期。
@@ -2631,6 +2646,9 @@ window.__ModuleLoader__.load({
         decideRegrant,
         newRegrantStreak,
         neededPixelWidth,
+        maxMediaCssWidth,
+        /** 直接设"设备原生宽度"，供 maxMediaCssWidth 的用例用（0 = 未知 → 兜底 1080）。 */
+        setDevicePixelWidth(width) { devicePixelWidth = width; },
         nextCooldownMs,
         nextCooldownAfterGrant,
         /** 判定参数，单测里直接用它们算时间线，避免把数字抄一遍。 */
