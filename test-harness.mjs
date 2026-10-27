@@ -993,7 +993,9 @@ async function loadClientRegistrations(options = {}) {
     },
   };
   plugin.apply(ctx);
-  return { types, slots, shortcuts, opened, id: loaded.id };
+  // plugin 本身也带出去：自适应取流的判定是纯函数（plugin.__test），
+  // 直接喂时间戳比渲染真实 React 面板驱动 600ms/5s 时间线可靠得多。
+  return { types, slots, shortcuts, opened, id: loaded.id, plugin };
 }
 
 const client = await loadClientRegistrations();
@@ -3460,16 +3462,147 @@ await test("control 路由按流的真实 plan 换算坐标（不是按请求体
   );
 });
 
-// ── daemon RPC 自愈 ──────────────────────────────────────────────────
+// ── 自适应取流 ────────────────────────────────────────────────────────
 //
-// daemon 空闲 30 分钟自退，CLI 又会把它拉起来 —— "连不上"是常态。旧实现
-// 一次 ECONNREFUSED 就永久停用（reset() 生产代码里没人调用），此后整场
-// 会话退化 CLI：166ms vs RPC 19.8ms，慢 8.4 倍。
+// 真机 bug：`--scale` 只在 /grant 那一刻按 preferredWidth 算一次，之后永不重算。
+// 用户把侧边栏拖宽、或把窗口从 1920×1080 外接屏（DPR 1）拖到内建 Retina（DPR 2），
+// 需要的物理像素都变大了，流却还是老分辨率 —— 实测面板里手机屏幕区 598 物理像素，
+// 编码进程只有 378×832（scale 0.35），被浏览器放大 1.58× 画上去，文字边缘全是插值糊。
 //
-// 这里用真实 unix socket 走完 失败 → 退避 → 恢复 的完整路径（退避档位用
-// 毫秒级覆盖，真实是 5s/15s/60s，用例等不起）。
+// 判定数学（阈值 / 持续时间 / 冷却 / 设备宽封顶）全在 src/client/index.jsx 的
+// 两个纯函数里，通过 plugin.__test 暴露出来。这里按 250ms 节拍喂时间戳，
+// 断言"什么时候该重建流"，不需要渲染 React、也不需要等真实时间。
 
-console.log("\n daemon RPC 自愈");
+console.log("\n自适应取流");
+
+const { decideRegrant, newRegrantStreak, neededPixelWidth, tuning } = client.plugin.__test;
+
+/**
+ * 把一段时间喂给判定器，返回**第一次**点头的时刻（never = null）。
+ *
+ * @param {{needPx: number, framePx: number, ms: number, lastAt?: number, start?: number}} spec
+ */
+function firstRegrantAt({ needPx, framePx, ms, lastAt = 0, start = 1000 }) {
+  const streak = newRegrantStreak();
+  for (let t = start; t <= start + ms; t += tuning.tickMs) {
+    if (decideRegrant(streak, needPx, framePx, t, lastAt)) return t;
+  }
+  return null;
+}
+
+await test("帧宽比需要的小 15% 以上、且持续 600ms → 重建流（升档）", () => {
+  // 真机那组数字：面板需要 630 物理像素，流只有 378 宽（≈0.6 倍）
+  const at = firstRegrantAt({ needPx: 630, framePx: 378, ms: 3000 });
+  assert.notEqual(at, null, "分辨率差 40% 还不重建，画面会一直是糊的");
+  assert.ok(
+    at - 1000 >= tuning.upscaleHoldMs,
+    `必须持续 ${tuning.upscaleHoldMs}ms 才动手，否则拖动侧边栏会连续重建流（实际 ${at - 1000}ms）`,
+  );
+});
+
+await test("比值 1.1（只差 10%）→ 不动手：肉眼看不出的过采样不值得重建流", () => {
+  // 630 / 573 ≈ 1.099，落在死区里
+  assert.equal(firstRegrantAt({ needPx: 630, framePx: 573, ms: 5000 }), null);
+  // 恰好 1.15 也不算超（用 > 而不是 >=，边界上不动手更省）
+  assert.equal(firstRegrantAt({ needPx: 630, framePx: 548, ms: 5000 }), null);
+});
+
+await test("两次重建流之间至少隔 5 秒（grant 会杀进程重启，不能连打）", () => {
+  // 假设 1000ms 那一刻刚 grant 过，之后立刻就该升档 —— 但要等到 6000 才允许
+  const at = firstRegrantAt({ needPx: 630, framePx: 378, ms: 8000, lastAt: 1000 });
+  assert.notEqual(at, null, "冷却过后应该还是会把欠缺的分辨率补回来");
+  assert.ok(
+    at - 1000 >= tuning.minIntervalMs,
+    `冷却期内不许再 grant（实际间隔 ${at - 1000}ms，要求 ≥ ${tuning.minIntervalMs}ms）`,
+  );
+});
+
+await test("首帧之前（framePx=0）不做任何判定，避免刚 grant 完就重复申请", () => {
+  const streak = newRegrantStreak();
+  for (let t = 1000; t <= 20000; t += tuning.tickMs) {
+    assert.equal(decideRegrant(streak, 630, 0, t, 0), false);
+  }
+  // 面板宽高还没量出来（needPx=0）同理
+  assert.equal(firstRegrantAt({ needPx: 0, framePx: 378, ms: 8000 }), null);
+});
+
+await test("流大于需要 1.6 倍且持续 3 秒才降档，1.3 倍落在死区不动", () => {
+  // 700 / 400 = 1.75 > 1.6：该降档，但降档的持续时间门槛是 3 秒（升档只要 0.6 秒）
+  assert.equal(
+    firstRegrantAt({ needPx: 400, framePx: 700, ms: 2000 }),
+    null,
+    "降档只是省资源，2 秒就动手的话用户正把面板拖宽时会被反复打断",
+  );
+  assert.notEqual(firstRegrantAt({ needPx: 400, framePx: 700, ms: 5000 }), null);
+
+  // 600 / 450 = 1.33，在 1.6 以下 —— 死区，永远不动（否则拖一格就升、拖回来就降）
+  assert.equal(firstRegrantAt({ needPx: 450, framePx: 600, ms: 10000 }), null);
+});
+
+await test("需要的像素 = CSS 宽 × 当前 DPR，且被设备宽封顶", () => {
+  // 面板 300 CSS 宽、Retina 2× → 600 物理像素
+  assert.equal(neededPixelWidth(300, 2, 0), 600);
+  assert.equal(neededPixelWidth(200, 2, 0), 400);
+  // DPR 1 的外接屏：同样 300 CSS，物理像素只有 300
+  assert.equal(neededPixelWidth(300, 1, 0), 300);
+  // 设备宽 720 时，需要 800 也只能报 720 —— 报多了 Host 会 clamp 到 scale=1，
+  // 像素一个都拿不到，却会让判定一直以为"还不够清晰"，每次冷却都白申请一遍。
+  assert.equal(neededPixelWidth(400, 2, 720), 720);
+  assert.equal(neededPixelWidth(300, 2, 720), 600, "没超过设备宽时不该被截短");
+  // 没量到尺寸时返回 0（调用方据此不发 preferredWidth，让 Host 走默认）
+  assert.equal(neededPixelWidth(0, 2, 0), 0);
+});
+
+await test("重新申请流不重挂画面组件（key 不含 token，否则每次都会黑一下）", () => {
+  const bundle = readFileSync(new URL("./lib/client.js", import.meta.url), "utf8");
+  assert.ok(
+    /key: activeId (\?\?|!== null)/u.test(bundle),
+    "StreamView 的 key 必须只由设备决定；把 token 拼进去会让每次重建流都重挂 canvas，"
+      + "画布上留着的上一帧随之丢失（黑一下再出图）",
+  );
+});
+await test("Host 不肯重建会话时冷却翻倍，别每 5 秒闪一次屏", () => {
+  // Host 的 StreamPool 对已在跑的会话**不重启编码器**（新 scale 只对下一个会话生效），
+  // 所以"拖宽面板 → 重新 grant"很可能什么都没换来，只换来一次重连闪屏。
+  // 这种情况必须退避，否则就是每 5 秒把画面掐一次。
+  const { nextCooldownMs, nextCooldownAfterGrant } = client.plugin.__test;
+
+  // 申请 600px、Host 实际只给 378px（老会话的 scale=0.35）→ 明显没升上去
+  let cooldown = tuning.minIntervalMs;
+  cooldown = nextCooldownAfterGrant(cooldown, 600, 378);
+  assert.ok(cooldown > tuning.minIntervalMs, `没升上去就该退避，实际仍是 ${cooldown}ms`);
+  for (let i = 0; i < 10; i += 1) cooldown = nextCooldownAfterGrant(cooldown, 600, 378);
+  assert.equal(cooldown, tuning.cooldownMaxMs, "退避要有上限，否则一次失败后永远不再尝试");
+  assert.ok(tuning.cooldownMaxMs >= 30000, "上限太短等于还在闪屏");
+
+  // Host 给了想要的宽度（或者更高）→ 回落到基准冷却
+  assert.equal(nextCooldownAfterGrant(tuning.cooldownMaxMs, 600, 600), tuning.minIntervalMs);
+  assert.equal(nextCooldownAfterGrant(tuning.cooldownMaxMs, 600, 720), tuning.minIntervalMs);
+  // 只差 10%（在 1.15 死区内）不算失败
+  assert.equal(nextCooldownAfterGrant(tuning.cooldownMaxMs, 600, 560), tuning.minIntervalMs);
+  // 信息不全（旧 Host 不回 deviceWidth/scale）→ 不猜，按基准走
+  assert.equal(nextCooldownAfterGrant(tuning.cooldownMaxMs, 600, 0), tuning.minIntervalMs);
+  assert.equal(nextCooldownAfterGrant(tuning.cooldownMaxMs, 0, 378), tuning.minIntervalMs);
+  // 翻倍函数本身：从 0 起步也要给出基准值，不能返回 0（否则再没有冷却）
+  assert.equal(nextCooldownMs(0), tuning.minIntervalMs);
+  assert.equal(nextCooldownMs(tuning.cooldownMaxMs), tuning.cooldownMaxMs);
+});
+
+await test("退避后的冷却期真的会推迟下一次申请", () => {
+  const { decideRegrant: decide, newRegrantStreak: newStreak } = client.plugin.__test;
+  const streak = newStreak();
+  // 1000ms 刚 grant 过；按 60 秒冷却，5 秒时不该动手，61 秒才该
+  let approvedAt = null;
+  for (let t = 1000; t <= 62000; t += tuning.tickMs) {
+    if (decide(streak, 630, 378, t, 1000, tuning.cooldownMaxMs)) { approvedAt = t; break; }
+  }
+  assert.notEqual(approvedAt, null, "退避不等于放弃，冷却过了还是要补分辨率");
+  assert.ok(
+    approvedAt - 1000 >= tuning.cooldownMaxMs,
+    `冷却期是 ${tuning.cooldownMaxMs}ms，实际 ${approvedAt - 1000}ms 就动手了`,
+  );
+});
+
 
 /**
  * 起一个只会回 `daemon.status` 的假 daemon。
@@ -3585,6 +3718,309 @@ await test("CLI 兜底成功后立刻恢复通道（下一次点击回到 RPC）
   assert.equal(res.statusCode, 200, `应当成功，实际 ${res.statusCode} ${res.body}`);
   assert.equal(cliCalls, 1, "通道不可用时应当走 CLI");
   assert.deepEqual(resets, ["reset"], "CLI 成功后必须恢复通道，否则永远退化在 CLI 上");
+});
+
+// ── 自适应取流：同一设备按新 scale 重建会话 ──────────────────────────────
+//
+// 用户最初的抱怨是"画面糊"。客户端把取流改成"按画布物理像素 1:1"之后，
+// 拖宽面板会带着更大的 preferredWidth 重新 grant —— 但会话池原先对已存在的
+// 会话一律"缩放变化延后生效"，于是 re-grant 换不来分辨率：真机现场跑着
+// --scale 0.35（编码 378×832）铺 598×1322 的画布，放大 1.58×，文字必糊。
+// 这一段锁的是"该重建时真重建、不该重建时一次也别多"。
+
+console.log("\n自适应取流重建");
+
+/** 造一个只记录 spawn 参数的池（进程用假替身，不碰设备）。 */
+function restartPool(log = () => {}) {
+  const spawnScales = [];
+  const pool = new StreamSessionPool({
+    spawnFor: (_deviceId, options) => {
+      spawnScales.push(options?.scale);
+      return fakeStream().proc;
+    },
+    idleStopMs: 100_000,
+    log,
+  });
+  return { pool, spawnScales };
+}
+
+await test("acquire 不传 restart 时不会为新的 scale 换会话（现有行为不变）", () => {
+  const { pool } = restartPool();
+  const first = pool.acquire("dev-1", { scale: 0.35 });
+  const second = pool.acquire("dev-1", { scale: 0.9 });
+
+  assert.equal(second, first, "没有重启意图时必须复用旧会话");
+  assert.equal(first.scale, 0.35, "旧会话的 scale 不能被悄悄改掉（坐标是按它换算的）");
+  assert.equal(first.stopped, false);
+  pool.stopAll();
+});
+
+await test("restart:true 且缩放差异 >15% → 停旧会话、按新 scale 建新会话", () => {
+  const { pool, spawnScales } = restartPool();
+  const old = pool.acquire("dev-1", { scale: 0.35 });
+  old.addConsumer(() => {});
+  assert.deepEqual(spawnScales, [0.35], "旧会话应按旧 scale 起进程");
+
+  const next = pool.acquire("dev-1", { scale: 0.554, restart: true });
+  assert.notEqual(next, old, "差异 1.58× 且允许重启时必须重建");
+  assert.ok(old.stopped, "旧会话必须进入终态，否则两路编码同时跑");
+  assert.equal(pool.sessions.get("dev-1"), next);
+  assert.equal(next.scale, 0.554, "新会话要带新 scale");
+
+  next.addConsumer(() => {});
+  assert.deepEqual(spawnScales, [0.35, 0.554], `两次 spawn 应分别拿到新旧 scale，实际 ${spawnScales.join(",")}`);
+  pool.stopAll();
+});
+
+await test("restart:true 但缩放差异 <15% → 不重启（不值得一次黑场）", () => {
+  const { pool } = restartPool();
+  const old = pool.acquire("dev-1", { scale: 0.5 });
+  const next = pool.acquire("dev-1", { scale: 0.55, restart: true }); // 1.1×
+  assert.equal(next, old, "10% 的差异肉眼分不出，不该重建");
+  assert.equal(old.stopped, false);
+  pool.stopAll();
+});
+
+await test("同一设备 3 秒内只重建一次（挡住拖宽抖动）", () => {
+  const { pool } = restartPool();
+  const first = pool.acquire("dev-1", { scale: 0.35 });
+  const rebuilt = pool.acquire("dev-1", { scale: 0.554, restart: true });
+  assert.notEqual(rebuilt, first, "第一次重建应当通过");
+
+  const throttled = pool.acquire("dev-1", { scale: 0.8, restart: true });
+  assert.equal(throttled, rebuilt, "3 秒内第二次重建必须被节流，否则编码器被反复杀");
+  assert.equal(throttled.scale, 0.554);
+  pool.stopAll();
+});
+
+await test("会话被主动终结时通知订阅者（否则旧 HTTP 响应要等看门狗）", () => {
+  const { pool } = restartPool();
+  const session = pool.acquire("dev-1", { scale: 0.35 });
+  let notified = 0;
+  const subscription = session.addConsumer(() => {}, () => { notified += 1; });
+
+  // 另一个设备的消费者：stop 它时应当收到通知
+  const other = pool.acquire("dev-2", { scale: 1 });
+  let otherNotified = 0;
+  other.addConsumer(() => {}, () => { otherNotified += 1; });
+  pool.stop("dev-2");
+  assert.equal(otherNotified, 1, "被 stop 的会话必须通知自己的订阅者");
+
+  // 已经退订的消费者不该再收到通知
+  subscription.remove();
+  pool.stop("dev-1");
+  assert.equal(notified, 0, "已经退订的消费者不该再收到通知");
+  pool.stopAll();
+});
+
+/** 造一次 grant 请求（真 HTTP 语义的 req/res 替身，不建 socket）。 */
+function grantReqRes(body) {
+  const req = new Readable({ read() {} });
+  req.method = "POST";
+  req.url = "/grant";
+  req.headers = {
+    host: "127.0.0.1:19387",
+    origin: "http://127.0.0.1:19387",
+    "content-type": "application/json",
+  };
+  req.socket = { remoteAddress: "127.0.0.1", localAddress: "127.0.0.1" };
+  const res = {
+    statusCode: 0,
+    body: "",
+    headersSent: false,
+    writeHead(code) { this.statusCode = code; this.headersSent = true; },
+    end(payload) { this.body = payload ?? ""; },
+    write() {},
+    on() {},
+    setHeader() {},
+  };
+  req.push(Buffer.from(JSON.stringify(body)));
+  req.push(null);
+  return { req, res };
+}
+
+/** grant 用的路由：真池子 + 假 spawn，scale = preferredWidth / 1080（三位小数）。 */
+function regrantHarness(log = () => {}) {
+  const { pool, spawnScales } = restartPool(log);
+  const client = {
+    async listDevices() { return [{ id: "d1", name: "一加 12", platform: "android", state: "online" }]; },
+    async runJson() { return {}; },
+  };
+  const routes = new StreamRoutes({
+    client,
+    pool,
+    access: { mint: () => "t" },
+    log,
+    resolveStreamPlan: async (_deviceId, preferredWidth) => {
+      const width = typeof preferredWidth === "number" && preferredWidth > 0 ? preferredWidth : 1080;
+      return {
+        scale: Math.round((width / 1080) * 1000) / 1000,
+        bitrate: null,
+        deviceWidth: 1080,
+        deviceHeight: 2376,
+        preferredWidth: width,
+      };
+    },
+  });
+
+  const grant = async (preferredWidth) => {
+    const { req, res } = grantReqRes({ preferredWidth });
+    await routes.handle("grant", req, res);
+    return { res, json: JSON.parse(res.body) };
+  };
+
+  return { routes, pool, spawnScales, grant };
+}
+
+await test("同设备 grant 更大的 preferredWidth → 真按新 scale 重建，回包也是新 scale", async () => {
+  const { pool, spawnScales, grant } = regrantHarness();
+
+  const first = await grant(378); // 0.35
+  assert.equal(first.res.statusCode, 200, `第一次 grant 应当成功，实际 ${first.res.body}`);
+  assert.equal(first.json.scale, 0.35, `回包 scale 应为 0.35，实际 ${first.json.scale}`);
+
+  const session = pool.sessions.get("d1");
+  session.addConsumer(() => {}); // 面板连上了流 → 编码器在跑
+  assert.deepEqual(spawnScales, [0.35]);
+
+  const second = await grant(598); // 0.554，比 0.35 大 1.58×
+  assert.equal(second.res.statusCode, 200, `第二次 grant 应当成功，实际 ${second.res.body}`);
+  assert.notEqual(pool.sessions.get("d1"), session, "面板变宽后必须重建会话，否则 re-grant 换不来分辨率");
+  assert.ok(session.stopped, "旧会话要被停掉");
+  assert.equal(second.json.scale, 0.554, `回包必须等于新会话的 scale，实际 ${second.json.scale}`);
+
+  pool.sessions.get("d1").addConsumer(() => {});
+  assert.deepEqual(spawnScales, [0.35, 0.554], `第二次 spawn 必须拿到新 scale，实际 ${spawnScales.join(",")}`);
+  pool.stopAll();
+});
+
+await test("3 秒内第二次 re-grant 被节流：不重建，回包仍是当前流的 scale", async () => {
+  const { pool, spawnScales, grant } = regrantHarness();
+
+  await grant(378); // 0.35
+  pool.sessions.get("d1").addConsumer(() => {});
+
+  const rebuilt = await grant(598); // 0.554 → 重建（第一次）
+  assert.equal(rebuilt.json.scale, 0.554);
+  const rebuiltSession = pool.sessions.get("d1");
+  // 模拟客户端重连：新会话的第一个消费者拉起新编码器
+  rebuiltSession.addConsumer(() => {});
+  assert.deepEqual(spawnScales, [0.35, 0.554]);
+
+  // 继续变宽（0.554 → 0.8 是 1.44×，幅度够，但距上次重建不到 3 秒）
+  const throttled = await grant(864);
+  assert.equal(throttled.json.scale, 0.554, `节流期间回包必须如实反映当前流的 scale，实际 ${throttled.json.scale}`);
+  assert.equal(pool.sessions.get("d1"), rebuiltSession, "节流期间不许换会话");
+  assert.deepEqual(spawnScales, [0.35, 0.554], `节流期间不许再 spawn，实际 ${spawnScales.join(",")}`);
+  pool.stopAll();
+});
+
+// 这条是给"重建会不会把用户卡在黑屏"一个真链路的答案：
+// 旧 /stream 响应必须被 Host 主动 end（否则浏览器要等看门狗，画面冻住），
+// 客户端随后带新 token 重连就能拿到新分辨率的流。
+await test("按新缩放重建时旧 /stream 响应主动结束，重连即拿到新流", async () => {
+  const PREFIX = "/_dsh/dsh-sidebar-mobile";
+  const streams = [];
+  const spawnScales = [];
+  const pool = new StreamSessionPool({
+    spawnFor: (_deviceId, options) => {
+      spawnScales.push(options?.scale);
+      const stream = fakeStream();
+      streams.push(stream);
+      return stream.proc;
+    },
+    idleStopMs: 100_000,
+    log: () => {},
+  });
+  const access = new StreamAccessController({ key: prepareStreamAccessKey() });
+  const client = {
+    async listDevices() { return [{ id: "d1", name: "一加 12", platform: "android", state: "online" }]; },
+    async runJson() { return {}; },
+  };
+  const routes = new StreamRoutes({
+    client,
+    pool,
+    access,
+    log: () => {},
+    resolveStreamPlan: async (_deviceId, preferredWidth) => {
+      const width = typeof preferredWidth === "number" && preferredWidth > 0 ? preferredWidth : 1080;
+      return { scale: Math.round((width / 1080) * 1000) / 1000, bitrate: null, deviceWidth: 1080, deviceHeight: 2376, preferredWidth: width };
+    },
+  });
+
+  let mounted = null;
+  const dispose = mountRoutes(
+    { webServer: { register(route) { mounted = route; return () => {}; } } },
+    routes,
+    PREFIX,
+  );
+  const server = http.createServer((req, res) => { void mounted.handler(req, res); });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const base = `http://127.0.0.1:${server.address().port}${PREFIX}`;
+
+  /** 等到某个条件成立（HTTP 替身里只能用轮询等状态）。 */
+  const waitFor = async (predicate, label) => {
+    const deadline = Date.now() + 3000;
+    while (!predicate()) {
+      if (Date.now() > deadline) throw new Error(`等待超时：${label}`);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+  };
+
+  const mjpegHeader = Buffer.from("--frame\r\nContent-Type: image/jpeg\r\n\r\n");
+  const mjpegFrame = Buffer.concat([mjpegHeader, Buffer.alloc(64, 7), Buffer.from("\r\n")]);
+
+  try {
+    // ① 面板第一次连流（画布 378 物理像素 → scale 0.35）
+    {
+      const { req, res } = grantReqRes({ preferredWidth: 378 });
+      await routes.handle("grant", req, res);
+      assert.equal(res.statusCode, 200, `首次 grant 应当成功，实际 ${res.body}`);
+    }
+    const firstUrl = `${base}/stream?token=${encodeURIComponent(access.mint("d1"))}`;
+    const pendingFirst = fetch(firstUrl);
+    await waitFor(() => pool.sessions.get("d1")?.consumers?.size === 1, "第一次 /stream 订阅");
+    streams[0].push(mjpegFrame);
+    const firstResponse = await pendingFirst;
+    assert.equal(firstResponse.status, 200, "第一次取流应当成功");
+    const firstReader = firstResponse.body.getReader();
+    const head = await firstReader.read();
+    assert.equal(head.done, false, "应当已经收到首块数据");
+
+    // ② 面板变宽 → 重建会话（0.35 → 0.554）
+    {
+      const { req, res } = grantReqRes({ preferredWidth: 598 });
+      await routes.handle("grant", req, res);
+      assert.equal(res.statusCode, 200, `重建 grant 应当成功，实际 ${res.body}`);
+      const json = JSON.parse(res.body);
+      assert.equal(json.scale, 0.554, `重建后回包 scale 应为 0.554，实际 ${json.scale}`);
+    }
+
+    // ③ 旧响应必须自己结束：不结束的话浏览器要等看门狗，画面就冻住了
+    const ended = await Promise.race([
+      firstReader.read().then((r) => r.done),
+      new Promise((resolve) => setTimeout(() => resolve("timeout"), 1000)),
+    ]);
+    assert.equal(ended, true, "会话被重建后，旧 /stream 响应必须主动结束（否则画面要冻到看门狗超时）");
+
+    // ④ 客户端带新 token 重连 → 新会话按新 scale 起进程
+    const secondUrl = `${base}/stream?token=${encodeURIComponent(access.mint("d1"))}`;
+    const pendingSecond = fetch(secondUrl);
+    await waitFor(() => streams.length === 2 && pool.sessions.get("d1")?.consumers?.size === 1, "重连后的 /stream 订阅");
+    streams[1].push(mjpegFrame);
+    const secondResponse = await pendingSecond;
+    assert.equal(secondResponse.status, 200, "重连应当拿到新流");
+    const secondReader = secondResponse.body.getReader();
+    const secondHead = await secondReader.read();
+    assert.equal(secondHead.done, false, "新流应当马上出画面");
+    assert.deepEqual(spawnScales, [0.35, 0.554], `重连后必须按新 scale 起编码器，实际 ${spawnScales.join(",")}`);
+
+    await secondReader.cancel();
+  } finally {
+    dispose?.();
+    await new Promise((resolve) => server.close(resolve));
+    pool.stopAll();
+  }
 });
 
 console.log(`\n结果：${passed} 通过，${failed} 失败`);

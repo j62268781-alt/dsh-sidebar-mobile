@@ -316,15 +316,6 @@ window.__ModuleLoader__.load({
     const stageLayout = new WeakMap();
 
     /**
-     * 面板当前占多少物理像素宽（= 后备存储宽度，见 fitCanvasToFrame）。
-     *
-     * 0 = 还没画过任何一帧，尺寸未知。用途只有一个：grant 时告诉 Host
-     * "按这个宽度给我取流"（见 preferredWidth），让送来的帧正好 1:1 落在
-     * 后备存储上 —— 解码量、降采样成本、清晰度三样同时改善。
-     */
-    let panelPixelWidth = 0;
-
-    /**
      * 「仿真整机」外壳吃掉的内边距，单位 CSS px，**单边**。
      *
      * = .mbm-chassis 的 padding 5 + 1px 描边（见 styles.css）。
@@ -352,6 +343,197 @@ window.__ModuleLoader__.load({
      * ⚠️ 300 是宿主侧的数字（ui-sidebar-right 的 computeColumns），宿主改了要同步这里。
      */
     const MAX_MEDIA_CSS_WIDTH = 300;
+
+    /**
+     * 面板**实际**占的 CSS 宽度（= fitCanvasToFrame 算出的 cssWidth）。
+     *
+     * 0 = 还没画过任何一帧。存 CSS 宽而不是直接存后备存储宽（= CSS × DPR），
+     * 是因为 DPR 会变：窗口从外接屏（DPR 1）拖到内建 Retina（DPR 2）时，
+     * 需要的物理像素直接翻倍，必须用**当下**的 DPR 重算。只存像素宽的话，
+     * DPR 一变这个数就过时了 —— 而它要等下一帧画完才更新，流停着时永远不更新，
+     * 判定就会拿着过时的"需要多宽"去做决定。
+     */
+    let panelCssWidth = 0;
+
+    /**
+     * 流分辨率不够时自动重新申请的判定参数（见 decideRegrant）。
+     *
+     * ── 这是一个真机上量出来的 bug 的补丁 ────────────────────────────
+     *
+     * scale 只在 /grant 那一刻按当时的 preferredWidth 算一次，之后永不重算。于是：
+     *   · 用户把侧边栏拖宽 → 画布后备存储变大 → 流还是老分辨率 → 越拖越糊；
+     *   · 窗口从 1920×1080 外接屏（DPR 1）拖到内建 Retina（DPR 2）→ 需要的
+     *     物理像素直接翻倍，同一路流立刻糊一半；
+     *   · 首次 grant 若发生在布局完成前，一开始就取小了，永久糊。
+     *
+     * 真机复现的那次：面板抓屏里手机屏幕区 598 物理像素宽，编码进程却只有
+     * 378×832（scale 0.35），被浏览器放大 1.58× —— 文字边缘全是插值糊。
+     */
+    /**
+     * 帧宽比需要的小 15% 以上才算"该升档"。
+     *
+     * 不设成 1.0：不到 15% 的过采样（比如需要 630、实际 600）在 2× 屏上几乎
+     * 看不出差别，却要付出一次 5 秒冷却 + 一次重新建流的代价。1.15 是"肉眼
+     * 能看出糊"的下限附近。
+     */
+    const REGRANT_UPSCALE_RATIO = 1.15;
+    /**
+     * 帧宽比需要的大 60% 以上才算"该降档"。
+     *
+     * 与上面的 1.15 一起构成滞环：升档要 over 15% 才动、降档要 over 60% 才动，
+     * 中间这一大段是死区。没有这段死区的话，用户把侧边栏拖宽一格又拖回来，
+     * 就会升一次降一次地反复重建流（每次都闪一下）。
+     */
+    const REGRANT_DOWNSCALE_RATIO = 1.6;
+    /** 升档要持续多久才动手：拖拽时宽度连续变化，必须 debounce。 */
+    const REGRANT_UPSCALE_HOLD_MS = 600;
+    /**
+     * 降档要持续多久才动手。
+     *
+     * 3 秒而不是 0.6 秒：降档只是省资源，不像糊那样影响可用性；
+     * 而"流太大"最常见的成因正是用户正在把面板**拖宽**（或刚拖完），
+     * 拖拽过程中就降档会立刻又要升回来。
+     */
+    const REGRANT_DOWNSCALE_HOLD_MS = 3000;
+    /**
+     * 两次重新申请之间的最小间隔。
+     *
+     * 一次 grant 要杀掉旧编码进程、spawn 新的（实测 mobilecli 进程启动 62ms，
+     * 加上等下一个 IDR），画面会闪一下；5 秒内重复申请没有任何收益。
+     */
+    const REGRANT_MIN_INTERVAL_MS = 5000;
+    /**
+     * 连续"申请了但没变清晰"之后冷却期的上限。
+     *
+     * ── 为什么需要这个上限 ──────────────────────────────────────────────
+     * Host 侧 `StreamPool#acquire` 对**已经在跑**的会话是这么处理的：
+     * 参数变了不重启（"重启编码器要黑屏一段，不值"，见 lib/stream/session.js），
+     * 新 scale 只在下一个会话生效。也就是说：拖宽面板时重新 grant 很可能
+     * **拿不到更高分辨率** —— 只能拿回一个新 token，帧还是老的。
+     *
+     * 这种情况下如果还按 5 秒一次重试，等价于每 5 秒把画面掐掉重连一次：
+     * 分辨率一点没变，用户只看到不停闪。所以每次发现"申请完还是不够清晰"
+     * 就把冷却翻倍（5 → 10 → 20 → 40 → 60 秒封顶），把抖动压到一分钟一次
+     * 以内；等 Host 支持按新 scale 重建会话（或会话自然重启）后，
+     * 一次成功就会把冷却重置回 5 秒。
+     */
+    const REGRANT_COOLDOWN_MAX_MS = 60000;
+    /** 判定节拍。250ms 足够让 600ms 的 debounce 有 2 次以上采样。 */
+    const REGRANT_TICK_MS = 250;
+    /**
+     * 拿不到设备宽度时按 1080 兜底（iPhone 15 Pro 等主流机型的逻辑宽）。
+     *
+     * 上报的 preferredWidth 超过设备宽没有意义：Host 侧 normalizeScale 会把
+     * scale 夹到 1，多出来的像素一个都拿不到，却会让判定认为"还不够清晰"，
+     * 于是每次冷却结束都白重新申请一遍。
+     */
+    const DEVICE_WIDTH_FALLBACK = 1080;
+
+    /**
+     * 重取判定的游标。用可变对象是因为它被 setInterval 每 250ms 读一次 ——
+     * 放 React state 里会让每次采样都重渲染一遍面板。
+     */
+    function newRegrantStreak() {
+      return { direction: "none", since: 0 };
+    }
+
+    /**
+     * 下一次冷却期：从基准值起逐次翻倍，封顶 REGRANT_COOLDOWN_MAX_MS。
+     *
+     * @param {number} prev 当前冷却期（毫秒）
+     * @returns {number}
+     */
+    function nextCooldownMs(prev) {
+      if (!(prev > 0)) return REGRANT_MIN_INTERVAL_MS;
+      return Math.min(prev * 2, REGRANT_COOLDOWN_MAX_MS);
+    }
+
+    /**
+     * 按"这次重新申请的结果"决定下一次冷却期（纯函数，便于单测）。
+     *
+     * @param {number} cooldown 当前冷却期
+     * @param {number} requestedPx 本次上报给 Host 的 preferredWidth
+     * @param {number} effectivePx Host 回包里**实际生效**的流宽（= deviceWidth × scale）
+     * @returns {number} 下一次冷却期
+     */
+    function nextCooldownAfterGrant(cooldown, requestedPx, effectivePx) {
+      // 信息不全（旧 Host 不回 deviceWidth/scale，或客户端没上报宽度）：
+      // 没有证据说明"申请无效"，按基准冷却走，别凭猜测越等越久。
+      if (!(requestedPx > 0) || !(effectivePx > 0)) return REGRANT_MIN_INTERVAL_MS;
+      // 只看"升档没升上去"：降档申请即使 Host 不理会也不算失败。
+      if (effectivePx >= requestedPx) return REGRANT_MIN_INTERVAL_MS;
+      const stillTooSmall = requestedPx / effectivePx > REGRANT_UPSCALE_RATIO;
+      return stillTooSmall ? nextCooldownMs(cooldown) : REGRANT_MIN_INTERVAL_MS;
+    }
+
+    /**
+     * 判断**这一刻**该不该重新申请流（纯函数，无副作用，便于单测）。
+     *
+     * @param {{direction: string, since: number}} streak 上次的持续时间游标（会被就地更新）
+     * @param {number} needPx 画布需要的物理像素宽（= 后备存储宽）
+     * @param {number} framePx 当前流的真实帧宽（设备像素）
+     * @param {number} now performance.now()
+     * @param {number} lastAt 上次重新申请的时刻（0 = 从未）
+     * @param {number} [cooldownMs] 冷却期（默认 REGRANT_MIN_INTERVAL_MS；连续申请
+     *   无效时会翻倍，见 REGRANT_COOLDOWN_MAX_MS 的注释）
+     * @returns {boolean} true = 应该重新 grant
+     */
+    function decideRegrant(streak, needPx, framePx, now, lastAt, cooldownMs = REGRANT_MIN_INTERVAL_MS) {
+      // 没有帧 / 没有布局：不知道任何东西，清空调度，什么都不做。
+      // 首帧到达前 framePx 就是 0，这条同时挡掉了"刚 grant 完还没出图"的窗口。
+      if (!(needPx > 0) || !(framePx > 0)) {
+        streak.direction = "none";
+        return false;
+      }
+      let direction = "none";
+      if (needPx / framePx > REGRANT_UPSCALE_RATIO) direction = "up";
+      else if (framePx / needPx > REGRANT_DOWNSCALE_RATIO) direction = "down";
+      if (direction === "none") {
+        // 落在死区（1/1.6 ≤ need/frame ≤ 1.15）：一切正常，清空计时。
+        streak.direction = "none";
+        return false;
+      }
+      if (direction !== streak.direction) {
+        // 方向翻转（用户开始往回拖）→ 重新计时，别拿旧方向的累计时间来触发。
+        streak.direction = direction;
+        streak.since = now;
+        return false;
+      }
+      const hold = direction === "up" ? REGRANT_UPSCALE_HOLD_MS : REGRANT_DOWNSCALE_HOLD_MS;
+      if (now - streak.since < hold) return false;
+      // 持续够久了，但冷却期没过 —— 保持 streak 不动，等冷却一过立刻发，
+      // 而不是从头再等 600ms。
+      // lastAt <= 0 = 本次会话还没 grant 过（首次申请），不适用冷却。
+      if (lastAt > 0 && now - lastAt < cooldownMs) return false;
+      return true;
+    }
+
+    /**
+     * 画布该按多宽的**物理像素**取流。
+     *
+     * 纯函数：调用方负责把 panelCssWidth / DPR / 设备宽喂进来。
+     * 单独抽出来是为了能单测四种组合（含设备宽封顶），不必渲染 React。
+     *
+     * @param {number} cssWidth 画布 CSS 宽（已含 contain 与 MAX_MEDIA_CSS_WIDTH 封顶）
+     * @param {number} dpr 当前 devicePixelRatio（已按上限 2 夹过）
+     * @param {number} deviceWidth 设备逻辑宽（0/null = 不知道，按兜底值）
+     * @returns {number} 物理像素宽；算不出时为 0
+     */
+    function neededPixelWidth(cssWidth, dpr, deviceWidth) {
+      if (!(cssWidth > 0) || !(dpr > 0)) return 0;
+      const raw = Math.round(cssWidth * dpr);
+      if (!(raw > 0)) return 0;
+      const limit = deviceWidth > 0 ? deviceWidth : DEVICE_WIDTH_FALLBACK;
+      return Math.min(raw, limit);
+    }
+
+    /** 等一帧（rAF；没有 rAF 的环境退化成 16ms 定时器）。用于等布局就绪。 */
+    function nextFrame() {
+      return new Promise((resolve) => {
+        if (typeof requestAnimationFrame === "function") requestAnimationFrame(() => resolve());
+        else setTimeout(resolve, 16);
+      });
+    }
 
     /**
      * 一条空的布局缓存。
@@ -495,10 +677,10 @@ window.__ModuleLoader__.load({
         canvas.height = bufferHeight;
       }
 
-      // 面板当前占多少物理像素宽。Host 用它决定按什么分辨率取流
-      // （见 grant 里的 preferredWidth），这样它送来的帧正好 1:1 落在
-      // 后备存储上：既不浪费解码，也不用浏览器再降采样一次。
-      panelPixelWidth = bufferWidth;
+      // 面板现在占多宽的物理像素 = cssWidth × 当前 DPR，Host 按它决定取流分辨率
+      // （见 grant 里的 preferredWidth）。留 CSS 宽而不是像素宽：跨屏移动时 DPR
+      // 会变，像素宽必须用**当下**的 DPR 重算（见 neededPixelWidth）。
+      panelCssWidth = cssWidth;
 
       // 机身圆角必须由画布宽度推出来：纯 CSS 拿不到"画布现在多宽"这个动态值
       // （百分比圆角是相对元素**自身**算的，而机身比画布宽 12px，比例会错位）。
@@ -1085,11 +1267,14 @@ window.__ModuleLoader__.load({
      *
      * @param {{deviceId: string|null, streamToken: string|null, format: string,
      *   frame: "bezel"|"device"|"frameless", deviceKind: string|null,
+     *   frameSizeRef: {current: {width: number, height: number}},
      *   onError?: (message: string) => void}} props
      *   deviceKind 是平台的 "ios"/"android"，只用来决定开孔样式
      *   （灵动岛 vs 挖孔），不参与任何布局或坐标计算。
+     *   frameSizeRef 由外层（MobilePanel）持有：面板要拿"当前流的真实帧宽"来判断
+     *   分辨率够不够（见 decideRegrant），组件的私有 ref 它读不到。
      */
-    function StreamView({ deviceId, streamToken, format, frame, deviceKind, onError }) {
+    function StreamView({ deviceId, streamToken, format, frame, deviceKind, frameSizeRef, onError }) {
       const [state, setState] = useState("idle");
       const [detail, setDetail] = useState(null);
       const canvasRef = useRef(null);
@@ -1103,8 +1288,16 @@ window.__ModuleLoader__.load({
        * 点击判成滑动（或反之）。ref 是同步写入的，没有这个窗口。
        */
       const gestureRef = useRef(null);
-      /** H.264 的真实帧尺寸（设备像素）。canvas 后备存储已不等于它。 */
-      const frameSizeRef = useRef({ width: 0, height: 0 });
+      /**
+       * 是否曾经成功画出过至少一帧。
+       *
+       * 机身外壳在首帧前是隐藏的（那时它只是个 12×12 的小方块，见 styles.css
+       * 的 [data-media="off"]）。一旦画过帧就必须**永远**保持显示：重新申请流、
+       * 断线重连都会让 state 短暂离开 "playing"，若拿 state 直接控制外壳可见性，
+       * 每次重连整块画面就闪一下 —— 而画布上还留着上一帧，本来可以一直顶着给
+       * 用户看（这也是"重取期间不黑屏"的实现基础）。
+       */
+      const [everPainted, setEverPainted] = useState(false);
 
       const streamUrl = streamToken === null ? null : `${PREFIX}/stream/${encodeURIComponent(streamToken)}`;
 
@@ -1115,6 +1308,8 @@ window.__ModuleLoader__.load({
         canvasRef,
         (next, info) => {
           setState(next);
+          // 画过一帧之后外壳永久可见（理由见 everPainted 的注释）
+          if (next === "playing") setEverPainted(true);
           if (info !== undefined) setDetail(info);
           if (next === "error" && typeof info === "string") onError?.(info);
         },
@@ -1433,7 +1628,12 @@ window.__ModuleLoader__.load({
           alt="设备画面"
           draggable={false}
           tabIndex={interactive ? 0 : undefined}
-          onLoad={() => setState("playing")}
+          onLoad={() => {
+            setState("playing");
+            // MJPEG 没有 canvas，但整机外壳也靠 everPainted 决定显不显示（见其注释），
+            // 不在这里点亮的话外壳一直是 opacity:0 —— 画面等于看不见。
+            setEverPainted(true);
+          }}
           onError={() => {
             const message = "MJPEG 流加载失败，检查设备是否仍在线。";
             setState("error");
@@ -1453,7 +1653,10 @@ window.__ModuleLoader__.load({
           style={{
             cursor: interactive ? "crosshair" : "default",
             touchAction: "none",
-            display: state === "playing" ? "block" : "none",
+            // 只看"有没有画过帧"，不看当前 state：重新申请流时 state 会短暂离开
+            // playing（connecting），若按 state 隐藏画布，正在看的那一帧会闪黑 ——
+            // 而画布上本来就留着上一帧，让它继续显示才是连续的。
+            display: everPainted ? "block" : "none",
           }}
         />
       );
@@ -1477,7 +1680,10 @@ window.__ModuleLoader__.load({
         <div
           className="mbm-chassis"
           data-device-kind={deviceKind ?? "unknown"}
-          data-media={state === "playing" ? "on" : "off"}
+          // 用"曾经画过帧"而不是"此刻在 playing"：重新申请流/断线重连时 state 会
+          // 短暂离开 playing，若按 state 控制可见性，整块外壳会闪一下。
+          // 画布上还留着上一帧，一直显示反而更连续（见 everPainted）。
+          data-media={everPainted ? "on" : "off"}
         >
           {media}
           {/* 侧键：电源在右、音量上/下在左，绝对定位在机身内边距带里 */}
@@ -1827,19 +2033,49 @@ window.__ModuleLoader__.load({
       const [adb, setAdb] = useState(null);
 
       /**
+       * H.264 的真实帧尺寸（设备像素）。
+       *
+       * 由面板持有并传给 StreamView：自适应取流要用 frameSizeRef.current.width
+       * 当作"当前流有多宽"，和面板需要的像素比大小（见 decideRegrant）。
+       */
+      const frameSizeRef = useRef({ width: 0, height: 0 });
+      /**
+       * 设备逻辑宽（grant 回包里的 deviceWidth）。0 = 还不知道。
+       *
+       * 上报的 preferredWidth 超过设备宽毫无意义（Host 会把 scale 夹到 1），
+       * 反而会让判定一直认为"还不够清晰"，每次冷却结束都白重新申请一遍。
+       */
+      const deviceWidthRef = useRef(0);
+      /** 上次重新申请流的时刻（0 = 从未），用于冷却。 */
+      const lastRegrantAtRef = useRef(0);
+      /**
+       * 当前冷却期。每次"申请了但没变清晰"就翻倍（见 REGRANT_COOLDOWN_MAX_MS
+       * 的注释：Host 对已在跑的会话不重启编码器，重复申请只换来闪屏）。
+       */
+      const regrantCooldownRef = useRef(REGRANT_MIN_INTERVAL_MS);
+      /** 升/降档的持续时间游标（见 decideRegrant），可变的普通对象。 */
+      const regrantStreakRef = useRef(newRegrantStreak());
+      /** busy 的同步副本：250ms 判定节拍里读到它才是最新的（state 会慢一拍）。 */
+      const busyRef = useRef(false);
+
+      /**
        * 面板该按多宽的**物理像素**取流（= 后备存储宽度），0 表示还没法确定。
        *
        * 两级来源：
-       * 1. 已经画过帧 → 直接用 fitCanvasToFrame 记下的真实后备存储宽度，零成本。
+       * 1. 已经画过帧 → 画布的 CSS 宽 × **当前** DPR（见 neededPixelWidth）。
+       *    用 CSS 宽而不是上次记下的后备存储宽：跨屏拖动时 DPR 会变，而后者
+       *    要等下一帧画完才更新 —— 流停着时永远不更新，判定就会拿着过时的
+       *    "需要多宽"去做决定。
        * 2. 首次 grant 时还没画过任何一帧（流都还没建）→ 拿 `.mbm-stage` 的可用宽度
        *    估一个。手机画面是竖长的，侧边栏通常"宽度受限"，所以这个估计值在
        *    常见情况下就是真实值；真被高度限制住时只会偏大一点，而 Host 那边还会
        *    clamp 到 [0.35, 1]，代价仅是多送一点像素。
-       *
-       * 绝不为此再改一次 grant：grant 会重开流（画面闪一下），为了几十像素不值得。
        */
       const preferredStreamWidth = () => {
-        if (panelPixelWidth > 0) return panelPixelWidth;
+        const dpr = Math.min(window.devicePixelRatio || 1, 2);
+        if (panelCssWidth > 0) {
+          return neededPixelWidth(panelCssWidth, dpr, deviceWidthRef.current);
+        }
         const stage = rootRef.current === null ? null : rootRef.current.querySelector(".mbm-stage");
         if (stage === null) return 0;
         // device 档画布外面还包着机身（.mbm-chassis），它的 padding + 描边要占两侧，
@@ -1851,7 +2087,6 @@ window.__ModuleLoader__.load({
         // display:contents 让它不参与布局 —— 文件里在、布局里不在。按存在性判断会在
         // 这两档少报 12px，Host 算出偏小的 scale，画布就把 562 宽的帧拉成 586 显示（发糊）。
         const staged = stage.getAttribute("data-frame") === "device" ? CHASSIS_INSET * 2 : 0;
-        const dpr = Math.min(window.devicePixelRatio || 1, 2);
         // 与 fitCanvasToFrame 用同一个封顶值：上报的像素宽必须是画布**真的**会占的
         // 宽度，否则 Host 按偏大的值算 scale，多送的像素照样被降采样丢掉。
         const availWidth = Math.min(
@@ -1859,14 +2094,20 @@ window.__ModuleLoader__.load({
           MAX_MEDIA_CSS_WIDTH,
         );
         if (!(availWidth > 0)) return 0;
-        return Math.max(1, Math.round(availWidth * dpr));
+        return neededPixelWidth(availWidth, dpr, deviceWidthRef.current);
       };
 
       /** 申请 token 并选定设备。token 决定设备，所以换设备必须重新申请。 */
       const grant = useCallback(
         async (deviceId) => {
           setBusy(true);
+          busyRef.current = true;
           setError(null);
+          // 冷却从**发起**时刻算起：判定节拍读的是这个值，若等响应回来再记，
+          // 一次慢 grant（离线模拟器冷启动可达数分钟）会让冷却形同虚设。
+          lastRegrantAtRef.current = performance.now();
+          // 一次新的 grant 意味着"重新开始看"，之前的升/降档计时作废。
+          regrantStreakRef.current = newRegrantStreak();
           try {
             /**
              * ⚠️ 选中**离线模拟器**时这条请求会很慢（Host 会先把它启动起来，
@@ -1902,6 +2143,30 @@ window.__ModuleLoader__.load({
             rememberDevices(result.devices ?? []);
             setActiveId(result.device?.id ?? null);
             setToken(result.streamToken ?? null);
+            // 记下设备逻辑宽：判定"需要的像素是否超过设备能给的"要用它封顶
+            // （见 neededPixelWidth）。Host 回带的是本次流**真实**的设备尺寸，
+            // 比从设备列表里猜可靠；拿不到就保持 0（按 1080 兜底）。
+            if (typeof result.deviceWidth === "number" && result.deviceWidth > 0) {
+              deviceWidthRef.current = result.deviceWidth;
+            }
+            /**
+             * 记录"这次申请到底换来了多宽的流"，用来决定下一次冷却期。
+             *
+             * ⚠️ Host 的 StreamPool 对**已在跑**的会话不重启编码器（新 scale
+             * 只对下一个会话生效），所以拖宽面板后重新 grant 很可能什么都没变：
+             * 回包里的 scale 还是老值。这时若仍按 5 秒冷却重试，就是把画面
+             * 每 5 秒掐一次重连、分辨率一点不涨 —— 用户只看到不停闪。
+             * 于是按"实际生效宽度"给冷却翻倍，见 REGRANT_COOLDOWN_MAX_MS。
+             */
+            const effectiveWidth = typeof result.deviceWidth === "number" && result.deviceWidth > 0
+              && typeof result.scale === "number" && result.scale > 0
+              ? Math.round(result.deviceWidth * result.scale)
+              : 0;
+            regrantCooldownRef.current = nextCooldownAfterGrant(
+              regrantCooldownRef.current,
+              preferredWidth,
+              effectiveWidth,
+            );
             // 启动失败不影响选中，但要如实告诉用户（否则画面一直是黑的却无解释）
             if (typeof result.bootError === "string" && result.bootError !== "") {
               setError(`设备已选中，但启动失败：${result.bootError}`);
@@ -1912,15 +2177,107 @@ window.__ModuleLoader__.load({
           } finally {
             setBooting(false);
             setBusy(false);
+            busyRef.current = false;
           }
         },
         [rememberDevices],
       );
 
-      // 挂载时自动选一台（Host 会优先沿用上次选的）
+      /**
+       * 挂载时自动选一台（Host 会优先沿用上次选的）。
+       *
+       * ⚠️ 先等布局算出来再发 grant。grant 里的 preferredWidth 决定了**整条流**的
+       * 编码分辨率，而它只在 grant 那一刻算一次；若这时 .mbm-stage 还没量到宽度
+       * （面板刚挂载、或所在 tab 还没显示），上报值就是 0 → Host 按默认分辨率
+       * 取流 → 开局就糊，之后只能靠 5 秒冷却的自适应重取慢慢纠正。
+       * 等布局的代价最多几十毫秒，比"开局糊一下再自己变清楚"划算得多。
+       */
       useEffect(() => {
-        void grant();
+        let cancelled = false;
+        const start = async () => {
+          // 最多等 30 帧（~0.5s）：面板被折叠/隐藏时永远量不到宽度，
+          // 这时也得把 grant 发出去，否则界面会一直空着。
+          for (let attempt = 0; attempt < 30 && !cancelled; attempt += 1) {
+            if (preferredStreamWidth() > 0) break;
+            await nextFrame();
+          }
+          if (!cancelled) void grant();
+        };
+        void start();
+        return () => {
+          cancelled = true;
+        };
       }, [grant]);
+
+      /**
+       * 自适应取流：分辨率不够（或过剩）时重新申请。
+       *
+       * 为什么必须重新 grant 而不是改个参数：编码参数（--scale）只能在进程
+       * spawn 时给，Host 侧 `#planForSession` 也是按会话里那条流的真实 scale
+       * 对齐的 —— 想让 scale 变，只能重新走一次 grant（会重建流）。
+       *
+       * 判定节拍 250ms、纯算术（不碰 DOM）：拖拽时宽度连续变化，靠 decideRegrant
+       * 里的"持续 600ms"debounce 兜住，不会每动一像素就重建一次流。
+       */
+      useEffect(() => {
+        if (activeId === null) return undefined;
+        const timer = setInterval(() => {
+          if (busyRef.current) return; // grant 进行中不重入
+          const now = performance.now();
+          const needPx = preferredStreamWidth();
+          const framePx = frameSizeRef.current.width;
+          if (!decideRegrant(
+            regrantStreakRef.current,
+            needPx,
+            framePx,
+            now,
+            lastRegrantAtRef.current,
+            regrantCooldownRef.current,
+          )) {
+            return;
+          }
+          regrantStreakRef.current = newRegrantStreak();
+          lastRegrantAtRef.current = now;
+          void grant(activeId);
+        }, REGRANT_TICK_MS);
+        return () => clearInterval(timer);
+      }, [activeId, grant]);
+
+      /**
+       * DPR 变化（窗口从外接屏拖到内建 Retina 屏）时，ResizeObserver **不会**触发
+       * —— 侧边栏的 CSS 像素尺寸一点没变，变的只是每个 CSS 像素对应几个物理像素。
+       * 而"需要的像素 = CSS 宽 × DPR"会直接翻倍，所以必须单独监听。
+       *
+       * matchMedia 的 resolution 查询只对**当前** DPR 值成立，一变就失效，
+       * 所以每次触发后都要重新注册（这是标准做法）。
+       */
+      useEffect(() => {
+        if (typeof window === "undefined" || typeof window.matchMedia !== "function") {
+          return undefined;
+        }
+        let stopped = false;
+        let query = null;
+        let onChange = null;
+        const watch = () => {
+          if (stopped) return;
+          query = window.matchMedia(`(resolution: ${window.devicePixelRatio}dppx)`);
+          onChange = () => {
+            // 重新计时：新 DPR 下的"缺少多少像素"要重新累计 600ms 才动手，
+            // 避免跨屏瞬间的抖动直接触发重建流。
+            regrantStreakRef.current = newRegrantStreak();
+            watch();
+          };
+          if (typeof query.addEventListener === "function") query.addEventListener("change", onChange);
+          else if (typeof query.addListener === "function") query.addListener(onChange); // 老 Safari
+        };
+        watch();
+        return () => {
+          stopped = true;
+          if (query === null || onChange === null) return;
+          if (typeof query.removeEventListener === "function") query.removeEventListener("change", onChange);
+          else if (typeof query.removeListener === "function") query.removeListener(onChange);
+        };
+      }, []);
 
       // 面板打开期间轮询状态：拿流格式（决定用哪个渲染器）与设备在线情况。
       //
@@ -2129,13 +2486,25 @@ window.__ModuleLoader__.load({
           {toolbar}
           {adbWarning}
           <StreamView
-            key={`${activeId ?? "none"}:${token ?? "none"}`}
+            /*
+             * ⚠️ key 里**只放设备**，不放 token。
+             *
+             * 原来 key 是 `${activeId}:${token}`，而自适应取流会给同一台设备换
+             * 新 token → key 变化 → 组件整个重新挂载 → canvas 被换掉 → 画布上
+             * 留着的上一帧没了，画面黑一下再出图。
+             * 只按设备做 key：换设备仍然干净地重建（必须的），重新申请流则原地
+             * 换源（streamUrl 变化由 useH264Canvas 的 effect 处理），画布和上一帧
+             * 都留着，直到新流的第一帧到达。
+             */
+            key={activeId ?? "none"}
             deviceId={activeId}
             streamToken={token}
             format={format}
             frame={frame}
             // 只给开孔样式用（iOS 灵动岛 / Android 挖孔），不参与布局与坐标
             deviceKind={active?.platform ?? null}
+            // 自适应取流要读"当前流的真实帧宽"，所以这个 ref 由面板持有
+            frameSizeRef={frameSizeRef}
             onError={(message) => setError(message)}
           />
           {status}
@@ -2184,6 +2553,33 @@ window.__ModuleLoader__.load({
        * 回调不执行，插件其余部分照常工作（面板仍能从「开始」页胶囊打开）。
        */
       inject: ["slots", "sidebarRightTabs"],
+
+      /**
+       * 仅供 test-harness 的单测入口，宿主不会用到。
+       *
+       * 为什么要把这几个函数暴露出来：自适应取流的正确性全在"判定数学"里
+       * （阈值 / 持续时间 / 冷却 / 设备宽封顶），而它们是纯函数。在 harness 里
+       * 渲染真实的 React 面板去驱动 600ms + 5000ms 的时间线既慢又脆，直接对
+       * 纯函数喂时间戳才是合适的粒度 —— 而这些函数在闭包里，不暴露就测不到。
+       */
+      __test: {
+        decideRegrant,
+        newRegrantStreak,
+        neededPixelWidth,
+        nextCooldownMs,
+        nextCooldownAfterGrant,
+        /** 判定参数，单测里直接用它们算时间线，避免把数字抄一遍。 */
+        tuning: {
+          upscaleRatio: REGRANT_UPSCALE_RATIO,
+          downscaleRatio: REGRANT_DOWNSCALE_RATIO,
+          upscaleHoldMs: REGRANT_UPSCALE_HOLD_MS,
+          downscaleHoldMs: REGRANT_DOWNSCALE_HOLD_MS,
+          minIntervalMs: REGRANT_MIN_INTERVAL_MS,
+          cooldownMaxMs: REGRANT_COOLDOWN_MAX_MS,
+          tickMs: REGRANT_TICK_MS,
+          deviceWidthFallback: DEVICE_WIDTH_FALLBACK,
+        },
+      },
 
       /**
        * @param {object} ctx 客户端插件上下文
