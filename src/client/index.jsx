@@ -370,13 +370,24 @@ window.__ModuleLoader__.load({
      * 378×832（scale 0.35），被浏览器放大 1.58× —— 文字边缘全是插值糊。
      */
     /**
-     * 帧宽比需要的小 15% 以上才算"该升档"。
+     * 帧宽比需要的**小 1% 以上**就该升档。
      *
-     * 不设成 1.0：不到 15% 的过采样（比如需要 630、实际 600）在 2× 屏上几乎
-     * 看不出差别，却要付出一次 5 秒冷却 + 一次重新建流的代价。1.15 是"肉眼
-     * 能看出糊"的下限附近。
+     * 这里原来是 1.15，理由是"不到 15% 的欠采样肉眼看不出"——**实测是错的**。
+     * 真机现场：面板画布 596 物理像素、流 540 宽，差 10%，落在 1.15 的"死区"里，
+     * 于是永远不重建，浏览器把每一帧放大 1.10× 铺上去 —— 而 1.10× 的双线性放大
+     * 正好够把文字的亚像素边缘抹平（用户的原话是"文字有点糊"）。
+     *
+     * 判据改成"只要帧比画布小就补"，因为**放大本身**就是糊的唯一来源：
+     * 差 1% 时的插值虽然轻微，但它是持续的，而且完全没有收益（少取的那点像素
+     * 换不减任何成本 —— 码率是按 scale 推导的，取大了也只会多几百 kbps）。
+     *
+     * 抖动风险交给下面三道闸门，而不是靠这个阈值：600ms 的持续判定
+     * （REGRANT_UPSCALE_HOLD_MS）+ 5 秒冷却（REGRANT_MIN_INTERVAL_MS）
+     * + Host 侧 3 秒节流。留 1.01 是为了吸收 scale 量化误差（Host 会把
+     * scale 截到 3 位小数、编码器再按宏块对齐，回包宽度可能比请求小 1-2px）
+     * 与亚像素布局抖动，不至于为 1px 反复重建。
      */
-    const REGRANT_UPSCALE_RATIO = 1.15;
+    const REGRANT_UPSCALE_RATIO = 1.01;
     /**
      * 帧宽比需要的大 60% 以上才算"该降档"。
      *
@@ -406,16 +417,15 @@ window.__ModuleLoader__.load({
      * 连续"申请了但没变清晰"之后冷却期的上限。
      *
      * ── 为什么需要这个上限 ──────────────────────────────────────────────
-     * Host 侧 `StreamPool#acquire` 对**已经在跑**的会话是这么处理的：
-     * 参数变了不重启（"重启编码器要黑屏一段，不值"，见 lib/stream/session.js），
-     * 新 scale 只在下一个会话生效。也就是说：拖宽面板时重新 grant 很可能
-     * **拿不到更高分辨率** —— 只能拿回一个新 token，帧还是老的。
+     * 正常情况下不会走到这里：Host 现在支持"按新 scale 重建会话"
+     * （lib/stream/session.js 的 SCALE_RESTART_RATIO + 3 秒节流），重新
+     * grant 一次就能真的换来更高分辨率。
      *
-     * 这种情况下如果还按 5 秒一次重试，等价于每 5 秒把画面掐掉重连一次：
-     * 分辨率一点没变，用户只看到不停闪。所以每次发现"申请完还是不够清晰"
-     * 就把冷却翻倍（5 → 10 → 20 → 40 → 60 秒封顶），把抖动压到一分钟一次
-     * 以内；等 Host 支持按新 scale 重建会话（或会话自然重启）后，
-     * 一次成功就会把冷却重置回 5 秒。
+     * 但仍有两条路会落空：Host 是旧版本（重建前装的应用）、或者重建被
+     * 3 秒节流挡住（连续拖拽）。这时如果还按 5 秒一次重试，等价于每 5 秒
+     * 把画面掐掉重连一次 —— 分辨率一点没变，用户只看到不停闪。所以每次
+     * 发现"申请完还是不够清晰"就把冷却翻倍（5 → 10 → 20 → 40 → 60 秒封顶），
+     * 把抖动压到一分钟一次以内；一次成功就把冷却重置回 5 秒。
      */
     const REGRANT_COOLDOWN_MAX_MS = 60000;
     /** 判定节拍。250ms 足够让 600ms 的 debounce 有 2 次以上采样。 */
@@ -2128,13 +2138,21 @@ window.__ModuleLoader__.load({
 
       /** 申请 token 并选定设备。token 决定设备，所以换设备必须重新申请。 */
       const grant = useCallback(
-        async (deviceId) => {
+        async (deviceId, options) => {
           setBusy(true);
           busyRef.current = true;
           setError(null);
-          // 冷却从**发起**时刻算起：判定节拍读的是这个值，若等响应回来再记，
-          // 一次慢 grant（离线模拟器冷启动可达数分钟）会让冷却形同虚设。
-          lastRegrantAtRef.current = performance.now();
+          /**
+           * 冷却从**发起**时刻算起：判定节拍读的是这个值，若等响应回来再记，
+           * 一次慢 grant（离线模拟器冷启动可达数分钟）会让冷却形同虚设。
+           *
+           * 但只有**自适应节拍发起的重取**才该算冷却起点。首次 grant（面板刚
+           * 打开）、换设备、用户手点重连这三种情况下没有任何"刚刚重建过"的
+           * 抖动风险，记进去就只是白等 REGRANT_MIN_INTERVAL_MS —— 真机现场
+           * 的表现是"打开面板先糊 5 秒，然后才自己变清楚"。置 0 后第一次纠正
+           * 只受 600ms 持续判定约束。
+           */
+          lastRegrantAtRef.current = options?.regrant === true ? performance.now() : 0;
           // 一次新的 grant 意味着"重新开始看"，之前的升/降档计时作废。
           regrantStreakRef.current = newRegrantStreak();
           try {
@@ -2224,10 +2242,28 @@ window.__ModuleLoader__.load({
       useEffect(() => {
         let cancelled = false;
         const start = async () => {
-          // 最多等 30 帧（~0.5s）：面板被折叠/隐藏时永远量不到宽度，
-          // 这时也得把 grant 发出去，否则界面会一直空着。
+          /**
+           * 等宽度**稳定**再发，不只是等它 > 0。
+           *
+           * 真机现场：面板展开动画中途量到 270 CSS（= DPR 2 × 270 = 540），
+           * 首次 grant 就按 540 定下编码分辨率；动画结束后画布其实是 596，
+           * 于是每帧都被放大 1.104× —— 这就是"文字有点糊"的来源。等两帧连续
+           * 相等只多花 ~33ms，却能从根上避免"按动画中途的尺寸取流"。
+           *
+           * 最多等 30 帧（~0.5s）：面板被折叠/隐藏时永远量不到宽度，
+           * 这时也得把 grant 发出去，否则界面会一直空着（后面靠自适应重取纠正）。
+           */
+          let previous = -1;
+          let stable = 0;
           for (let attempt = 0; attempt < 30 && !cancelled; attempt += 1) {
-            if (preferredStreamWidth() > 0) break;
+            const current = preferredStreamWidth();
+            if (current > 0 && current === previous) {
+              stable += 1;
+              if (stable >= 2) break;
+            } else {
+              stable = 0;
+            }
+            previous = current;
             await nextFrame();
           }
           if (!cancelled) void grant();
@@ -2267,7 +2303,7 @@ window.__ModuleLoader__.load({
           }
           regrantStreakRef.current = newRegrantStreak();
           lastRegrantAtRef.current = now;
-          void grant(activeId);
+          void grant(activeId, { regrant: true });
         }, REGRANT_TICK_MS);
         return () => clearInterval(timer);
       }, [activeId, grant]);

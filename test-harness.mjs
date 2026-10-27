@@ -3500,11 +3500,19 @@ await test("帧宽比需要的小 15% 以上、且持续 600ms → 重建流（�
   );
 });
 
-await test("比值 1.1（只差 10%）→ 不动手：肉眼看不出的过采样不值得重建流", () => {
-  // 630 / 573 ≈ 1.099，落在死区里
-  assert.equal(firstRegrantAt({ needPx: 630, framePx: 573, ms: 5000 }), null);
-  // 恰好 1.15 也不算超（用 > 而不是 >=，边界上不动手更省）
-  assert.equal(firstRegrantAt({ needPx: 630, framePx: 548, ms: 5000 }), null);
+await test("帧比画布小 10% 就要重建（1.10× 放大正好把文字边缘抹平）", () => {
+  // 真机现场那组数字：画布 596 物理像素、流 540 宽 → 596/540 ≈ 1.104。
+  // 这里原来断言"差 10% 不动手"，正是它让文字一直糊着（旧阈值 1.15）。
+  const at = firstRegrantAt({ needPx: 596, framePx: 540, ms: 3000 });
+  assert.notEqual(at, null, "差 10% 就是浏览器放大 1.10×，必须补分辨率");
+  assert.notEqual(firstRegrantAt({ needPx: 630, framePx: 573, ms: 5000 }), null);
+});
+
+await test("只差 1% 以内不动手（scale 量化与宏块对齐的回差）", () => {
+  // Host 把 scale 截到 3 位小数、编码器再按宏块对齐，回包宽度常比请求小 1-2px。
+  // 这种量级反复重建只会闪屏，什么也换不来。
+  assert.equal(firstRegrantAt({ needPx: 596, framePx: 594, ms: 10000 }), null);
+  assert.equal(firstRegrantAt({ needPx: 600, framePx: 596, ms: 10000 }), null);
 });
 
 await test("两次重建流之间至少隔 5 秒（grant 会杀进程重启，不能连打）", () => {
@@ -3578,8 +3586,13 @@ await test("Host 不肯重建会话时冷却翻倍，别每 5 秒闪一次屏", 
   // Host 给了想要的宽度（或者更高）→ 回落到基准冷却
   assert.equal(nextCooldownAfterGrant(tuning.cooldownMaxMs, 600, 600), tuning.minIntervalMs);
   assert.equal(nextCooldownAfterGrant(tuning.cooldownMaxMs, 600, 720), tuning.minIntervalMs);
-  // 只差 10%（在 1.15 死区内）不算失败
-  assert.equal(nextCooldownAfterGrant(tuning.cooldownMaxMs, 600, 560), tuning.minIntervalMs);
+  // 回包比请求小 1% 以内 → 算成功（量化/宏块对齐的正常回差，不该退避）
+  assert.equal(nextCooldownAfterGrant(tuning.cooldownMaxMs, 600, 596), tuning.minIntervalMs);
+  // 但回包明显更小（600 只给 560）→ 就是没升上去，必须退避
+  assert.ok(
+    nextCooldownAfterGrant(tuning.cooldownMaxMs, 600, 560) > tuning.minIntervalMs,
+    "欠 7% 仍然是浏览器放大，不能当成成功去重置冷却",
+  );
   // 信息不全（旧 Host 不回 deviceWidth/scale）→ 不猜，按基准走
   assert.equal(nextCooldownAfterGrant(tuning.cooldownMaxMs, 600, 0), tuning.minIntervalMs);
   assert.equal(nextCooldownAfterGrant(tuning.cooldownMaxMs, 0, 378), tuning.minIntervalMs);
@@ -3755,7 +3768,7 @@ await test("acquire 不传 restart 时不会为新的 scale 换会话（现有�
   pool.stopAll();
 });
 
-await test("restart:true 且缩放差异 >15% → 停旧会话、按新 scale 建新会话", () => {
+await test("restart:true 且缩放差异 1.58× → 停旧会话、按新 scale 建新会话", () => {
   const { pool, spawnScales } = restartPool();
   const old = pool.acquire("dev-1", { scale: 0.35 });
   old.addConsumer(() => {});
@@ -3772,11 +3785,26 @@ await test("restart:true 且缩放差异 >15% → 停旧会话、按新 scale �
   pool.stopAll();
 });
 
-await test("restart:true 但缩放差异 <15% → 不重启（不值得一次黑场）", () => {
-  const { pool } = restartPool();
+await test("restart:true 且新 scale 更大 10% → 真的重建（这是文字糊的直接成因）", () => {
+  // 真机现场：会话在 0.5（编码 540 宽），画布却是 596 物理像素 → 放大 1.10×。
+  // 旧阈值 1.15 让这次重建被拒，画面就一直糊着。
+  const { pool, spawnScales } = restartPool();
   const old = pool.acquire("dev-1", { scale: 0.5 });
-  const next = pool.acquire("dev-1", { scale: 0.55, restart: true }); // 1.1×
-  assert.equal(next, old, "10% 的差异肉眼分不出，不该重建");
+  old.addConsumer(() => {});
+  const next = pool.acquire("dev-1", { scale: 0.552, restart: true }); // 1.104×
+  assert.notEqual(next, old, "差 10% 就是浏览器放大 1.10×，必须重建");
+  assert.ok(old.stopped, "旧会话要进终态，否则两路编码同时跑");
+  assert.equal(next.scale, 0.552);
+  next.addConsumer(() => {}); // spawn 是懒的：有消费者才起进程
+  assert.deepEqual(spawnScales, [0.5, 0.552]);
+  pool.stopAll();
+});
+
+await test("restart:true 但缩放差异 <1% → 不重启（量化回差，别为 1px 闪屏）", () => {
+  const { pool } = restartPool();
+  const old = pool.acquire("dev-1", { scale: 0.552 });
+  const next = pool.acquire("dev-1", { scale: 0.554, restart: true }); // 1.004×
+  assert.equal(next, old, "1% 以内的差异是 scale 量化/宏块对齐的正常回差");
   assert.equal(old.stopped, false);
   pool.stopAll();
 });
