@@ -337,6 +337,23 @@ window.__ModuleLoader__.load({
     const CHASSIS_INSET = 6;
 
     /**
+     * 手机画面的**最大** CSS 宽度，取自宿主右侧边栏的**最小宽度**。
+     *
+     * 宿主的 `ui-sidebar-right` 用 `computeColumns()` 把右栏夹在
+     * `clampWidth(rightbar, 300, viewport * 0.7)` 之间 —— 也就是右栏最窄 300 CSS px。
+     * 面板被拖宽时不该把手机一路放大：画布越宽，同一帧被放大得越多（看起来更糊），
+     * 观感也会变成"面板里的巨屏手机"。所以画布到 300 就停住，剩下的空间由
+     * .mbm-stage 的 justify-content / align-items 居中吃掉。
+     *
+     * 取的是**画布**（手机屏幕）的宽度，不含机身那 12px —— 用户说的是"页面最大宽度"，
+     * 页面 = 屏幕上显示的内容。侧边栏拖到 312 以上才真的开始封顶，所以当前
+     * 315 宽的面板观感不变，只有把它拖得更宽时手机才不再跟着长。
+     *
+     * ⚠️ 300 是宿主侧的数字（ui-sidebar-right 的 computeColumns），宿主改了要同步这里。
+     */
+    const MAX_MEDIA_CSS_WIDTH = 300;
+
+    /**
      * 一条空的布局缓存。
      *
      * availWidth/availHeight 用 NaN 而不是 0 表示"还没量过"：0 是"量过，
@@ -439,8 +456,15 @@ window.__ModuleLoader__.load({
       // device 档机身两侧各占 CHASSIS_INSET，可用空间先扣掉，否则机身会跟内容盒
       // 一样宽、侧键被 .mbm-stage 的 overflow:hidden 切掉。模式直接读 DOM 上的
       // data-frame（React 提交时就写好了），不依赖任何模块级状态或 effect 时序。
-      const chassisInset = stage.getAttribute("data-frame") === "device" ? CHASSIS_INSET * 2 : 0;
-      const availWidth = Math.max(0, layout.availWidth - chassisInset);
+      const frameMode = stage.getAttribute("data-frame");
+      const chassisInset = frameMode === "device" ? CHASSIS_INSET * 2 : 0;
+      // 宽度再夹一道上限（见 MAX_MEDIA_CSS_WIDTH）：面板被拖宽时手机停止放大，
+      // 多出来的空间由 .mbm-stage 的居中排布吃掉。高度不用单独夹 —— contain
+      // 之后高度由宽度决定，宽度封顶高度自然跟着封顶。
+      const availWidth = Math.max(0, Math.min(
+        layout.availWidth - chassisInset,
+        MAX_MEDIA_CSS_WIDTH,
+      ));
       const availHeight = Math.max(0, layout.availHeight - chassisInset);
       if (availWidth <= 0 || availHeight <= 0) return null; // 还没布局出来（或面板收起），等下一帧
 
@@ -1828,7 +1852,12 @@ window.__ModuleLoader__.load({
         // 这两档少报 12px，Host 算出偏小的 scale，画布就把 562 宽的帧拉成 586 显示（发糊）。
         const staged = stage.getAttribute("data-frame") === "device" ? CHASSIS_INSET * 2 : 0;
         const dpr = Math.min(window.devicePixelRatio || 1, 2);
-        const availWidth = measureStage(stage).availWidth - staged;
+        // 与 fitCanvasToFrame 用同一个封顶值：上报的像素宽必须是画布**真的**会占的
+        // 宽度，否则 Host 按偏大的值算 scale，多送的像素照样被降采样丢掉。
+        const availWidth = Math.min(
+          measureStage(stage).availWidth - staged,
+          MAX_MEDIA_CSS_WIDTH,
+        );
         if (!(availWidth > 0)) return 0;
         return Math.max(1, Math.round(availWidth * dpr));
       };

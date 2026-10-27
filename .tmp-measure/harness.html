@@ -72,7 +72,8 @@ function measure(host, variant) {
   const availW0 = stage.clientWidth - (parseFloat(cs.paddingLeft) || 0) - (parseFloat(cs.paddingRight) || 0);
   const availH0 = stage.clientHeight - (parseFloat(cs.paddingTop) || 0) - (parseFloat(cs.paddingBottom) || 0);
   const inset = VARIANTS[variant].inset * 2;
-  const aw = availW0 - inset, ah = availH0 - inset;
+  const MAX_MEDIA_CSS_WIDTH = 300; // 与 src/client/index.jsx 一致（宿主右栏最小宽度）
+  const aw = Math.min(availW0 - inset, MAX_MEDIA_CSS_WIDTH), ah = availH0 - inset;
   const s = Math.min(aw / FRAME[0], ah / FRAME[1]);
   const cssW = Math.max(1, Math.round(FRAME[0] * s));
   const cssH = Math.max(1, Math.round(FRAME[1] * s));
