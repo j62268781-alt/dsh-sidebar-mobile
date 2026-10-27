@@ -833,6 +833,16 @@ window.__ModuleLoader__.load({
          * 说明流是健康的 → 重连退避复位（见 runWithReconnect）。
          */
         let bytesReceived = 0;
+        /**
+         * 本轮 run() 是不是被**服务端主动结束**的（读到 `done === true`）。
+         *
+         * Host 在「按新缩放重建流」时会主动 `res.end()` 掉旧响应（见
+         * lib/stream/routes.js 的 pipeStreamToResponse）。这种结束与"设备掉线 /
+         * 网络中断"不同：新会话**已经建好**，客户端这条重连马上就能拿到新流，
+         * 没必要按退避白等 1 秒 —— 不然每次拖宽面板都要多冻 1 秒。
+         * 所以这种结束走 150ms 的快速重连，既不退避也不改变退避状态。
+         */
+        let endedCleanly = false;
         let carry = new Uint8Array(0);
         let timestamp = 0;
         let configured = false;
@@ -1012,6 +1022,7 @@ window.__ModuleLoader__.load({
 
         const run = async () => {
           report("connecting");
+          endedCleanly = false;
           let response;
           try {
             response = await fetch(streamUrl, { cache: "no-store" });
@@ -1063,6 +1074,10 @@ window.__ModuleLoader__.load({
           try {
             for (;;) {
               const { done, value } = await reader.read();
+              if (done && !cancelled) {
+                // 服务端主动收尾（重建流 / 卸载）→ 记下来，重连走快速路径
+                endedCleanly = true;
+              }
               if (cancelled || done) break;
               lastByteAt = performance.now();
               bytesReceived += value?.byteLength ?? 0;
@@ -1185,6 +1200,14 @@ window.__ModuleLoader__.load({
          */
         const RECONNECT_BASE_MS = 1000;
         const RECONNECT_MAX_MS = 8000;
+        /**
+         * 服务端主动收尾（按新缩放重建流）时的重连延迟。
+         *
+         * 新会话此刻已经建好，1 秒的退避纯属白等 —— 每次拖宽面板都会多冻 1 秒。
+         * 但不能直接 0：万一服务端每次都立刻 end（异常循环），0 延迟会变成
+         * 满速打转。150ms 既快又留了喘息。
+         */
+        const RECONNECT_FAST_MS = 150;
         let reconnectDelay = RECONNECT_BASE_MS;
 
         const runWithReconnect = async () => {
@@ -1194,12 +1217,18 @@ window.__ModuleLoader__.load({
             if (cancelled) return;
 
             // 这一轮收到过数据 → 视为健康，退避重置（抖动后能快速恢复）
-            if (bytesReceived > before) reconnectDelay = RECONNECT_BASE_MS;
+            const healthy = bytesReceived > before;
+            if (healthy) reconnectDelay = RECONNECT_BASE_MS;
+
+            // 健康且是被服务端主动结束的（重建流）→ 快速重连，不动退避状态
+            const waitMs = healthy && endedCleanly ? RECONNECT_FAST_MS : reconnectDelay;
 
             report("connecting", "画面中断，正在重连…");
-            await new Promise((resolve) => setTimeout(resolve, reconnectDelay));
+            await new Promise((resolve) => setTimeout(resolve, waitMs));
             if (cancelled) return;
-            reconnectDelay = Math.min(reconnectDelay * 2, RECONNECT_MAX_MS);
+            if (waitMs !== RECONNECT_FAST_MS) {
+              reconnectDelay = Math.min(reconnectDelay * 2, RECONNECT_MAX_MS);
+            }
           }
         };
 
