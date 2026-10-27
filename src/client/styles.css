@@ -26,7 +26,19 @@
   justify-content: center; overflow: hidden; border-radius: 10px;
   background: var(--dsw-alias-bg-layer-2, #f4f5f7);
   border: 1px solid var(--dsw-alias-border-l2, #e4e7ec); }
-.mbm-stage[data-frame="device"] { padding: 10px; background: #101114; }
+/* device 档要让机身尽量吃满面板。根容器的 8px 内边距用负外边距抵掉：
+   16px 宽度在 1080:2376 的竖长比下会连锁换算成约 35px 的高度损失。
+   实测 315×700 面板：不抵边距时机身只占面板高 89.6%（上下各空 34px），
+   抵掉后 99.4%（上下各空 2px），宽度占比 92.6% → 98.4%。
+   只留 2px padding 接住侧键伸出的那 2px，否则会被 overflow:hidden 裁掉。 */
+.mbm-stage[data-frame="device"] {
+  margin: 0 -8px -8px; padding: 2px; border: none; border-radius: 0;
+  /* stage 是"取景框"底色，恒为深色（与主题无关）：亮画面在上面才有对比。
+     但不能是死黑——旧值 #101114 与机身最暗处几乎同色，整台手机糊进背景，
+     用户看到的就是"一片黑"。改成石墨蓝径向渐变，上半部亮一档，
+     机身才有"浮在取景框里"的层次。 */
+  background: radial-gradient(125% 85% at 50% 4%, #2d323b 0%, #1e222a 50%, #171a20 100%);
+}
 .mbm-stage[data-frame="frameless"] { border: none; background: transparent; }
 /* 媒体元素：CSS 尺寸由 JS 按帧的真实宽高比算好写进 style（见 fitCanvasToFrame）。
    这里只加 flex:none —— 否则 flex 容器会把它拉伸/压缩，宽高比又丢了。
@@ -64,10 +76,12 @@
   position: relative; display: inline-flex; flex: none; padding: 5px;
   border: 1px solid rgba(255, 255, 255, .2);
   border-radius: calc(var(--mbm-device-radius, 14px) + 6px);
-  /* 机身必须明显比 stage(#101114) 亮，否则"手机"和背景糊成一片：
-     实测旧渐变的中段只有 rgb(30,32,37)，与背景差 14，屏幕上根本看不出来。
-     现在的钛灰从 #6b7078 走到 #1b1d21，中段 ≈ rgb(74,78,86)，差 58。 */
-  background: linear-gradient(155deg, #6b7078 0%, #4a4e56 22%, #2b2e34 65%, #1b1d21 100%);
+  /* 机身必须明显比 stage 亮，否则"手机"和背景糊成一片（用户反馈"底色是黑的"）：
+     旧渐变从 #6b7078 走到 #1b1d21，下半段与背景几乎同色，等于只有一半边框看得见。
+     现在整体抬到钛银区间（最暗处 #4a5058 仍比 stage 亮 ~1.8 倍），
+     155° 让左上受光、右下背光，保留金属纵深感。 */
+  background: linear-gradient(155deg, #d3d8df 0%, #aeb3bc 9%, #8b909a 28%, #6d737d 52%,
+    #575d66 76%, #4a5058 100%);
   box-shadow: 0 16px 34px rgba(0, 0, 0, .65), 0 2px 6px rgba(0, 0, 0, .5);
 }
 /* 还没画出第一帧时机身只剩 5px 内边距（12×12 的小方块），会在深色 stage 上
@@ -79,13 +93,13 @@
 .mbm-sideKey, .mbm-island, .mbm-punch { display: none; }
 
 /* 侧键：3px 宽的实体键骑在机身边沿上（1px 在机身内、2px 伸到外沿之外）。
-   纵向用 % 吃机身高度，窄屏/高屏都不会错位。stage 的 device 档有 10px
+   纵向用 % 吃机身高度，窄屏/高屏都不会错位。device 档的 stage 只留 2px
    padding，正好接住伸出去的这 2px，不会被 stage 的 overflow:hidden 裁掉。 */
 .mbm-stage[data-frame="device"] .mbm-sideKey {
   display: block; position: absolute; width: 3px; border-radius: 2px;
   pointer-events: none;
-  background: linear-gradient(180deg, #565a64 0%, #34373e 55%, #22252a 100%);
-  box-shadow: 0 0 3px rgba(0, 0, 0, .65);
+  background: linear-gradient(180deg, #6a7079 0%, #474d56 55%, #33373e 100%);
+  box-shadow: 0 0 3px rgba(0, 0, 0, .55);
 }
 .mbm-stage[data-frame="device"] .mbm-sideKey[data-side="power"] {
   right: -2px; top: 22%; height: 7.5%; }

@@ -1,0 +1,110 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<title>chassis measure</title>
+<link rel="stylesheet" href="../src/client/styles.css">
+<style>
+  body { margin: 0; background: #202225; color: #eee; font: 12px/1.5 -apple-system, sans-serif; }
+  #out { white-space: pre; font-family: ui-monospace, monospace; padding: 8px; }
+  /* 每个变体一个离屏容器，尺寸 = 模拟的侧边栏面板 */
+  .probe { position: absolute; left: -4000px; top: 0; }
+  /* 变体 B：边框收到 0，内边距 2，机身 3+1 */
+  .vB .mbm-stage[data-frame="device"] { padding: 2px; border: none; }
+  .vB .mbm-stage[data-frame="device"] .mbm-chassis { padding: 3px; }
+  /* 变体 C：内边距 0，机身 3+1 */
+  .vC .mbm-stage[data-frame="device"] { padding: 0; border: none; }
+  .vC .mbm-stage[data-frame="device"] .mbm-chassis { padding: 3px; }
+  /* 变体 D：内边距 2，机身 2+1 */
+  .vD .mbm-stage[data-frame="device"] { padding: 2px; border: none; }
+  .vD .mbm-stage[data-frame="device"] .mbm-chassis { padding: 2px; }
+
+  /* 变体 E：stage 用负 margin 吃掉 root padding，机身 4 */
+  .vE .mbm-stage[data-frame="device"] { margin: 0 -8px -8px; padding: 2px; border: none; }
+  .vE .mbm-stage[data-frame="device"] .mbm-chassis { padding: 3px; }
+  /* 变体 F：E 的基础上再收成 padding 0 */
+  .vF .mbm-stage[data-frame="device"] { margin: 0 -8px -8px; padding: 0; border: none; }
+  .vF .mbm-stage[data-frame="device"] .mbm-chassis { padding: 3px; }
+  /* 变体 G：E 但机身保持 6（看厚度代价） */
+  .vG .mbm-stage[data-frame="device"] { margin: 0 -8px -8px; padding: 2px; border: none; }
+</style>
+</head><body>
+<div id="out">measuring…</div>
+<script>
+const VARIANTS = {
+  A: { inset: 6, label: "现状 padding10+border1+机身6" },
+  B: { inset: 4, label: "padding2+机身4" },
+  C: { inset: 4, label: "padding0+机身4" },
+  D: { inset: 3, label: "padding2+机身3" },
+  E: { inset: 4, label: "负margin+padding2+机身4" },
+  F: { inset: 4, label: "负margin+padding0+机身4" },
+  G: { inset: 6, label: "负margin+padding2+机身6" },
+};
+const PANELS = [[300, 640], [315, 700], [315, 760], [360, 700], [420, 700], [315, 900]];
+const FRAME = [1080, 2376];
+const rows = [];
+
+function build(panelW, panelH, variant) {
+  const host = document.createElement("div");
+  host.className = "probe v" + variant;
+  host.style.width = panelW + "px";
+  host.style.height = panelH + "px";
+  host.innerHTML = `
+    <div class="mbm-root">
+      <div class="mbm-bar"><div style="height:28px;flex:1"></div></div>
+      <div class="mbm-stage" data-frame="device">
+        <div class="mbm-chassis" data-device-kind="android" data-media="on">
+          <canvas class="mbm-media" width="1080" height="2376"></canvas>
+          <i class="mbm-sideKey" data-side="power"></i>
+          <i class="mbm-sideKey" data-side="volumeUp"></i>
+          <i class="mbm-sideKey" data-side="volumeDown"></i>
+          <i class="mbm-island"></i><i class="mbm-punch"></i>
+        </div>
+      </div>
+    </div>`;
+  document.body.appendChild(host);
+  return host;
+}
+
+function measure(host, variant) {
+  const stage = host.querySelector(".mbm-stage");
+  const chassis = host.querySelector(".mbm-chassis");
+  const canvas = host.querySelector("canvas");
+  const cs = getComputedStyle(stage);
+  const availW0 = stage.clientWidth - (parseFloat(cs.paddingLeft) || 0) - (parseFloat(cs.paddingRight) || 0);
+  const availH0 = stage.clientHeight - (parseFloat(cs.paddingTop) || 0) - (parseFloat(cs.paddingBottom) || 0);
+  const inset = VARIANTS[variant].inset * 2;
+  const aw = availW0 - inset, ah = availH0 - inset;
+  const s = Math.min(aw / FRAME[0], ah / FRAME[1]);
+  const cssW = Math.max(1, Math.round(FRAME[0] * s));
+  const cssH = Math.max(1, Math.round(FRAME[1] * s));
+  canvas.style.width = cssW + "px";
+  canvas.style.height = cssH + "px";
+  // 同一轮里重新读一次（布局已稳定）
+  const sr = stage.getBoundingClientRect();
+  const cr = chassis.getBoundingClientRect();
+  const keyOut = host.querySelector('.mbm-sideKey[data-side="power"]').getBoundingClientRect();
+  return {
+    stageInnerW: Math.round(sr.width), stageInnerH: Math.round(sr.height),
+    canvas: cssW + "×" + cssH,
+    chassis: Math.round(cr.width) + "×" + Math.round(cr.height),
+    fillW: +(cr.width / sr.width).toFixed(3),
+    fillH: +(cr.height / sr.height).toFixed(3),
+    vSlack: Math.round(sr.height - cr.height),
+    keyOverflowRight: Math.round(keyOut.right - sr.right),
+    keyOverflowLeft: Math.round(sr.left - host.querySelector('.mbm-sideKey[data-side="volumeUp"]').getBoundingClientRect().left),
+  };
+}
+
+for (const [w, h] of PANELS) {
+  for (const v of Object.keys(VARIANTS)) {
+    const host = build(w, h, v);
+    const m = measure(host, v);
+    rows.push(`面板 ${w}×${h}  变体${v}(${VARIANTS[v].label})  ` +
+      `stage内 ${m.stageInnerW}×${m.stageInnerH}  画布 ${m.canvas}  机身 ${m.chassis}  ` +
+      `填充 W=${m.fillW} H=${m.fillH}  上下空余 ${m.vSlack}px  侧键越界 R=${m.keyOverflowRight} L=${m.keyOverflowLeft}`);
+    host.remove();
+  }
+}
+document.getElementById("out").textContent = rows.join("\n");
+document.title = "done";
+</script>
+</body></html>

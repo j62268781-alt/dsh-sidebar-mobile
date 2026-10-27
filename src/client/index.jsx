@@ -498,7 +498,7 @@ window.__ModuleLoader__.load({
      * - 面板从收起 → 展开、tab 切走再切回（keepMounted 下是 display:none，
      *   尺寸直接变 0）；
      * - 侧边栏被拖宽 / 窗口缩放；
-     * - frame 模式切换 —— `.mbm-stage[data-frame="device"]` 多 10px padding、
+     * - frame 模式切换 —— `.mbm-stage[data-frame="device"]` 只留 2px padding、
      *   frameless 少一圈边框，content box 跟着变。
      *
      * 观察的是 content box；`.mbm-stage` 是 overflow:hidden 且没有滚动条，
