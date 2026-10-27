@@ -54,13 +54,75 @@ export const inject = ["tools"];
 const DEFAULT_ROUTE_PREFIX = "/_dsh/dsh-sidebar-mobile";
 
 /**
- * AVC 默认码率（bps）。
+ * 码率上限（bps）。mobilecli 允许的范围是 100000–10000000，这里取到顶。
  *
- * mobilecli 的 `--bitrate` 默认值很低，实测 1080×2400 静止仅 0.98 Mbps。
- * 8 Mbps 是 1080p 实时画面的常见取值，远低于 USB 实际吞吐。
- * mobilecli 允许的范围是 100000–10000000。
+ * mobilecli 的 `--bitrate` 默认值很低（实测 1080×2400 静止仅 0.98 Mbps），
+ * 所以必须显式给。给多少？实测（一加12 / 1080×2376 / 连续横滑 6 秒）：
+ *
+ *     8 Mbps  → 实测 7.10 Mbps（= 上限的 89%，基本打满）
+ *     10 Mbps → 实测 8.72 Mbps（比特数比 8 Mbps 多 23%，帧更大、细节更多）
+ *
+ * 也就是**原来那个 8 Mbps 对 1080p 是不够用的**：运动时编码器一直贴着上限跑，
+ * 只能靠糊掉细节来满足约束。USB/adb 侧远未饱和（普通 USB2 实测也能跑 20+
+ * Mbps），所以这里直接取 mobilecli 允许的最大值。
+ *
+ * ⚠️ 该上限是**软**的：设 4 Mbps 实测也能跑到 6.79 Mbps（内容复杂时编码器
+ * 会超过设定值），所以不要拿它当硬限流用。
  */
-const DEFAULT_BITRATE_BPS = 8_000_000;
+const MAX_BITRATE_BPS = 10_000_000;
+
+/**
+ * 取流分辨率缩放下限。
+ *
+ * 面板是侧边栏，宽度通常 300–400 CSS px，物理像素（DPR 2）也就 700 上下。
+ * 再往下缩虽然更省，但 1080 宽的手机缩到 0.35（378 px）后文字笔画会糊，
+ * 反而伤清晰度。0.35 是"再小就没意义"的下限，不是推荐值。
+ */
+const MIN_STREAM_SCALE = 0.35;
+
+/**
+ * 缩放到这个值以上就当作不缩放。
+ *
+ * 0.97 与 1.0 的像素差（1080 → 1048）肉眼看不出，但会让 `--scale` 参数
+ * 一直存在、让"取的流尺寸 == 设备尺寸"这个前提失效（坐标换算、诊断都变复杂）。
+ */
+const SCALE_SNAP_THRESHOLD = 0.97;
+
+/**
+ * 计算某个 scale 下该给多少码率。
+ *
+ * 分辨率降下来之后码率不该还是 1080p 的数：像素少了 2.25 倍，同样码率意味着
+ * 每像素比特多 2.25 倍，超出编码器收益区间；而帧变小、缓冲更浅，端到端延迟
+ * 反而更低（背压阈值是**字节**数，10 Mbps 的流只需要 200ms 就能填满 256KB）。
+ *
+ * 但也不按 scale² 一路缩到底：缩放后浏览器不再做降采样（画布 1:1 映射到
+ * 物理像素），同样的每像素比特在这里的视觉收益比"1080p 缩到 700px"更高，
+ * 所以留 0.5 的下限，即最少给到 5 Mbps。
+ *
+ * @param {number} scale
+ * @returns {number} bps
+ */
+function bitrateForScale(scale) {
+  const factor = Math.max(scale * scale, 0.5);
+  const raw = Math.round(MAX_BITRATE_BPS * factor);
+  // 取整到 0.5 Mbps，日志里好读，也避免每次 scale 微调都换一个怪数字
+  return Math.round(raw / 500_000) * 500_000;
+}
+
+/**
+ * 把外部传入的 scale 规整成可用值。
+ *
+ * 非法/缺失一律返回 null 交给调用方回落默认，避免用一个 NaN 去算码率和坐标。
+ *
+ * @param {unknown} value
+ * @returns {number|null}
+ */
+function normalizeScale(value) {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return null;
+  const clamped = Math.min(1, Math.max(MIN_STREAM_SCALE, value));
+  if (clamped >= SCALE_SNAP_THRESHOLD) return 1;
+  return Number(clamped.toFixed(3));
+}
 
 /**
  * 默认帧率上限。
@@ -221,7 +283,7 @@ export function apply(ctx, config = {}) {
     idleStopMs,
     restartDelayMs,
     log,
-    spawnFor: (deviceId) => {
+    spawnFor: (deviceId, options) => {
       ensureBinary();
       // 格式交给 mobilecli 决定：Android 上 AVC 更快，iOS 模拟器上它会给
       // MJPEG（实测 --format avc 会被静默降级）。Host 侧从字节嗅探真实格式，
@@ -229,17 +291,34 @@ export function apply(ctx, config = {}) {
       const args = ["screencapture", "--device", deviceId, "--format", "avc"];
 
       /**
-       * ⚠️ 码率必须显式指定。
+       * 分辨率：默认不缩（= 设备原始分辨率），但**客户端可以要求缩到面板大小**。
        *
-       * mobilecli 不传 `--bitrate` 时的默认值很低：实测 1080×2400 的
-       * Xiaomi 15 Pro，静止 0.98 Mbps、滑动 2.15 Mbps。而同一台设备传
-       * `--bitrate 8000000` 后滑动能到 4.88 Mbps —— 这就是"画面糊"的主因
-       * （大范围运动时码率不够，编码器只能糊掉细节）。
+       * 面板画布的后备存储只有"显示尺寸 × DPR"（客户端实测 315 CSS × DPR2 =
+       * 630×1400），而设备是 1080×2376 —— 直接取原始分辨率等于**过采样 2.9 倍**：
+       * 解码量（≈101fps × 2.57 Mpx）、USB 带宽、帧大小全按 2.9 倍在跑，
+       * 而多出来的像素在 630 宽的画布上根本显示不出来，最后被浏览器降采样丢掉。
        *
-       * 1080p 级别的实时画面给 8 Mbps 是常见取值，也远低于 USB/adb 的
-       * 实际吞吐（实测 adb 上跑 5 Mbps 毫无压力）。
+       * 按面板宽度取流（630/1080 → 0.583）之后三件事同时变好：
+       *   ① 解码量降到 1/2.9 → 主线程压力大降（"流畅"）
+       *   ② 同样码率下每像素比特 ×2.9，且不再经过浏览器降采样 → 更锐（"清晰"）
+       *   ③ 帧更小 → 背压缓冲更浅 → 端到端延迟更低（"响应"）
+       *
+       * 实测（解 SPS 确认）`--scale` 真的会改编码分辨率：
+       * 1.0→1080×2376、0.75→810×1782、0.667→720×1584、0.5→540×1188。
+       *
+       * 显式配了 `stream.defaultScale` 时以配置为准（固定画质排查用）。
        */
-      const bitrate = toPositiveInt(streamConfig.bitrate, DEFAULT_BITRATE_BPS);
+      const scale =
+        normalizeScale(options?.scale) ??
+        normalizeScale(streamConfig.defaultScale) ??
+        1;
+      if (scale !== 1) args.push("--scale", String(scale));
+
+      /**
+       * 码率：配置优先，否则按 scale 推导（取舍见 bitrateForScale 的注释）。
+       */
+      const configuredBitrate = toPositiveInt(streamConfig.bitrate, 0);
+      const bitrate = configuredBitrate > 0 ? configuredBitrate : bitrateForScale(scale);
       args.push("--bitrate", String(bitrate));
 
       /**
@@ -252,8 +331,8 @@ export function apply(ctx, config = {}) {
        *     --fps 15     → 100.7 fps
        *
        * 传什么都是 ~120fps，所以**限流不能指望这个参数**。真正起作用的是
-       * 客户端渲染侧：每帧都解码（保住 H.264 参考链，不花屏），但只按
-       * 30fps 绘制（见 client.js 的 TARGET_RENDER_FPS）。
+       * 客户端渲染侧：每帧都解码（保住 H.264 参考链，不花屏），但只在 rAF 里
+       * 按 60fps 绘制最新帧（见 client.js 的 TARGET_RENDER_FPS）。
        *
        * 这里仍然传上去有两个理由：① 上游哪天修好了就自动生效；
        * ② 它出现在命令行里，排查时一眼能看到我们期望的帧率。
@@ -261,11 +340,10 @@ export function apply(ctx, config = {}) {
       const fps = toPositiveInt(streamConfig.maxFps, DEFAULT_MAX_FPS);
       args.push("--fps", String(fps));
 
-      const scale = streamConfig.defaultScale;
-      if (typeof scale === "number" && scale > 0 && scale !== 1) {
-        args.push("--scale", String(scale));
-      }
-      log("info", `启动流：${deviceId}（${bitrate / 1e6}Mbps / ${fps}fps）`);
+      log(
+        "info",
+        `启动流：${deviceId}（${bitrate / 1e6}Mbps / ${fps}fps${scale !== 1 ? ` / scale=${scale}` : ""}）`,
+      );
       return client.spawnStream(args);
     },
   });
@@ -306,6 +384,139 @@ export function apply(ctx, config = {}) {
     return guardedClient.runJson(["io", "tap", "--device", deviceId, `${x},${y}`]);
   };
 
+  /**
+   * 设备屏幕尺寸缓存：deviceId → {width, height, at}。
+   *
+   * 只拿来算 scale（面板像素宽 / 设备宽），不需要实时性。60 秒足够，
+   * 又能在换设备、改分辨率之后自己纠正。
+   */
+  const screenSizeCache = new Map();
+  const SCREEN_SIZE_TTL_MS = 60_000;
+
+  /**
+   * 查屏幕尺寸的总时限。
+   *
+   * 这一步在 `/grant` 的**关键路径**上（`--scale` 必须在编码器启动前定下来），
+   * 而 `rpc.call` 的默认超时是 15s —— 万一 daemon 半死不活，用户点"连接"就要
+   * 干等 15 秒。`device.info` 正常只要 ~92ms，给 2.5s 已经很宽松；超时就放弃
+   * 这次优化、按原始分辨率取流（= 今天的行为）。宁可画面大一点，也不要卡。
+   */
+  const SCREEN_SIZE_TIMEOUT_MS = 2_500;
+
+  /** 给 promise 套一个超时：超时返回 fallback（原 promise 的错误照样不吞）。 */
+  async function withTimeout(promise, timeoutMs, fallback) {
+    let timer = null;
+    const timeout = new Promise((resolve) => {
+      timer = setTimeout(() => resolve(fallback), timeoutMs);
+      timer.unref?.();
+    });
+    try {
+      return await Promise.race([promise, timeout]);
+    } finally {
+      if (timer !== null) clearTimeout(timer);
+    }
+  }
+
+  /**
+   * 取设备屏幕尺寸（逻辑像素）。
+   *
+   * 优先 daemon RPC 的 `device.info`（实测 91.9ms，响应里直接带 screenSize），
+   * 退到 CLI `device info`（多一次进程启动 ~166ms）。都失败或超时就返回 null，
+   * 让调用方退回"不缩放"——查不到尺寸不该挡住取流。
+   *
+   * @param {string} deviceId
+   * @returns {Promise<{width: number, height: number}|null>}
+   */
+  async function queryScreenSize(deviceId) {
+    const cached = screenSizeCache.get(deviceId);
+    if (cached !== undefined && Date.now() - cached.at < SCREEN_SIZE_TTL_MS) {
+      return { width: cached.width, height: cached.height };
+    }
+
+    const lookup = async () => {
+      if (rpc !== null) {
+        try {
+          const result = await rpc.call("device.info", { deviceId });
+          const screen = result?.device?.screenSize;
+          if (Number.isFinite(screen?.width) && Number.isFinite(screen?.height)) {
+            return { width: screen.width, height: screen.height };
+          }
+        } catch {
+          // 通道不可用或超时：下面退 CLI
+        }
+      }
+      try {
+        const info = await guardedClient.runJson(["device", "info", "--device", deviceId]);
+        const screen = info?.device?.screenSize ?? info?.screenSize;
+        if (Number.isFinite(screen?.width) && Number.isFinite(screen?.height)) {
+          return { width: screen.width, height: screen.height };
+        }
+      } catch {
+        // 查不到就算了
+      }
+      return null;
+    };
+
+    const size = await withTimeout(lookup(), SCREEN_SIZE_TIMEOUT_MS, null);
+    if (size === null) return null;
+    screenSizeCache.set(deviceId, { ...size, at: Date.now() });
+    return size;
+  }
+
+  /**
+   * 决定这台设备该用什么分辨率/码率取流。
+   *
+   * `preferredWidth` 是客户端上报的**画布物理像素宽度**（CSS 宽 × DPR）。
+   * 按它反推 scale，让编码分辨率正好落在面板能显示的像素数上：再高就是白
+   * 解码（见 spawnFor 里的 2.9 倍过采样说明），再低就开始糊。
+   *
+   * 三条回落路径都收敛到"不缩放"（= 今天的行为），保证这个优化不会因为
+   * 查不到设备尺寸、客户端没上报、用户配了固定 scale 而让画面变得更差。
+   *
+   * @param {string} deviceId
+   * @param {unknown} preferredWidth 客户端上报的画布物理像素宽度
+   * @returns {Promise<{scale: number, bitrate: number, deviceWidth: number|null, deviceHeight: number|null, preferredWidth: number|null}>}
+   */
+  async function resolveStreamPlan(deviceId, preferredWidth) {
+    const wanted =
+      typeof preferredWidth === "number" && Number.isFinite(preferredWidth) && preferredWidth > 0
+        ? Math.round(preferredWidth)
+        : null;
+
+    const configured = normalizeScale(streamConfig.defaultScale);
+    if (wanted === null || configured !== null) {
+      const scale = configured ?? 1;
+      return {
+        scale,
+        bitrate: bitrateForScale(scale),
+        deviceWidth: null,
+        deviceHeight: null,
+        preferredWidth: wanted,
+      };
+    }
+
+    const screen = await queryScreenSize(deviceId);
+    if (screen === null || screen.width <= 0) {
+      return {
+        scale: 1,
+        bitrate: bitrateForScale(1),
+        deviceWidth: null,
+        deviceHeight: null,
+        preferredWidth: wanted,
+      };
+    }
+
+    const scale = normalizeScale(wanted / screen.width) ?? 1;
+    return {
+      scale,
+      bitrate: bitrateForScale(scale),
+      // 交给 routes 夹取坐标用：帧像素 ÷ scale 之后不能越出屏幕
+      deviceWidth: screen.width,
+      deviceHeight: screen.height,
+      preferredWidth: wanted,
+    };
+  }
+
   const routes = new StreamRoutes({
     client: guardedClient,
     pool,
@@ -314,6 +525,7 @@ export function apply(ctx, config = {}) {
     adbProbe,
     log,
     rpc,
+    resolveStreamPlan,
   });
 
   // webServer 是可选服务：headless profile 没有它，此时面板不可用但工具照常。

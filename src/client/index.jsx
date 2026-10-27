@@ -248,8 +248,29 @@ window.__ModuleLoader__.load({
      *
      * 解码本身是硬件加速的、很便宜；贵的是主线程上的 drawImage。
      * 丢掉多余的绘制既能保住码流完整，又直接把主线程负担降下来。
+     *
+     * ── 为什么是 60 而不是 30 ──────────────────────────────────────────
+     *
+     * 30fps 的代价是每次操作多等**平均半个周期 = 17ms**（docs/ARCHITECTURE.md
+     * 的延迟表里就有这一行），纯白给。而 60fps 并不贵：实测 M3 Pro / Chrome
+     * （ANGLE Metal）上 630×1400 后备存储的一次 drawImage，把 GPU 侧同步等完
+     * 也只要 p50 2.2ms / p95 3.6ms，60fps 约占 13% 的帧预算 —— 并没有
+     * "把主线程占满"。源流本身是 105–120fps，60fps 正好隔帧画，节奏均匀。
+     *
+     * 跑不动的机器不用这里操心：绘制挂在 rAF 上，主线程一忙 rAF 回调自己就
+     * 变稀，帧率自然掉下来（这就是浏览器自带的背压）。
      */
-    const TARGET_RENDER_FPS = 30;
+    const TARGET_RENDER_FPS = 60;
+
+    /**
+     * vsync 对齐余量（ms）。
+     *
+     * rAF 回调时刻与"理论间隔"总有抖动。把节奏阈值正好卡在 1000/60 上，
+     * 本该命中的那一帧会因差 0.2ms 被丢掉，节奏塌成"隔两帧画一次"（40fps 感）。
+     * 留 4ms 余量后：60Hz 屏每个 vsync 都命中，120Hz 屏每两个命中一次，
+     * 144Hz 屏每两个命中（≈72fps）—— 都是偶数间隔，不会一快一慢。
+     */
+    const VSYNC_SLACK_MS = 4;
 
     /**
      * 把若干 NAL 拼成一个缓冲区，用于"关键帧自带参数集"。
@@ -270,6 +291,78 @@ window.__ModuleLoader__.load({
         offset += part.length;
       }
       return out;
+    }
+
+    /**
+     * 每块 canvas 的容器尺寸缓存。
+     *
+     * 为什么要有它：fitCanvasToFrame 原先**每帧**都 getComputedStyle + clientWidth。
+     * 那不是普通的读属性，是**强制同步布局** —— 浏览器得当场把 React 刚写脏的
+     * 样式树排完才能给出数字，主线程被按在那里（实测 0.1–1.5ms/次，页面越复杂
+     * 越贵），而每秒要做 30–60 次。这笔开销直接加在点击响应上。
+     *
+     * 现在容器尺寸只在 ResizeObserver 回调里更新（见 watchStageSize），
+     * 绘制路径上只剩纯算术。
+     *
+     * 用 WeakMap 而不是挂在 DOM 上：canvas 被卸载后缓存跟着回收，
+     * 也不会在元素上留自定义属性。
+     *
+     * @type {WeakMap<HTMLCanvasElement, {
+     *   availWidth: number, availHeight: number,
+     *   cssWidth: number, cssHeight: number,
+     *   bufferWidth: number, bufferHeight: number,
+     * }>}
+     */
+    const stageLayout = new WeakMap();
+
+    /**
+     * 面板当前占多少物理像素宽（= 后备存储宽度，见 fitCanvasToFrame）。
+     *
+     * 0 = 还没画过任何一帧，尺寸未知。用途只有一个：grant 时告诉 Host
+     * "按这个宽度给我取流"（见 preferredWidth），让送来的帧正好 1:1 落在
+     * 后备存储上 —— 解码量、降采样成本、清晰度三样同时改善。
+     */
+    let panelPixelWidth = 0;
+
+    /**
+     * 一条空的布局缓存。
+     *
+     * availWidth/availHeight 用 NaN 而不是 0 表示"还没量过"：0 是"量过，
+     * 但容器此刻是隐藏的"（面板收起 / tab 切走），这时不该每帧重新量 ——
+     * 解码还在跑，重量等于每帧强制布局一次，白烧 CPU。
+     *
+     * manual = ResizeObserver 不可用（见 watchStageSize），此时没有东西会刷新
+     * 缓存，只好退回"每次绘制量一次"的老行为。
+     */
+    function newStageLayout() {
+      return {
+        manual: false,
+        availWidth: Number.NaN,
+        availHeight: Number.NaN,
+        cssWidth: 0,
+        cssHeight: 0,
+        bufferWidth: 0,
+        bufferHeight: 0,
+      };
+    }
+
+    /**
+     * 同步量一次容器的可用尺寸（content box，即已去掉 padding）。
+     *
+     * 只在 ResizeObserver 不可用、或它还没送出第一个值时走这条路 ——
+     * 也就是退回"每帧量一次"的老行为。正确性优先于省那点布局时间。
+     *
+     * @param {HTMLElement} parent .mbm-stage
+     * @returns {{availWidth: number, availHeight: number}}
+     */
+    function measureStage(parent) {
+      const style = getComputedStyle(parent);
+      const paddingX = Number.parseFloat(style.paddingLeft) + Number.parseFloat(style.paddingRight);
+      const paddingY = Number.parseFloat(style.paddingTop) + Number.parseFloat(style.paddingBottom);
+      return {
+        availWidth: parent.clientWidth - (Number.isFinite(paddingX) ? paddingX : 0),
+        availHeight: parent.clientHeight - (Number.isFinite(paddingY) ? paddingY : 0),
+      };
     }
 
     /**
@@ -313,29 +406,156 @@ window.__ModuleLoader__.load({
       // 那正是上面说的循环依赖。
       const parent = canvas.parentElement;
       if (parent === null) return null;
-      const style = getComputedStyle(parent);
-      const paddingX = Number.parseFloat(style.paddingLeft) + Number.parseFloat(style.paddingRight);
-      const paddingY = Number.parseFloat(style.paddingTop) + Number.parseFloat(style.paddingBottom);
-      const availWidth = parent.clientWidth - (Number.isFinite(paddingX) ? paddingX : 0);
-      const availHeight = parent.clientHeight - (Number.isFinite(paddingY) ? paddingY : 0);
-      if (availWidth <= 0 || availHeight <= 0) return null; // 还没布局出来，等下一帧
+
+      let layout = stageLayout.get(canvas);
+      if (layout === undefined) {
+        layout = newStageLayout();
+        stageLayout.set(canvas, layout);
+      }
+      // 只在 NaN（还没量过）时同步量一次；0 意味着容器当前是隐藏的，
+      // 这时直接放弃这一帧，别每帧都去强制布局。
+      // layout.manual = 没有 ResizeObserver 维护缓存，只能退回"每帧量一次"。
+      if (layout.manual || Number.isNaN(layout.availWidth) || Number.isNaN(layout.availHeight)) {
+        const measured = measureStage(parent);
+        layout.availWidth = measured.availWidth;
+        layout.availHeight = measured.availHeight;
+      }
+      const availWidth = layout.availWidth;
+      const availHeight = layout.availHeight;
+      if (availWidth <= 0 || availHeight <= 0) return null; // 还没布局出来（或面板收起），等下一帧
 
       // contain：等比缩放到刚好装进容器
       const scale = Math.min(availWidth / frameWidth, availHeight / frameHeight);
       const cssWidth = Math.max(1, Math.round(frameWidth * scale));
       const cssHeight = Math.max(1, Math.round(frameHeight * scale));
 
-      if (canvas.style.width !== `${cssWidth}px`) canvas.style.width = `${cssWidth}px`;
-      if (canvas.style.height !== `${cssHeight}px`) canvas.style.height = `${cssHeight}px`;
+      // 只在尺寸真的变了才写：写 style 会让布局失效，写 canvas.width 还会清屏 +
+      // 重置 2D 状态（见 getMediaContext）。每帧都写等于每帧清一次屏。
+      if (cssWidth !== layout.cssWidth || cssHeight !== layout.cssHeight) {
+        layout.cssWidth = cssWidth;
+        layout.cssHeight = cssHeight;
+        canvas.style.width = `${cssWidth}px`;
+        canvas.style.height = `${cssHeight}px`;
+      }
 
-      const dpr = Math.min(window.devicePixelRatio || 1, 2); // 2 以上收益极小，白白费算力
+      // ⚠️ 上限 2：先按物理像素 1:1 映射（DPR 2 的屏上 315 CSS → 630 像素），
+      // 再往上每加 0.5 倍像素量翻倍，而手机源最多 1080 宽 —— 实测 630×1400
+      // 与 945×2079 的峰值信噪都早已饱和，多出来的只是绘制成本。
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
       const bufferWidth = Math.max(1, Math.round(cssWidth * dpr));
       const bufferHeight = Math.max(1, Math.round(cssHeight * dpr));
-      if (canvas.width !== bufferWidth || canvas.height !== bufferHeight) {
+      if (bufferWidth !== layout.bufferWidth || bufferHeight !== layout.bufferHeight) {
+        layout.bufferWidth = bufferWidth;
+        layout.bufferHeight = bufferHeight;
         canvas.width = bufferWidth;
         canvas.height = bufferHeight;
       }
-      return { width: cssWidth, height: cssHeight };
+
+      // 面板当前占多少物理像素宽。Host 用它决定按什么分辨率取流
+      // （见 grant 里的 preferredWidth），这样它送来的帧正好 1:1 落在
+      // 后备存储上：既不浪费解码，也不用浏览器再降采样一次。
+      panelPixelWidth = bufferWidth;
+
+      // 降采样倍数（>1 表示浏览器要把帧缩小后再画）。
+      return { width: cssWidth, height: cssHeight, downscale: frameWidth / bufferWidth };
+    }
+
+    /**
+     * 让 ResizeObserver 维护某块 canvas 的容器可用尺寸（见 stageLayout）。
+     *
+     * 哪些变化必须在这里发现（都**不会**改动帧尺寸，所以不能靠"帧变了才重算"）：
+     * - 面板从收起 → 展开、tab 切走再切回（keepMounted 下是 display:none，
+     *   尺寸直接变 0）；
+     * - 侧边栏被拖宽 / 窗口缩放；
+     * - frame 模式切换 —— `.mbm-stage[data-frame="device"]` 多 10px padding、
+     *   frameless 少一圈边框，content box 跟着变。
+     *
+     * 观察的是 content box；`.mbm-stage` 是 overflow:hidden 且没有滚动条，
+     * 所以 contentRect 恰好等于 "clientWidth - padding"，直接可用，
+     * 不需要再 getComputedStyle。
+     *
+     * @param {HTMLCanvasElement} canvas
+     * @returns {() => void} 取消监听
+     */
+    function watchStageSize(canvas) {
+      const parent = canvas.parentElement;
+      if (parent === null) return () => {};
+      if (typeof ResizeObserver === "undefined") {
+        // 没有 ResizeObserver 就没人刷新缓存 → 打开 manual，让 fitCanvasToFrame
+        // 每次绘制自己量（正确性优先，回到每帧强制布局的老代价）。
+        // 实际不可达：H.264 路径要求 WebCodecs，而有 WebCodecs 的浏览器都有 RO。
+        let layout = stageLayout.get(canvas);
+        if (layout === undefined) {
+          layout = newStageLayout();
+          stageLayout.set(canvas, layout);
+        }
+        layout.manual = true;
+        return () => {};
+      }
+      const observer = new ResizeObserver((entries) => {
+        const entry = entries[entries.length - 1];
+        if (entry === undefined) return;
+        let layout = stageLayout.get(canvas);
+        if (layout === undefined) {
+          layout = newStageLayout();
+          stageLayout.set(canvas, layout);
+        }
+        // 直接覆盖（包括 0）：0 表示容器被隐藏了，绘制会自己跳过，
+        // 等重新可见时这里会再收到真实尺寸。
+        layout.availWidth = entry.contentRect.width;
+        layout.availHeight = entry.contentRect.height;
+      });
+      observer.observe(parent);
+      return () => {
+        observer.disconnect();
+      };
+    }
+
+    /**
+     * 每块 canvas 的 2D 上下文缓存。
+     *
+     * @type {WeakMap<HTMLCanvasElement, CanvasRenderingContext2D>}
+     */
+    const mediaContexts = new WeakMap();
+
+    /**
+     * 取（并缓存）画布的 2D 上下文，顺手把绘制状态设成我们要的那套。
+     *
+     * 三件事：
+     * 1. `getContext("2d")` 不该每帧调（实测 p50 ≈ 0.04ms，60fps 下每秒白花 2.4ms）。
+     * 2. `alpha: false`：画面永远是一整帧不透明的内容，省掉合成期的一次混合。
+     * 3. `imageSmoothingQuality` 按**降采样倍数**选，见下面的注释。
+     *
+     * 每次调用都重设这几个属性：`canvas.width =` 赋值会重置全部 2D 状态
+     * （包括平滑设置），每次都设一遍最省心，代价是几次属性写。
+     *
+     * ── 为什么 quality 不是一律 "high" ──────────────────────────────
+     *
+     * 实测（Chrome / ANGLE Metal M3 Pro，源 1080×2376，缩到 315×693 … 945×2079，
+     * 覆盖 3.43×–1.14× 全部缩放比）：把 "low" 与 "high" 的绘制结果逐字节比较，
+     * **diffBytes 全是 0** —— 在降采样路径上 Chromium 根本没按这个提示换滤波器。
+     * 而代价是实打实的：630×1386 下一次绘制 "low" p50 2.2ms、"high" p50 12.2ms
+     * （4–6 倍）。也就是说重降采样时开 "high" 是纯亏：60fps 下 12ms 已经吃掉
+     * 大半帧预算，只会让画面更卡，一像素清晰度都不会多。
+     *
+     * 所以：重降采样（≥1.5×）用 "low"；接近 1:1（≤1.5×，Host 按面板宽度取流后
+     * 就是这个区间）用 "high" —— 那种情况下几乎没有重采样，开 high 不额外花钱，
+     * 而万一将来 Chromium 改成真按提示选滤波器，也已经是正确配置。
+     *
+     * @param {HTMLCanvasElement} canvas
+     * @param {boolean} heavilyDownscaled 帧是否远大于后备存储（见 fitCanvasToFrame 的 downscale）
+     * @returns {CanvasRenderingContext2D|null}
+     */
+    function getMediaContext(canvas, heavilyDownscaled) {
+      let ctx = mediaContexts.get(canvas);
+      if (ctx === undefined) {
+        ctx = canvas.getContext("2d", { alpha: false });
+        if (ctx === null) return null;
+        mediaContexts.set(canvas, ctx);
+      }
+      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingQuality = heavilyDownscaled ? "low" : "high";
+      return ctx;
     }
 
     /**
@@ -391,12 +611,94 @@ window.__ModuleLoader__.load({
          * 立刻喂非关键帧会让解码器报错（实测）。
          */
         let needsKeyframe = true;
-        let frames = 0;
-        /** 上次真正绘制的时间戳，用于渲染限流（见 output 回调）。 */
+        /** 是否已经报过 "playing"（每次建流只报一次，理由见 drawLatestFrame）。 */
+        let reportedPlaying = false;
+        /**
+         * 等待绘制的**最新**一帧。
+         *
+         * 解码输出比绘制快好几倍（源 ~105–120fps，绘制目标 60fps），所以这里
+         * 只留最新的一帧：新帧到达时旧帧必须 close() —— VideoFrame 占着解码器
+         * 的输出缓冲，不归还解码器很快就会"取不到输出缓冲"而停摆。
+         */
+        let pendingFrame = null;
+        /** 已排队的 requestAnimationFrame 句柄（0 = 没排队）。 */
+        let rafId = 0;
+        /** 上次真正绘制的时刻，用于渲染限流（见 drawLatestFrame）。 */
         let lastDrawAt = 0;
 
         const report = (state, detail) => {
           if (!cancelled) onState(state, detail);
+        };
+
+        /**
+         * 把排队的绘制画出来 —— 这是**唯一**的绘制入口。
+         *
+         * ── 为什么一定要在 rAF 里画 ─────────────────────────────────────
+         *
+         * 解码输出回调发生在 vsync 之间的任意时刻。在那里直接 drawImage，
+         * 结果要等**下一个** vsync 才被合成，于是每一帧的等待时间在
+         * "0 到 2 个 vsync" 之间随机跳动：帧率数字一样，肉眼却是抖的
+         * （judder），操作反馈的延迟也跟着抖。
+         *
+         * 放进 rAF 后，绘制紧贴 vsync 之前完成，等待固定在 0–1 个 vsync；
+         * 而且"这一帧画不画"变成可控的（限流见下）。
+         *
+         * 不变量：每一帧**最终**都会被 close 且只 close 一次 ——
+         * 画完 close、画不了 close、被更新的帧顶替时 close、卸载时 close。
+         * （限流跳过那一条分支是把帧放回去，不算放手，见下面的注释。）
+         */
+        const drawLatestFrame = () => {
+          rafId = 0;
+          const frame = pendingFrame;
+          pendingFrame = null;
+          if (frame === null) return;
+          const canvas = canvasRef.current;
+          if (cancelled || canvas === null) {
+            frame.close();
+            return;
+          }
+
+          const now = performance.now();
+          // 限流：源流 ~105–120fps，超过目标帧率的绘制不画（解码一帧都没少，
+          // 见 TARGET_RENDER_FPS 上面那段）。
+          //
+          // ⚠️ 这里**不能 close 这一帧**：close 掉就等于"这一帧彻底没了"，而下一个
+          // vsync 很可能根本没有新帧可画（源 101fps ≈ 9.9ms 一帧，比 120Hz 屏的
+          // vsync 8.3ms 还稀）。按时间线模拟（解码 101/103fps × 60/120/144Hz 屏）：
+          // close 的版本在 120Hz 屏上只剩 51.8–57fps，且间隔一长一短；
+          // 改成"放回去、下一个 vsync 再试"后是稳定 60fps、间隔严格 2 个 vsync。
+          // 代价只是每次跳过多一次空转的 rAF 回调（几十微秒）。
+          //
+          // 放回去的是**最新**那一帧：期间若来了更新的帧，output 会先把旧帧 close
+          // 再顶替，所以画出来的永远是最新的，不会因为"等一等"而变慢。
+          if (now - lastDrawAt < 1000 / TARGET_RENDER_FPS - VSYNC_SLACK_MS) {
+            pendingFrame = frame;
+            rafId = requestAnimationFrame(drawLatestFrame);
+            return;
+          }
+          lastDrawAt = now;
+
+          // 按帧的真实宽高比定尺寸（不能读 canvas 自己的矩形 —— 那是循环依赖）
+          const size = fitCanvasToFrame(canvas, frame.displayWidth, frame.displayHeight);
+          if (size !== null) {
+            const ctx2d = getMediaContext(canvas, size.downscale >= 1.5);
+            if (ctx2d !== null) ctx2d.drawImage(frame, 0, 0, canvas.width, canvas.height);
+          }
+          frame.close();
+
+          // "playing" 只报一次。原来是 `frames % 30 === 0` 时报 report("playing",
+          // { frames })，但那个 detail 没有任何地方显示（hintText 对 playing
+          // 返回空串），等于每秒 4 次 setState 把整个面板重渲染一遍。
+          if (!reportedPlaying) {
+            reportedPlaying = true;
+            report("playing");
+          }
+        };
+
+        /** 排一次 rAF；已经有排队的就别重复排。 */
+        const scheduleDraw = () => {
+          if (rafId !== 0 || cancelled) return;
+          rafId = requestAnimationFrame(drawLatestFrame);
         };
 
         /**
@@ -419,42 +721,35 @@ window.__ModuleLoader__.load({
           }
           decoder = new VideoDecoder({
             output: (frame) => {
-              const canvas = canvasRef.current;
-              // 记下真实帧尺寸（设备像素）供坐标换算用 —— 后备存储已经不等于它了
-              if (frameSizeRef !== undefined) {
-                frameSizeRef.current = {
-                  width: frame.displayWidth,
-                  height: frame.displayHeight,
-                };
+              if (cancelled) {
+                frame.close();
+                return;
               }
-
-              /**
-               * ── 渲染限流（不是解码限流）──────────────────────────────
-               *
-               * mobilecli 的 `--fps` 无效，实测恒定 ~120fps。解码本身很便宜
-               * （硬件加速），贵的是主线程上的 drawImage：120fps × 后备存储
-               * 会把主线程占满，点击事件只能排队。
-               *
-               * 所以这里**每一帧都解码**（保住 H.264 参考链完整，不会花屏），
-               * 但只按 TARGET_RENDER_FPS 绘制。多余的直接 close 掉。
-               *
-               * ⚠️ frame 必须 close，否则解码器很快会因为拿不到输出缓冲而卡死。
-               */
-              const now = performance.now();
-              if (canvas !== null && now - lastDrawAt >= 1000 / TARGET_RENDER_FPS) {
-                lastDrawAt = now;
-                // 按帧的真实宽高比定尺寸（不能读 canvas 自己的矩形 —— 那是循环依赖）
-                fitCanvasToFrame(canvas, frame.displayWidth, frame.displayHeight);
-                const ctx2d = canvas.getContext("2d");
-                if (ctx2d !== null) {
-                  ctx2d.drawImage(frame, 0, 0, canvas.width, canvas.height);
+              // 记下真实帧尺寸（设备像素）供坐标换算用 —— 后备存储已经不等于它了。
+              // 只在变化时写：解码 100+ 帧/秒，每帧都建个新对象是纯垃圾。
+              if (frameSizeRef !== undefined) {
+                const prev = frameSizeRef.current;
+                if (prev === null || prev === undefined || prev.width !== frame.displayWidth || prev.height !== frame.displayHeight) {
+                  frameSizeRef.current = {
+                    width: frame.displayWidth,
+                    height: frame.displayHeight,
+                  };
                 }
               }
 
-              frames += 1;
-              if (frames === 1) report("playing");
-              else if (frames % 30 === 0) report("playing", { frames });
-              frame.close();
+              /**
+               * ── 帧的所有权转交给绘制循环 ──────────────────────────────
+               *
+               * 这里**不画**，只把最新一帧交出去（见 drawLatestFrame）：
+               * 解码输出发生在 vsync 之间的随机时刻，在那儿直接 drawImage
+               * 会让每帧的合成等待在 0–2 个 vsync 之间抖动（肉眼就是卡顿），
+               * 也没法做限流。
+               *
+               * ⚠️ 被顶替的旧帧必须 close，否则解码器拿不到输出缓冲会停摆。
+               */
+              if (pendingFrame !== null) pendingFrame.close();
+              pendingFrame = frame;
+              scheduleDraw();
             },
             error: (error) => {
               // 不在这里重建：交给下面的循环统一复位。
@@ -677,10 +972,32 @@ window.__ModuleLoader__.load({
           return undefined;
         }
 
+        /**
+         * 容器尺寸交给 ResizeObserver 长期盯着（见 watchStageSize）：
+         * 面板收起/展开、侧边栏拖宽、frame 模式切换都会改变可用空间，
+         * 而这些**都不改帧尺寸**，靠"帧变了才重算"是发现不了的。
+         *
+         * ⚠️ 必须在 canvas 挂载后（下面的 runWithReconnect 之前）就订阅：
+         * 首帧解码出来时 layout 里必须已经有真实尺寸，否则第一帧会白画一次。
+         */
+        const canvasElement = canvasRef.current;
+        const unwatchStage = canvasElement === null ? () => {} : watchStageSize(canvasElement);
+
         void runWithReconnect();
 
         return () => {
           cancelled = true;
+          unwatchStage();
+          // 排队中的 rAF 必须取消：回调里会用已经被取消的上下文继续画
+          if (rafId !== 0) {
+            cancelAnimationFrame(rafId);
+            rafId = 0;
+          }
+          // 还没画出去的帧必须 close，否则解码器拿不回输出缓冲
+          if (pendingFrame !== null) {
+            pendingFrame.close();
+            pendingFrame = null;
+          }
           if (stallTimer !== null) {
             clearInterval(stallTimer);
             stallTimer = null;
@@ -1386,6 +1703,8 @@ window.__ModuleLoader__.load({
       const [format, setFormat] = useState("unknown");
       const [frame, setFrame] = useState("bezel");
       const [busy, setBusy] = useState(false);
+      /** 面板根节点：只在估算取流宽度时用（见 preferredStreamWidth）。 */
+      const rootRef = useRef(null);
       /**
        * 是否正在启动一台离线设备。
        *
@@ -1404,7 +1723,30 @@ window.__ModuleLoader__.load({
        */
       const [adb, setAdb] = useState(null);
 
+      /**
+       * 面板该按多宽的**物理像素**取流（= 后备存储宽度），0 表示还没法确定。
+       *
+       * 两级来源：
+       * 1. 已经画过帧 → 直接用 fitCanvasToFrame 记下的真实后备存储宽度，零成本。
+       * 2. 首次 grant 时还没画过任何一帧（流都还没建）→ 拿 `.mbm-stage` 的可用宽度
+       *    估一个。手机画面是竖长的，侧边栏通常"宽度受限"，所以这个估计值在
+       *    常见情况下就是真实值；真被高度限制住时只会偏大一点，而 Host 那边还会
+       *    clamp 到 [0.35, 1]，代价仅是多送一点像素。
+       *
+       * 绝不为此再改一次 grant：grant 会重开流（画面闪一下），为了几十像素不值得。
+       */
+      const preferredStreamWidth = () => {
+        if (panelPixelWidth > 0) return panelPixelWidth;
+        const stage = rootRef.current === null ? null : rootRef.current.querySelector(".mbm-stage");
+        if (stage === null) return 0;
+        const dpr = Math.min(window.devicePixelRatio || 1, 2);
+        const availWidth = measureStage(stage).availWidth;
+        if (!(availWidth > 0)) return 0;
+        return Math.max(1, Math.round(availWidth * dpr));
+      };
+
       /** 申请 token 并选定设备。token 决定设备，所以换设备必须重新申请。 */
+
       const grant = useCallback(
         async (deviceId) => {
           setBusy(true);
@@ -1421,7 +1763,26 @@ window.__ModuleLoader__.load({
               && (target.type === "simulator" || target.type === "emulator");
             if (willBoot) setBooting(true);
 
-            const result = await api("grant", deviceId === undefined ? {} : { deviceId });
+            /**
+             * preferredWidth：面板当前占多少**物理像素**宽（= 后备存储宽度）。
+             *
+             * 为什么值得上报：Host 拿它算 `scale = clamp(preferredWidth / 设备宽,
+             * 0.35, 1)` —— 按面板宽度取流，送来的帧就正好 1:1 落在 canvas 上。
+             * 不报的话 Host 只能按设备原生 1080 宽取流，而面板只有 ~630 物理像素：
+             * 解码量、带宽、浏览器降采样三份成本全白付一倍多。
+             *
+             * 0 = 连估都估不出来（面板还没布局），这时**不传**这个字段 ——
+             * 让 Host 走自己的默认值，比传一个会被 clamp 到下限的 0 安全。
+             * 旧 Host 会忽略未知字段，所以加了也不会坏。
+             *
+             * ⚠️ 只是"告诉我帧该多宽"，不是坐标口径：坐标照旧按**帧像素**发，
+             * 缩放由 Host 自己负责，客户端不要再折算一次。
+             */
+            const body = deviceId === undefined ? {} : { deviceId };
+            const preferredWidth = preferredStreamWidth();
+            if (preferredWidth > 0) body.preferredWidth = preferredWidth;
+
+            const result = await api("grant", body);
             rememberDevices(result.devices ?? []);
             setActiveId(result.device?.id ?? null);
             setToken(result.streamToken ?? null);
@@ -1642,7 +2003,7 @@ window.__ModuleLoader__.load({
         ) : null;
 
       return (
-        <div className="mbm-root">
+        <div className="mbm-root" ref={rootRef}>
           {/*
             样式以 React 子节点的形式注入 <style>（而不是命令式 appendChild）：
             DSH 会给插件注入的 <style> 打上 data-plugin 并在卸载时一并清理，

@@ -156,9 +156,9 @@ pnpm add @j62268781-alt/dsh-sidebar-mobile
 | `mobileLoop.purpose` | `mobile.action` | dsh_judgment 中已配置且可用的 purpose |
 | `stream.idleStopSeconds` | `300` | 无消费者后多久停流 |
 | `stream.restartDelayMs` | `5000` | 流崩溃后的重启延迟 |
-| `stream.bitrate` | `8000000` | AVC 码率（bps）；默认已较高，需实机 A/B |
-| `stream.maxFps` | `30` | 请求上游帧率（当前测试设备上参数无效）；浏览器仍以 30 FPS 绘制 |
-| `stream.defaultScale` | `1.0` | 缩放。`0.5` 在 iOS 上实测 104fps/6.6Mbps（全分辨率 131fps/20.6Mbps） |
+| `stream.bitrate` | `0` | AVC 码率（bps）。`0` = 按 scale 自动推导（满分辨率 10 Mbps）；显式填数字则固定该值 |
+| `stream.maxFps` | `30` | 请求上游帧率（当前测试设备上参数无效）；浏览器在 rAF 里按 60 FPS 绘制 |
+| `stream.defaultScale` | `0` | `0` = 按面板画布物理像素自动决定（侧边栏通常 ≈0.58）；`0.35`–`1` = 固定缩放 |
 | `useDaemonRpc` | `true` | 优先走 daemon JSON-RPC；可用时历史 tap 实测 7.3ms vs CLI 104.2ms。Windows socket 权限错误会停用 RPC 并回退；排查时设 `false` |
 | `trustedAuthorities` | `[]` | 经反向代理访问时显式列出对外 authority |
 
@@ -213,7 +213,7 @@ pnpm add @j62268781-alt/dsh-sidebar-mobile
 
 每次判断会把用户目标和最多 12 个控件标签发给配置的 judgment 服务；只做邮箱/长数字遮蔽与长度截断，不发送截图或完整 UI 树，因此并非通用隐私脱敏。loop 上限 5 步，只点击控件；会排除输入框和明显涉及提交、发送、支付、删除、授权、权限、上传、分享、保存、安装等标签，点击前重新读取 UI 并核对 judgment fingerprint。弃答、低置信度、无效响应或 UI 变化都会停止，不会自动重试。不要在含敏感信息的屏幕启用它。它是受限的结构化 UI loop，不是完整视觉 agent。
 
-性能方面，默认视频已经是 `scale: 1.0`、8 Mbps；mobilecli 的 `--fps` 在已测设备上无效，浏览器 H.264 绘制上限是 30 FPS（仍逐帧解码保留参考链）。没有在线设备时不盲目提高码率/DPR/FPS；要更清晰可保持 `defaultScale: 1.0` 并在真实设备上测 8–10 Mbps，要更流畅需先做 30/60 FPS 解码与主线程对照，再决定是否开放配置。
+性能方面，默认按**面板像素**取流（`defaultScale: 0` → 侧边栏通常得 `scale≈0.58`，即 628×1384 而不是 1080×2376），码率按 scale 自动推导（`bitrate: 0`，满分辨率给 10 Mbps）。实测同一台一加 12 连续横滑：1080×2376 时解码负载 260 Mpx/s、每像素比特 0.027；628×1384 时降到 89 Mpx/s、每像素比特 0.048 —— 解码量只有 34%，每像素比特反而多 1.8 倍。mobilecli 的 `--fps` 在已测设备上无效，浏览器侧逐帧解码保留 H.264 参考链、只在 rAF 里按 60 FPS 绘制。多出来的像素在 630 宽画布上本来显示不出来，最后被浏览器降采样丢掉，纯属白解码；要固定满分辨率排查时把 `defaultScale` 设成 `1.0`。
 
 #### 为什么不给 tap / swipe / 输入 / 按键 / 启动应用注册工具
 
@@ -274,9 +274,9 @@ mobilecli 仓库里的 playbook（`SKILL.md` + `reference.md`）被原样打包�
 
 - **⚠️ mobilecli 会独占设备的 UiAutomation**。上游源码注释原文：*"While it runs it holds the device's only UiAutomation, which kills every other UiAutomator client (`uiautomator dump`, Appium)."* **实测确认**：daemon 运行时 `adb shell uiautomator dump` 静默失败（文件根本不生成），`mobilecli daemon stop` 后立刻恢复。受影响的是 Appium、UiAutomator、以及任何依赖 `uiautomator dump` 的工具；不受影响的是 `adb shell input`、`screencap`、以及**进程内的 Flutter 测试**（`integration_test` / `patrol` 的 Dart 部分不碰 UiAutomation）。
 - **⚠️ Android 必须有 adb，且 mobilecli 不会为此报错**。缺 adb 时 `devices` 返回空列表 + exit code 0，看起来跟"没插手机"一模一样。插件会主动体检并区分这两种情况（见[前置：adb](#前置adbandroid-必需)）。
-- **⚠️ `--fps` 参数不生效**。复测（Xiaomi 15 Pro / 1080×2400 / mobilecli 1.0.19）：不传 → 120.6fps，`--fps 30` → 105.5fps，`--fps 15` → 100.7fps，传什么都是 ~120fps。所以限流只能在**客户端渲染侧**做：插件每帧都解码（保住 H.264 参考链 —— 丢 P 帧会花屏），但只按 30fps 绘制。想降带宽只能用 `--scale` 或 `--bitrate`。
+- **⚠️ `--fps` 参数不生效**。复测（Xiaomi 15 Pro / 1080×2400 / mobilecli 1.0.19）：不传 → 120.6fps，`--fps 30` → 105.5fps，`--fps 15` → 100.7fps，传什么都是 ~120fps。所以限流只能在**客户端渲染侧**做：插件每帧都解码（保住 H.264 参考链 —— 丢 P 帧会花屏），但只在 rAF 里按 60fps 绘制最新帧。想降带宽只能用 `--scale` 或 `--bitrate`。
 - **⚠️ swipe 不传 `--duration` 时会跑满 1000ms**。实测 `io swipe` 不带该参数耗时 1074ms，带 `--duration 300` 只需 374ms。插件按手指按住时长自动计算并透传。
-- **⚠️ `--bitrate` 默认值偏低**。实测 1080×2400 静止仅 0.98 Mbps、滑动 2.15 Mbps（大范围运动时明显发糊）。插件默认传 8 Mbps，同场景实测可达 6.6 Mbps。
+- **⚠️ `--bitrate` 默认值偏低，但它是软上限**。实测 1080×2400 静止仅 0.98 Mbps、滑动 2.15 Mbps（大范围运动时明显发糊）。插件默认给满分辨率 10 Mbps（按 scale² 折算、下限 5 Mbps）。注意设 4 Mbps 实测仍出 6.79 Mbps，所以它不能当限流用。
 - **⚠️ iOS 的 `--format avc` 会被静默降级成 MJPEG**。这也是本插件从首块字节嗅探格式、而不相信请求参数的原因。
 - **多个 DSH 进程不能共用同一个 daemon**。需要并行时给每个 profile 配不同的 `homeDir`。
 - **⚠️ 从源码装时不能用软链**。本插件的 Host 半 import 宿主包（`@deepseek-ai/dsh-tools`），而 Node 的 ESM 解析会以软链的**真实路径**为基准去找 `node_modules`——源码目录下没有那些包，于是启动日志报 `failed to import`（伴随 `1 entry did not activate`）。**实测对照**：同一个插件软链失败、真实目录成功。用 `dsh plugin add "link:$PWD"` 或 `cp -R` 成真实目录，见 [docs/DEPLOY-DSH.md](docs/DEPLOY-DSH.md)。发到 npm 后不受影响。

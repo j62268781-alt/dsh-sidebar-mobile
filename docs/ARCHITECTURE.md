@@ -477,9 +477,9 @@ crashCount  1  2  3  4  5  6 → 上限
 | adb/USB 回传 | 20 | 1080p 帧 ~35KB |
 | Host 转发 + 背压 | 2 | 16KB hwm |
 | 浏览器解码 | 5 | WebCodecs 硬件解码 |
-| 渲染限流等待 | 17 | 30fps 的半个周期（均值）|
+| 渲染限流等待 | 8 | 60fps 的半个周期（均值）|
 | drawImage + 合成 | 8 | 主线程 |
-| **合计** | **~178** | |
+| **合计** | **~169** | |
 
 那 62ms 的进程启动**目前无法消除**：`mobilecli` 是 Node CLI，输入类命令
 （`io tap/swipe/longpress/pinch/button/text/keys/clipboard`）全是**一次性**命令，

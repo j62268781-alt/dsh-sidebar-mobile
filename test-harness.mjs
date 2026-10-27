@@ -26,7 +26,7 @@ import {
   isJudgmentUsable,
   runMobileLoop,
 } from "./lib/agent/mobile-loop.js";
-import { StreamRoutes, mountRoutes } from "./lib/stream/routes.js";
+import { StreamRoutes, mountRoutes, toDeviceCoordinates } from "./lib/stream/routes.js";
 import {
   resolveSocketPath,
   callDaemon,
@@ -3262,6 +3262,239 @@ await test("lib 按职责分目录，且只有 client.js 留在根下", () => {
   for (const dir of ["device", "stream", "agent"]) {
     assert.ok(existsSync(new URL(`./lib/${dir}`, import.meta.url)), `缺少 lib/${dir}/`);
   }
+});
+
+// ── 流参数与坐标换算 ─────────────────────────────────────────────────
+//
+// 背景（实测）：侧边栏画布后备存储只有 630×1400 物理像素，而设备是 1080×2376
+// —— 2.9 倍过采样，解码与纹理上传都在为看不见的像素买单。按画布宽度给
+// `--scale` 后编码器真的改分辨率（SPS 实测 1.0→1080×2376、0.5→540×1188）。
+//
+// 一旦按 scale 编码，客户端报的坐标就是**帧像素**，必须换回设备像素，
+// 否则所有点击都会按 1/scale 的比例系统性偏移（0.5 时点右上角会点到屏幕外）。
+// 这组用例锁的就是这个换算。
+
+console.log("\n流参数与坐标换算");
+
+await test("scale=1 时坐标原样透传", () => {
+  const input = { action: "tap", x: 100, y: 200 };
+  const out = toDeviceCoordinates(input, { scale: 1, deviceWidth: 1080, deviceHeight: 2376 });
+  assert.deepEqual(out, { action: "tap", x: 100, y: 200 });
+  assert.notEqual(out, input, "应当返回新对象，不要改调用方的输入");
+});
+
+await test("scale=0.5 时帧像素 ×2 换回设备像素", () => {
+  const out = toDeviceCoordinates({ action: "tap", x: 315, y: 700 }, {
+    scale: 0.5,
+    deviceWidth: 1080,
+    deviceHeight: 2376,
+  });
+  assert.equal(out.x, 630, "x=315 在 0.5 缩放下对应设备像素 630");
+  assert.equal(out.y, 1400, "y=700 在 0.5 缩放下对应设备像素 1400");
+});
+
+await test("swipe 的四个点都要换算（少一个就会从错的位置起手）", () => {
+  const out = toDeviceCoordinates(
+    { action: "swipe", x1: 100, y1: 100, x2: 200, y2: 300, duration: 300 },
+    { scale: 0.5, deviceWidth: 1080, deviceHeight: 2376 },
+  );
+  assert.deepEqual(
+    { x1: out.x1, y1: out.y1, x2: out.x2, y2: out.y2 },
+    { x1: 200, y1: 200, x2: 400, y2: 600 },
+  );
+  assert.equal(out.duration, 300, "duration 不是坐标，不该被动到");
+});
+
+await test("换算结果夹在屏幕范围内（点边缘不至于越界）", () => {
+  // 帧宽 630 → 设备 x 上限 1079；x=700 会算出 1400，必须夹住
+  const out = toDeviceCoordinates({ action: "tap", x: 700, y: 5 }, {
+    scale: 0.5,
+    deviceWidth: 1080,
+    deviceHeight: 2376,
+  });
+  assert.equal(out.x, 1079, "x 应夹到 deviceWidth-1");
+  assert.equal(out.y, 10, "未越界的坐标不该被改");
+
+  const negative = toDeviceCoordinates({ action: "tap", x: -20, y: -20 }, { scale: 1, deviceWidth: 1080 });
+  assert.deepEqual({ x: negative.x, y: negative.y }, { x: 0, y: 0 }, "负坐标夹到 0");
+});
+
+await test("屏幕高度未知时不能夹 y（否则下半屏点不到）", () => {
+  // 只有 deviceWidth（例如 device.info 只回了宽）时，y 不做上界夹取：
+  // 把 2376 高的屏按 1080 夹，等于"下半屏永远点不到"。
+  const out = toDeviceCoordinates({ action: "tap", x: 10, y: 2000 }, { scale: 1, deviceWidth: 1080 });
+  assert.equal(out.y, 2000, "y 不该被 deviceWidth 夹住");
+});
+
+await test("plan 缺失时按不缩放处理（流还没 grant 过）", () => {
+  assert.deepEqual(
+    toDeviceCoordinates({ action: "tap", x: 12, y: 34 }, null),
+    { action: "tap", x: 12, y: 34 },
+  );
+  assert.deepEqual(
+    toDeviceCoordinates({ action: "tap", x: 12, y: 34 }, { scale: 0 }),
+    { action: "tap", x: 12, y: 34 },
+    "非法 scale 不能当 0 去除（会除出 Infinity）",
+  );
+});
+
+await test("control 路由按流的真实 plan 换算坐标（不是按请求体）", async () => {
+  const rpcCalls = [];
+  const client = {
+    async listDevices() { return [{ id: "d1", name: "一加 12", platform: "android", state: "online" }]; },
+    async runJson() { throw new Error("这条路径不该走 CLI"); },
+  };
+  const routes = new StreamRoutes({
+    client,
+    pool: { acquire: () => ({ sendInput: async () => {} }) },
+    access: { mint: () => "t" },
+    rpc: {
+      available: true,
+      async call(method, params) { rpcCalls.push({ method, params }); return {}; },
+    },
+    log: () => {},
+  });
+  routes.activeDeviceId = "d1";
+  routes.streamPlans.set("d1", { scale: 0.5, deviceWidth: 1080, deviceHeight: 2376 });
+
+  const { req, res } = latencyReqRes({ action: "tap", x: 315, y: 700 });
+  await routes.handle("control", req, res);
+
+  assert.equal(res.statusCode, 200, `应当成功，实际 ${res.statusCode} ${res.body}`);
+  assert.equal(rpcCalls.length, 1, "应当走一次 RPC");
+  assert.equal(rpcCalls[0].method, "device.io.tap");
+  assert.deepEqual(
+    rpcCalls[0].params,
+    { deviceId: "d1", x: 630, y: 1400 },
+    "坐标必须按流的 scale 换算成设备像素；按帧像素送给设备会点偏一半屏幕",
+  );
+});
+
+// ── daemon RPC 自愈 ──────────────────────────────────────────────────
+//
+// daemon 空闲 30 分钟自退，CLI 又会把它拉起来 —— "连不上"是常态。旧实现
+// 一次 ECONNREFUSED 就永久停用（reset() 生产代码里没人调用），此后整场
+// 会话退化 CLI：166ms vs RPC 19.8ms，慢 8.4 倍。
+//
+// 这里用真实 unix socket 走完 失败 → 退避 → 恢复 的完整路径（退避档位用
+// 毫秒级覆盖，真实是 5s/15s/60s，用例等不起）。
+
+console.log("\n daemon RPC 自愈");
+
+/**
+ * 起一个只会回 `daemon.status` 的假 daemon。
+ * @param {string} socketPath
+ * @returns {Promise<{close: () => Promise<void>}>}
+ */
+function startFakeDaemon(socketPath) {
+  const server = net.createServer((socket) => {
+    let buffer = "";
+    socket.on("data", (chunk) => {
+      buffer += chunk.toString("utf8");
+      const newline = buffer.indexOf("\n");
+      if (newline === -1) return;
+      let message;
+      try {
+        message = JSON.parse(buffer.slice(0, newline));
+      } catch {
+        socket.destroy();
+        return;
+      }
+      socket.write(`${JSON.stringify({ jsonrpc: "2.0", id: message.id, result: { version: "1.0.19" } })}\n`);
+      // 与真 daemon 一致：回完就主动关（一请求一连接）
+      socket.end();
+    });
+    socket.on("error", () => {});
+  });
+  return new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(socketPath, () => {
+      resolve({
+        close: () => new Promise((done) => server.close(() => done())),
+      });
+    });
+  });
+}
+
+await test("连接失败后按退避自动恢复（不必等 CLI 来救）", async () => {
+  const home = mkdtempSync(join(import.meta.dirname, ".tmp-rpc-test-"));
+  const socketPath = join(home, "daemon.sock");
+  const logs = [];
+  const rpc = new DaemonRpc({
+    home,
+    recoveryBackoffMs: [20, 40],
+    log: (level, message) => logs.push(`${level}:${message}`),
+  });
+
+  try {
+    // ① 没有 daemon：连接层失败 → 通道停用，但不该是"永久"
+    await assert.rejects(rpc.call("device.io.tap", {}), /ENOENT|daemon/);
+    assert.equal(rpc.available, false, "连接层失败后应标记不可用（避免每次点击白等）");
+
+    // ② daemon 起来了（等价于 CLI 把它拉起来）
+    const daemon = await startFakeDaemon(socketPath);
+
+    // ③ 退避探测（20ms 档）应当自动把通道救回来
+    const deadline = Date.now() + 2000;
+    while (!rpc.available && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(rpc.available, true, "daemon 回来后通道应当自动恢复，否则整场会话都在走 CLI");
+    assert.ok(
+      logs.some((line) => line.includes("恢复")),
+      `恢复应当留一条日志，实际日志：${logs.join(" | ") || "(空)"}`,
+    );
+
+    await daemon.close();
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+await test("prewarm 让第一次点击就走 RPC（冷启动不再先吃一次 CLI）", async () => {
+  const home = mkdtempSync(join(import.meta.dirname, ".tmp-rpc-warm-"));
+  const socketPath = join(home, "daemon.sock");
+  const rpc = new DaemonRpc({ home, log: () => {} });
+  const daemon = await startFakeDaemon(socketPath);
+
+  try {
+    assert.equal(await rpc.prewarm(), true, "daemon 在跑时预热应当成功");
+    assert.equal(rpc.available, true);
+    const result = await rpc.call("device.io.tap", {});
+    assert.deepEqual(result, { version: "1.0.19" });
+  } finally {
+    await daemon.close();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+await test("CLI 兜底成功后立刻恢复通道（下一次点击回到 RPC）", async () => {
+  // 通道已标记不可用，但 CLI 能跑通 —— 说明 daemon 已经被 CLI 拉起来了。
+  const resets = [];
+  let cliCalls = 0;
+  const client = {
+    async listDevices() { return [{ id: "d1", name: "一加 12", platform: "android", state: "online" }]; },
+    async runJson() { cliCalls += 1; return {}; },
+  };
+  const routes = new StreamRoutes({
+    client,
+    pool: { acquire: () => ({ sendInput: (run) => run(["io", "tap", "--device", "d1", "1,2"]) }) },
+    access: { mint: () => "t" },
+    rpc: {
+      available: false,
+      async call() { throw new Error("不该走 RPC"); },
+      reset() { resets.push("reset"); this.available = true; },
+    },
+    log: () => {},
+  });
+  routes.activeDeviceId = "d1";
+
+  const { req, res } = latencyReqRes({ action: "tap", x: 1, y: 2 });
+  await routes.handle("control", req, res);
+
+  assert.equal(res.statusCode, 200, `应当成功，实际 ${res.statusCode} ${res.body}`);
+  assert.equal(cliCalls, 1, "通道不可用时应当走 CLI");
+  assert.deepEqual(resets, ["reset"], "CLI 成功后必须恢复通道，否则永远退化在 CLI 上");
 });
 
 console.log(`\n结果：${passed} 通过，${failed} 失败`);
