@@ -533,6 +533,33 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * 自适应节拍该不该发起一次重取（fixed 感知的包装层）。
+     *
+     * ── fixed 是什么 ────────────────────────────────────────────────────
+     * Host 现在默认**始终按设备原生分辨率取流**（scale 恒为 1，回包带
+     * `fixed: true`），缩放交给浏览器 GPU 降采样 —— 真机实测面板画布
+     * 800×1760 时：设备端缩到 798 再 1:1 画 RMSE 14.84 / 锐度 0.934，
+     * 原生 1080 由浏览器缩到 800 反而 RMSE 5.39 / 锐度 0.943。
+     *
+     * 也就是说"要多少像素就取多少像素"这条路已经被证明更差，分辨率不再由
+     * 客户端的一句话决定。此时若还按 decideRegrant 判定，会看到 framePx(1080)
+     * 远大于 needPx(比如 532) → 走降档分支 → 每 3 秒发一次 grant，而 Host
+     * 永远回 scale=1：等于每隔几秒把画面掐掉重连一次，纯闪屏、零收益。
+     *
+     * 所以 fixed 时**完全不判定**（连 streak 都不动，将来 Host 想动态化时会
+     * 从干净状态重新计时）。旧 Host 不回 fixed 字段 → 视作 false，行为退化成
+     * 改造前的样子，不会因为字段缺失就把自适应功能整个关掉。
+     *
+     * @param {{fixed: boolean, streak: object, needPx: number, framePx: number,
+     *   now: number, lastAt: number, cooldown: number}} state
+     * @returns {boolean} true = 应该重新 grant
+     */
+    function shouldAttemptRegrant({ fixed, streak, needPx, framePx, now, lastAt, cooldown }) {
+      if (fixed === true) return false;
+      return decideRegrant(streak, needPx, framePx, now, lastAt, cooldown);
+    }
+
+    /**
      * 画布该按多宽的**物理像素**取流。
      *
      * 纯函数：调用方负责把 panelCssWidth / DPR / 设备宽喂进来。
@@ -2210,6 +2237,14 @@ window.__ModuleLoader__.load({
       const regrantStreakRef = useRef(newRegrantStreak());
       /** busy 的同步副本：250ms 判定节拍里读到它才是最新的（state 会慢一拍）。 */
       const busyRef = useRef(false);
+      /**
+       * Host 是否把分辨率**钉死**了（grant 回包 `fixed: true`）。
+       *
+       * true = 这条流永远是设备原生分辨率，客户端的画布宽窄不会改变它 ——
+       * 此时发起重取只会白重连一次（详见 shouldAttemptRegrant 的注释）。
+       * 每次 grant 都按最新回包更新：换设备/换策略后可能又变回可变。
+       */
+      const fixedScaleRef = useRef(false);
 
       /**
        * 面板该按多宽的**物理像素**取流（= 后备存储宽度），0 表示还没法确定。
@@ -2304,6 +2339,15 @@ window.__ModuleLoader__.load({
             rememberDevices(result.devices ?? []);
             setActiveId(result.device?.id ?? null);
             setToken(result.streamToken ?? null);
+            /**
+             * Host 是否把分辨率**钉死**了（回包 fixed: true = 始终按设备原生
+             * 分辨率取流，缩放交给浏览器 GPU 降采样）。
+             *
+             * 每次 grant 都覆盖，不做"一旦为真就永真"：换设备、或 Host 将来
+             * 改回按需取流时，自适应逻辑要能自己长回来。旧 Host 不回这个字段
+             * → false → 行为退化成改造前。
+             */
+            fixedScaleRef.current = result.fixed === true;
             // 记下设备逻辑宽：判定"需要的像素是否超过设备能给的"要用它封顶
             // （见 neededPixelWidth）。Host 回带的是本次流**真实**的设备尺寸，
             // 比从设备列表里猜可靠；拿不到就保持 0（按 1080 兜底）。
@@ -2330,6 +2374,11 @@ window.__ModuleLoader__.load({
               preferredWidth,
               effectiveWidth,
             );
+            // fixed 时上面那次"没变清晰 → 冷却翻倍"没有意义（根本不会再申请），
+            // 顺手拨回基础值：免得将来 Host 恢复动态策略时一上来就从 60s 冷却起步。
+            if (fixedScaleRef.current) {
+              regrantCooldownRef.current = REGRANT_MIN_INTERVAL_MS;
+            }
             // 启动失败不影响选中，但要如实告诉用户（否则画面一直是黑的却无解释）
             if (typeof result.bootError === "string" && result.bootError !== "") {
               setError(`设备已选中，但启动失败：${result.bootError}`);
@@ -2407,17 +2456,20 @@ window.__ModuleLoader__.load({
           // 设备不在线时一切都是白做：grant 只会白等一次失败的 CLI 探测，
           // 还会把错误横幅刷到面板上，盖住"设备已断开"这条真正的原因。
           if (offlineRef.current) return;
+          // fixed（Host 钉死原生分辨率）时这一步直接返回 false：不再判定、
+          // 不再发 grant。理由与实测数字见 shouldAttemptRegrant 的注释。
           const now = performance.now();
           const needPx = preferredStreamWidth();
           const framePx = frameSizeRef.current.width;
-          if (!decideRegrant(
-            regrantStreakRef.current,
+          if (!shouldAttemptRegrant({
+            fixed: fixedScaleRef.current,
+            streak: regrantStreakRef.current,
             needPx,
             framePx,
             now,
-            lastRegrantAtRef.current,
-            regrantCooldownRef.current,
-          )) {
+            lastAt: lastRegrantAtRef.current,
+            cooldown: regrantCooldownRef.current,
+          })) {
             return;
           }
           regrantStreakRef.current = newRegrantStreak();
@@ -2774,6 +2826,8 @@ window.__ModuleLoader__.load({
        */
       __test: {
         decideRegrant,
+        /** fixed（Host 钉死原生分辨率）感知的判定入口，节拍里实际调用的就是它。 */
+        shouldAttemptRegrant,
         newRegrantStreak,
         neededPixelWidth,
         maxMediaCssWidth,

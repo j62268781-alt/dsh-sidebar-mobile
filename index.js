@@ -466,16 +466,33 @@ export function apply(ctx, config = {}) {
   /**
    * 决定这台设备该用什么分辨率/码率取流。
    *
-   * `preferredWidth` 是客户端上报的**画布物理像素宽度**（CSS 宽 × DPR）。
-   * 按它反推 scale，让编码分辨率正好落在面板能显示的像素数上：再高就是白
-   * 解码（见 spawnFor 里的 2.9 倍过采样说明），再低就开始糊。
+   * **默认始终按设备原生分辨率取流，把缩放交给浏览器的 GPU 降采样。**
    *
-   * 三条回落路径都收敛到"不缩放"（= 今天的行为），保证这个优化不会因为
-   * 查不到设备尺寸、客户端没上报、用户配了固定 scale 而让画面变得更差。
+   * 真机 + 面板真实画布（800×1760 物理像素）上量过三种取法，同一静态页面：
+   *
+   * | 取流 | 帧尺寸 | 绘制 | RMSE(对理想缩略图) | 边缘锐度 |
+   * |---|---|---|---|---|
+   * | 设备缩到 0.740 | 798×1758 | 近 1:1 | 14.84 | 0.934 |
+   * | 设备缩到 0.500 | 540×1188 | 放大 1.48× | 9.05 | 0.825 |
+   * | **原生 1.000** | 1080×2376 | 浏览器缩到 0.74× | **5.39** | **0.943** |
+   *
+   * 结论：设备端（AvcServer / 编码器）的缩放在非整数比例下明显更糊
+   * （1080/798 = 1.35），而浏览器的降采样是 GPU 上的面积平均，质量高得多。
+   * 所以哪怕面板只有 500 物理像素宽，也要原生取流再缩小 —— 画质更好。
+   *
+   * 代价与余量（都是实测）：解码量 ×2.9（260 vs 89 Mpx/s），但本机解码上限
+   * 1538fps 而实际只需 ~101fps（15× 余量）；码率上限 10Mbps，设备实测能稳定给
+   * 8.7Mbps，adb 传输约 1MB/s。手机端编码负载回到 mobilecli 的默认档。
+   *
+   * 副作用（是好事）：scale 恒为 1，拖面板不再触发重建流，也就没有重建时的
+   * 黑场与重连抖动；客户端靠回包里的 `fixed: true` 停止无意义的重取。
+   *
+   * `preferredWidth` 现在只作为回包信息与日志保留 —— 策略不再依赖它，
+   * 这样"面板拖宽导致反复重取"这条抖动路径从根上消失了。
    *
    * @param {string} deviceId
-   * @param {unknown} preferredWidth 客户端上报的画布物理像素宽度
-   * @returns {Promise<{scale: number, bitrate: number, deviceWidth: number|null, deviceHeight: number|null, preferredWidth: number|null}>}
+   * @param {unknown} preferredWidth 客户端上报的画布物理像素宽度（仅回显）
+   * @returns {Promise<{scale: number, bitrate: number, deviceWidth: number|null, deviceHeight: number|null, preferredWidth: number|null, fixed: boolean}>}
    */
   async function resolveStreamPlan(deviceId, preferredWidth) {
     const wanted =
@@ -483,37 +500,24 @@ export function apply(ctx, config = {}) {
         ? Math.round(preferredWidth)
         : null;
 
+    // 用户显式配了 stream.defaultScale 就照办（弱机/省流量的逃生口）。
     const configured = normalizeScale(streamConfig.defaultScale);
-    if (wanted === null || configured !== null) {
-      const scale = configured ?? 1;
-      return {
-        scale,
-        bitrate: bitrateForScale(scale),
-        deviceWidth: null,
-        deviceHeight: null,
-        preferredWidth: wanted,
-      };
-    }
+    const scale = configured ?? 1;
 
+    // 设备尺寸仍要查：routes 用它夹取坐标（scale=1 时是恒等映射，但夹取需要上界），
+    // 客户端也用它算"画布宽度上限 = 设备原生像素 ÷ DPR"。
     const screen = await queryScreenSize(deviceId);
-    if (screen === null || screen.width <= 0) {
-      return {
-        scale: 1,
-        bitrate: bitrateForScale(1),
-        deviceWidth: null,
-        deviceHeight: null,
-        preferredWidth: wanted,
-      };
-    }
+    const deviceWidth = screen !== null && screen.width > 0 ? screen.width : null;
+    const deviceHeight = screen !== null && screen.height > 0 ? screen.height : null;
 
-    const scale = normalizeScale(wanted / screen.width) ?? 1;
     return {
       scale,
       bitrate: bitrateForScale(scale),
-      // 交给 routes 夹取坐标用：帧像素 ÷ scale 之后不能越出屏幕
-      deviceWidth: screen.width,
-      deviceHeight: screen.height,
+      deviceWidth,
+      deviceHeight,
       preferredWidth: wanted,
+      // 告诉客户端"分辨率不会随画布变化"，别再白发重取请求（routes 回带）。
+      fixed: true,
     };
   }
 

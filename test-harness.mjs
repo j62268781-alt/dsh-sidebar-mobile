@@ -3411,6 +3411,29 @@ await test("换算结果夹在屏幕范围内（点边缘不至于越界）", ()
   assert.deepEqual({ x: negative.x, y: negative.y }, { x: 0, y: 0 }, "负坐标夹到 0");
 });
 
+await test("原生取流（scale=1）时坐标恒等，越界仍夹到屏幕内", () => {
+  // 这条锁的是"默认原生取流"上线后的点击链路：编码分辨率不再随画布变，
+  // 客户端报的坐标就是设备像素（帧像素 == 设备像素），换算必须是恒等；
+  // 但手指拖到面板边缘、或客户端按画布比例四舍五入时仍可能越界，
+  // 设备端收到 x=1080（宽正好 1080）会直接报错，所以夹取必须留着。
+  const plan = { scale: 1, deviceWidth: 1080, deviceHeight: 2376, fixed: true };
+
+  const inside = toDeviceCoordinates({ action: "tap", x: 540, y: 1188 }, plan);
+  assert.deepEqual({ x: inside.x, y: inside.y }, { x: 540, y: 1188 }, "scale=1 必须原样透传");
+  assert.equal(inside.x, 540, "恒等映射：不能被四舍五入/夹取意外改动");
+
+  const overflow = toDeviceCoordinates({ action: "tap", x: 5000, y: 9999 }, plan);
+  assert.equal(overflow.x, 1079, "x 越界夹到 deviceWidth-1");
+  assert.equal(overflow.y, 2375, "y 越界夹到 deviceHeight-1");
+
+  const underflow = toDeviceCoordinates({ action: "swipe", x1: -50, y1: -1, x2: 1080, y2: 2376 }, plan);
+  assert.deepEqual(
+    { x1: underflow.x1, y1: underflow.y1, x2: underflow.x2, y2: underflow.y2 },
+    { x1: 0, y1: 0, x2: 1079, y2: 2375 },
+    "swipe 四个点同样要夹（起点/终点任一越界设备都会拒）",
+  );
+});
+
 await test("屏幕高度未知时不能夹 y（否则下半屏点不到）", () => {
   // 只有 deviceWidth（例如 device.info 只回了宽）时，y 不做上界夹取：
   // 把 2376 高的屏按 1080 夹，等于"下半屏永远点不到"。
@@ -3575,6 +3598,67 @@ await test("画布宽度上限 = 设备原生像素 / DPR（拖宽面板能变�
   setDevicePixelWidth(720);
   assert.equal(maxMediaCssWidth(2), 360);
   setDevicePixelWidth(0);
+});
+
+await test("Host 钉死原生分辨率（fixed）后，客户端一次都不再自发重取", () => {
+  // Host 现在默认"始终按设备原生分辨率取流"（回包 fixed: true），把降采样交给
+  // 浏览器 GPU：真机面板画布 800×1760 时，设备端缩到 798 再 1:1 画是
+  // RMSE 14.84 / 锐度 0.934，而原生 1080 由浏览器缩到 800 是 RMSE 5.39 / 0.943。
+  //
+  // 但客户端的判定只看"帧宽 vs 画布需要多少物理像素"：framePx 恒为 1080、面板
+  // 只要 532 时比值 2.03 > 1.6，会走降档分支，每 3 秒发一次 grant —— 而 Host
+  // 永远回 scale=1，等于每隔几秒把画面掐掉重连一次，纯闪屏、分辨率一点不涨。
+  const { shouldAttemptRegrant, newRegrantStreak } = client.plugin.__test;
+
+  const streak = newRegrantStreak();
+  let attempts = 0;
+  for (let t = 0; t <= 60_000; t += tuning.tickMs) {
+    if (shouldAttemptRegrant({
+      fixed: true, streak, needPx: 532, framePx: 1080, now: t, lastAt: 0, cooldown: tuning.minIntervalMs,
+    })) {
+      attempts += 1;
+    }
+  }
+  assert.equal(attempts, 0, "fixed 时不该有任何一次 grant（每次都是一次白重连）");
+  assert.equal(streak.direction, "none", "连持续计时游标都不该被推进");
+  assert.equal(streak.since, 0);
+
+  // 反方向同理：画布比流还宽（needPx 1080、帧 630）在 fixed 下也只是浏览器放大，
+  // 重取同样没有意义 —— 别把"升档"当成漏网之鱼放过去。
+  assert.equal(
+    shouldAttemptRegrant({
+      fixed: true, streak: newRegrantStreak(), needPx: 1080, framePx: 630, now: 60_000, lastAt: 0, cooldown: tuning.minIntervalMs,
+    }),
+    false,
+  );
+});
+
+await test("fixed 缺失或为 false 时，判断与改造前逐拍一致（旧 Host 不退化成关掉自适应）", () => {
+  // 旧 Host 不认识 fixed、回包里没有这个字段 → 必须按可变处理。少一个字段就把
+  // 自适应整个关掉，等于把上一个任务修好的"拖宽面板变清晰"又退回去。
+  const { shouldAttemptRegrant, decideRegrant, newRegrantStreak } = client.plugin.__test;
+  const scenarios = [
+    { needPx: 630, framePx: 378 }, // 升档
+    { needPx: 400, framePx: 700 }, // 降档
+    { needPx: 600, framePx: 596 }, // 死区（只差 0.7%）
+  ];
+  for (const { needPx, framePx } of scenarios) {
+    for (const fixed of [false, undefined]) {
+      const legacy = newRegrantStreak();
+      const wrapped = newRegrantStreak();
+      for (let t = 0; t <= 20_000; t += tuning.tickMs) {
+        const before = decideRegrant(legacy, needPx, framePx, t, 0);
+        const after = shouldAttemptRegrant({
+          fixed, streak: wrapped, needPx, framePx, now: t, lastAt: 0, cooldown: tuning.minIntervalMs,
+        });
+        assert.equal(
+          after,
+          before,
+          `needPx=${needPx} framePx=${framePx} fixed=${String(fixed)} 在 t=${t} 处与改造前不一致`,
+        );
+      }
+    }
+  }
 });
 
 await test("设备掉线时画面消失，而不是把最后一帧冻在屏幕上", () => {
@@ -4113,6 +4197,50 @@ await test("按新缩放重建时旧 /stream 响应主动结束，重连即拿�
     await new Promise((resolve) => server.close(resolve));
     pool.stopAll();
   }
+});
+
+await test("grant 回包带 fixed 标记（原生取流 → 客户端不再按画布重 grant）", async () => {
+  // 原生取流（scale 恒 1、缩放交给浏览器 GPU）下，分辨率不随画布变，
+  // 客户端必须知道这件事，否则它会继续按画布宽度反复 re-grant —— 每次只是
+  // 换 token 闪一下屏，换不来任何清晰度。
+  const clientFor = () => ({
+    async listDevices() { return [{ id: "d1", name: "一加 12", platform: "android", state: "online" }]; },
+    async runJson() { return {}; },
+  });
+  const grantOnce = async (resolveStreamPlan) => {
+    const routes = new StreamRoutes({
+      client: clientFor(),
+      pool: { acquire: () => ({}) },
+      access: { mint: () => "t" },
+      log: () => {},
+      resolveStreamPlan,
+    });
+    const { req, res } = grantReqRes({ preferredWidth: 800 });
+    await routes.handle("grant", req, res);
+    assert.equal(res.statusCode, 200, `grant 应当成功，实际 ${res.statusCode} ${res.body}`);
+    return JSON.parse(res.body);
+  };
+
+  const fixed = await grantOnce(async () => ({
+    scale: 1,
+    bitrate: 10_000_000,
+    deviceWidth: 1080,
+    deviceHeight: 2376,
+    preferredWidth: 800,
+    fixed: true,
+  }));
+  assert.equal(fixed.fixed, true, "原生取流时回包必须带 fixed:true（否则客户端会一直 re-grant）");
+  assert.equal(fixed.scale, 1, "原生取流：编码 scale 恒为 1");
+
+  // 规划器没给 fixed（老版本 / 退化为自适应）→ 必须是布尔 false，不能是 undefined
+  const legacy = await grantOnce(async () => ({
+    scale: 0.5,
+    bitrate: null,
+    deviceWidth: 1080,
+    deviceHeight: 2376,
+  }));
+  assert.equal(legacy.fixed, false, "规划器没给 fixed 时必须是 false，不能让客户端误以为分辨率钉死了");
+  assert.equal(legacy.scale, 0.5, "自适应路径的 scale 仍然照旧生效");
 });
 
 console.log(`\n结果：${passed} 通过，${failed} 失败`);
