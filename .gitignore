@@ -16,3 +16,4 @@ node_modules/
 .tmp-color/
 .tmp-measure/
 .tmp-mcli/
+.tmp-bench/
