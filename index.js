@@ -27,6 +27,7 @@ import { Mobilecli, resolveBinary } from "./lib/device/mobilecli.js";
 import { AdbProbe, findAdb } from "./lib/device/android-toolchain.js";
 import { registerSkills } from "./lib/agent/skills.js";
 import { StreamSessionPool } from "./lib/stream/session.js";
+import { exactScale, MIN_SCALE } from "./lib/stream/scale-plan.js";
 import {
   ROUTES,
   StreamAccessController,
@@ -72,13 +73,13 @@ const DEFAULT_ROUTE_PREFIX = "/_dsh/dsh-sidebar-mobile";
 const MAX_BITRATE_BPS = 10_000_000;
 
 /**
- * 取流分辨率缩放下限。
+ * 取流分辨率缩放下限（与 lib/stream/scale-plan.js 共用同一个常量）。
  *
  * 面板是侧边栏，宽度通常 300–400 CSS px，物理像素（DPR 2）也就 700 上下。
  * 再往下缩虽然更省，但 1080 宽的手机缩到 0.35（378 px）后文字笔画会糊，
  * 反而伤清晰度。0.35 是"再小就没意义"的下限，不是推荐值。
  */
-const MIN_STREAM_SCALE = 0.35;
+const MIN_STREAM_SCALE = MIN_SCALE;
 
 /**
  * 缩放到这个值以上就当作不缩放。
@@ -121,7 +122,10 @@ function normalizeScale(value) {
   if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return null;
   const clamped = Math.min(1, Math.max(MIN_STREAM_SCALE, value));
   if (clamped >= SCALE_SNAP_THRESHOLD) return 1;
-  return Number(clamped.toFixed(3));
+  // 5 位小数不是"精度洁癖"：精确命中画布要求 `deviceWidth × scale` 四舍五入回画布宽，
+  // 1080 宽的手机保留 3 位小数会带来最多 0.54px 的偏差 —— 而实测（同图走 canvas）
+  // 1.01× 的重采样就把边缘能量从 0.967 打到 0.854，所以这里不能自己丢精度。
+  return Number(clamped.toFixed(5));
 }
 
 /**
@@ -464,34 +468,39 @@ export function apply(ctx, config = {}) {
   }
 
   /**
-   * 决定这台设备该用什么分辨率/码率取流。
+   * 决定这台设备该用什么分辨率/码率取流：**让编码宽度恰好等于画布后备宽度**。
    *
-   * **默认始终按设备原生分辨率取流，把缩放交给浏览器的 GPU 降采样。**
+   * 取名函数见 lib/stream/scale-plan.js 的 `exactScale`：`clamp(画布宽 / 设备宽, 0.35, 1)`
+   * 取 4 位小数。画布 532 物理像素 → 0.4926（实测编码出来就是 532×1170）。
    *
-   * 真机 + 面板真实画布（800×1760 物理像素）上量过三种取法，同一静态页面：
+   * 为什么"精确命中"是唯一最优解（真机同一静态页面实测，Sobel 边缘能量比，
+   * 1.0 = 与 LANCZOS 理想缩略图同锐）：
    *
-   * | 取流 | 帧尺寸 | 绘制 | RMSE(对理想缩略图) | 边缘锐度 |
-   * |---|---|---|---|---|
-   * | 设备缩到 0.740 | 798×1758 | 近 1:1 | 14.84 | 0.934 |
-   * | 设备缩到 0.500 | 540×1188 | 放大 1.48× | 9.05 | 0.825 |
-   * | **原生 1.000** | 1080×2376 | 浏览器缩到 0.74× | **5.39** | **0.943** |
+   * | 取流 | 画布 532×1170（编码→画布） | 边缘比 |
+   * |---|---|---|
+   * | 精确 0.4926 | 恒等 1.00× | **1.023** |
+   * | 原生 1.000 | 2.03× 缩小 | 0.994 |
+   * | 干净 0.500 | 1.02× 缩小 | 0.862 |
+   * | 非整数 0.750 | 1.52× 缩小 | 0.947 |
    *
-   * 结论：设备端（AvcServer / 编码器）的缩放在非整数比例下明显更糊
-   * （1080/798 = 1.35），而浏览器的降采样是 GPU 上的面积平均，质量高得多。
-   * 所以哪怕面板只有 500 物理像素宽，也要原生取流再缩小 —— 画质更好。
+   * 机制：编码端几乎无损（540 帧按原生导出与 LANCZOS 比 0.998），**糊来自重采样**
+   * —— 浏览器在"只缩一点点"（1.0–1.1×）时用双线性两抽头，把笔画边缘抹成灰；
+   * 隔离实验（同一张栅格图走 canvas）：恒等 0.967、1.01× 0.854、1.52× 0.924。
+   * 所以差的不是"设备缩放不如浏览器"，而是**多一次重采样**：精确命中时
+   * `drawImage` 恒等、一次重采样都不做，比原生还锐；而 0.5 档看着"干净"，
+   * 落到画布上差 1.5% 就掉到 0.862。
    *
-   * 代价与余量（都是实测）：解码量 ×2.9（260 vs 89 Mpx/s），但本机解码上限
-   * 1538fps 而实际只需 ~101fps（15× 余量）；码率上限 10Mbps，设备实测能稳定给
-   * 8.7Mbps，adb 传输约 1MB/s。手机端编码负载回到 mobilecli 的默认档。
+   * 收益：画布 532 时解码量降到 (532/1080)² ≈ **1/4**（0.62 vs 2.57 Mpx），
+   * GPU 每帧纹理上传同比例下降 —— 这正是用户要的"别掉清晰度、把解码量降下来"。
    *
-   * 副作用（是好事）：scale 恒为 1，拖面板不再触发重建流，也就没有重建时的
-   * 黑场与重连抖动；客户端靠回包里的 `fixed: true` 停止无意义的重取。
+   * 与客户端的分工：`fixed` 只在用户钉死 `stream.defaultScale` 时为 true；
+   * 默认情况下分辨率跟着画布走，由客户端既有的自适应机制带新 preferredWidth
+   * 重新 grant（升档 1.02 / 降档 1.05、宽度不稳时不计时、5s 冷却、Host 3s 节流）。
    *
-   * `preferredWidth` 现在只作为回包信息与日志保留 —— 策略不再依赖它，
-   * 这样"面板拖宽导致反复重取"这条抖动路径从根上消失了。
+   * 拿不到画布宽或设备宽时一律回原生（宁可多解码，也不要凭猜测把画面缩小再放大）。
    *
    * @param {string} deviceId
-   * @param {unknown} preferredWidth 客户端上报的画布物理像素宽度（仅回显）
+   * @param {unknown} preferredWidth 客户端上报的画布物理像素宽度
    * @returns {Promise<{scale: number, bitrate: number, deviceWidth: number|null, deviceHeight: number|null, preferredWidth: number|null, fixed: boolean}>}
    */
   async function resolveStreamPlan(deviceId, preferredWidth) {
@@ -500,15 +509,16 @@ export function apply(ctx, config = {}) {
         ? Math.round(preferredWidth)
         : null;
 
-    // 用户显式配了 stream.defaultScale 就照办（弱机/省流量的逃生口）。
-    const configured = normalizeScale(streamConfig.defaultScale);
-    const scale = configured ?? 1;
-
-    // 设备尺寸仍要查：routes 用它夹取坐标（scale=1 时是恒等映射，但夹取需要上界），
-    // 客户端也用它算"画布宽度上限 = 设备原生像素 ÷ DPR"。
+    // 设备尺寸要查：routes 用它夹取坐标（scale=1 时是恒等映射，但夹取需要上界），
+    // 客户端也用它算"画布宽度上限 = 设备原生像素 ÷ DPR"，这里还用它反算 scale。
     const screen = await queryScreenSize(deviceId);
     const deviceWidth = screen !== null && screen.width > 0 ? screen.width : null;
     const deviceHeight = screen !== null && screen.height > 0 ? screen.height : null;
+
+    // 用户显式配了 stream.defaultScale 就照办（弱机/省流量的逃生口），
+    // 此时分辨率与画布无关 → fixed: true，客户端不再白发重取请求。
+    const configured = normalizeScale(streamConfig.defaultScale);
+    const scale = configured ?? exactScale(wanted, deviceWidth);
 
     return {
       scale,
@@ -516,8 +526,8 @@ export function apply(ctx, config = {}) {
       deviceWidth,
       deviceHeight,
       preferredWidth: wanted,
-      // 告诉客户端"分辨率不会随画布变化"，别再白发重取请求（routes 回带）。
-      fixed: true,
+      // fixed: 分辨率不随画布变化。只有"用户钉死 scale"这一种情况为真。
+      fixed: configured !== null,
     };
   }
 

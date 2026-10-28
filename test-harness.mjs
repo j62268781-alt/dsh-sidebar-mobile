@@ -3513,7 +3513,7 @@ function firstRegrantAt({ needPx, framePx, ms, lastAt = 0, start = 1000 }) {
   return null;
 }
 
-await test("帧宽比需要的小 15% 以上、且持续 600ms → 重建流（升档）", () => {
+await test("帧宽比需要的小 2% 以上、且持续 600ms → 重建流（升档）", () => {
   // 真机那组数字：面板需要 630 物理像素，流只有 378 宽（≈0.6 倍）
   const at = firstRegrantAt({ needPx: 630, framePx: 378, ms: 3000 });
   assert.notEqual(at, null, "分辨率差 40% 还不重建，画面会一直是糊的");
@@ -3531,11 +3531,14 @@ await test("帧比画布小 10% 就要重建（1.10× 放大正好把文字边�
   assert.notEqual(firstRegrantAt({ needPx: 630, framePx: 573, ms: 5000 }), null);
 });
 
-await test("只差 1% 以内不动手（scale 量化与宏块对齐的回差）", () => {
-  // Host 把 scale 截到 3 位小数、编码器再按宏块对齐，回包宽度常比请求小 1-2px。
-  // 这种量级反复重建只会闪屏，什么也换不来。
+await test("只差 2% 以内不动手（scale 取 4 位小数 + 宏块对齐的回差）", () => {
+  // Host 现在按 exactScale 精确反算（clamp 到 4 位小数），编码器再按 16 的倍数
+  // 对齐宏块，回包宽度常比请求小 1–2px。为这点回差重建一次流要等一个 IDR
+  // （约 0.5s 黑场），代价远大于 1px 的欠采样。
   assert.equal(firstRegrantAt({ needPx: 596, framePx: 594, ms: 10000 }), null);
   assert.equal(firstRegrantAt({ needPx: 600, framePx: 596, ms: 10000 }), null);
+  // 边界：差 2.04% 就该动手（1.02 是"容忍回差"的上限，不是死区）
+  assert.notEqual(firstRegrantAt({ needPx: 600, framePx: 588, ms: 3000 }), null);
 });
 
 await test("两次重建流之间至少隔 5 秒（grant 会杀进程重启，不能连打）", () => {
@@ -3557,17 +3560,75 @@ await test("首帧之前（framePx=0）不做任何判定，避免刚 grant 完�
   assert.equal(firstRegrantAt({ needPx: 0, framePx: 378, ms: 8000 }), null);
 });
 
-await test("流大于需要 1.6 倍且持续 3 秒才降档，1.3 倍落在死区不动", () => {
-  // 700 / 400 = 1.75 > 1.6：该降档，但降档的持续时间门槛是 3 秒（升档只要 0.6 秒）
+await test("流比需要的大 5% 以上且持续 3 秒才降档，4% 落在死区不动", () => {
+  // 阈值从 1.6 收到 1.05 的依据（task-7 画质实测）：把一帧缩小到画布时，
+  // 恒等绘制的边缘能量比是 0.967，1.01× 反而掉到 0.854，1.52× 是 0.924 ——
+  // 也就是 1.0–1.1× 的重采样**比大倍率更糊**，而 1.6× 容忍度等于白解码
+  // 2.5 倍像素（1080×2376 对 532×1170 是 4.1 倍面积），每帧都要付。
+  //
+  // 1000 / 940 = 1.064 > 1.05：该降档，但降档门槛是 3 秒（升档只要 0.6 秒）
   assert.equal(
-    firstRegrantAt({ needPx: 400, framePx: 700, ms: 2000 }),
+    firstRegrantAt({ needPx: 940, framePx: 1000, ms: 2000 }),
     null,
     "降档只是省资源，2 秒就动手的话用户正把面板拖宽时会被反复打断",
   );
-  assert.notEqual(firstRegrantAt({ needPx: 400, framePx: 700, ms: 5000 }), null);
+  assert.notEqual(firstRegrantAt({ needPx: 940, framePx: 1000, ms: 5000 }), null);
 
-  // 600 / 450 = 1.33，在 1.6 以下 —— 死区，永远不动（否则拖一格就升、拖回来就降）
-  assert.equal(firstRegrantAt({ needPx: 450, framePx: 600, ms: 10000 }), null);
+  // 1000 / 961 = 1.041 < 1.05 —— 死区，永远不动（否则 1px 抖动就来一次重建）
+  assert.equal(firstRegrantAt({ needPx: 961, framePx: 1000, ms: 10000 }), null);
+});
+
+await test("拖拽途中（宽度每拍都在变）60 秒内一次都不重建 —— 重建一次要等一个 IDR", () => {
+  // 真机观感：拖侧边栏时连续闪。根因不是判定阈值，而是**拖拽过程中**宽度每 250ms
+  // 就变了 20px，若允许累计 hold，拖 600ms 必然触发一次重建（杀进程 + 等 IDR，
+  // 约 0.5s 花屏），而且拖到一半的宽度不是最终宽度，按它取流紧接着还要再改一次。
+  const { tickRegrant, newRegrantStreak: newStreak } = client.plugin.__test;
+
+  // 拖拽：宽度在 900/920/940 之间来回（每拍差 20px），帧宽 500 → 比值 1.8 远超阈值，
+  // 若没有"不稳定就不计时"这道闸门，这 60 秒里会触发很多次。
+  const dragWidthAt = (t) => 900 + (Math.floor(t / tuning.tickMs) % 3) * 20;
+  const streak = newStreak();
+  let prevPx = 0;
+  let grants = 0;
+  for (let t = 1000; t <= 61_000; t += tuning.tickMs) {
+    const needPx = dragWidthAt(t);
+    if (tickRegrant({
+      fixed: false, streak, prevPx, needPx, framePx: 500, now: t, lastAt: 0, cooldown: tuning.minIntervalMs,
+    })) {
+      grants += 1;
+    }
+    prevPx = needPx;
+  }
+  assert.equal(grants, 0, "拖拽途中每拍宽度都在变，根本不该开始计时");
+  assert.equal(streak.direction, "none", "计时游标要被清掉，不能留着半格进度");
+  assert.equal(streak.since, 0);
+});
+
+await test("松手稳定 600ms 后才按新宽度重建一次（而不是拖到一半就重建）", () => {
+  const { tickRegrant, newRegrantStreak: newStreak } = client.plugin.__test;
+
+  // 0–1200ms 一直在拖（抖动），1200ms 松手稳定在 940；帧宽 500 → 940/500 = 1.88，
+  // 需要 600ms 的持续判定 → 最早在 1800ms 才该动手。
+  const settleAt = 1200;
+  const widthAt = (t) => (t < settleAt ? 900 + (Math.floor(t / tuning.tickMs) % 3) * 20 : 940);
+  const streak = newStreak();
+  let prevPx = 0;
+  const grantTimes = [];
+  for (let t = 500; t <= 6000; t += tuning.tickMs) {
+    const needPx = widthAt(t);
+    if (tickRegrant({
+      fixed: false, streak, prevPx, needPx, framePx: 500, now: t, lastAt: 0, cooldown: tuning.minIntervalMs,
+    })) {
+      grantTimes.push(t);
+      break; // 真实节拍里 grant 之后 busy 会挡住后续判定，这里只关心第一次
+    }
+    prevPx = needPx;
+  }
+  assert.equal(grantTimes.length, 1, "松手稳定后应该按新宽度重建一次");
+  assert.ok(
+    grantTimes[0] >= settleAt + tuning.upscaleHoldMs,
+    `必须等宽度稳定 ${tuning.upscaleHoldMs}ms（实际 ${grantTimes[0] - settleAt}ms 就动手了）`,
+  );
 });
 
 await test("需要的像素 = CSS 宽 × 当前 DPR，且被设备宽封顶", () => {
@@ -3606,7 +3667,7 @@ await test("Host 钉死原生分辨率（fixed）后，客户端一次都不再�
   // RMSE 14.84 / 锐度 0.934，而原生 1080 由浏览器缩到 800 是 RMSE 5.39 / 0.943。
   //
   // 但客户端的判定只看"帧宽 vs 画布需要多少物理像素"：framePx 恒为 1080、面板
-  // 只要 532 时比值 2.03 > 1.6，会走降档分支，每 3 秒发一次 grant —— 而 Host
+  // 只要 532 时比值 2.03 > 1.05，会走降档分支，每 3 秒发一次 grant —— 而 Host
   // 永远回 scale=1，等于每隔几秒把画面掐掉重连一次，纯闪屏、分辨率一点不涨。
   const { shouldAttemptRegrant, newRegrantStreak } = client.plugin.__test;
 
@@ -4241,6 +4302,63 @@ await test("grant 回包带 fixed 标记（原生取流 → 客户端不再按�
   }));
   assert.equal(legacy.fixed, false, "规划器没给 fixed 时必须是 false，不能让客户端误以为分辨率钉死了");
   assert.equal(legacy.scale, 0.5, "自适应路径的 scale 仍然照旧生效");
+});
+
+// ── 取流分辨率按画布精确反算（scale-plan）────────────────────────────────
+//
+// 这一段的数字全部对应真机实测（见 lib/stream/scale-plan.js 模块注释）：
+// 画布 532×1170 时，精确命中的边缘锐度 1.023 > 原生 0.994 > 0.5 档 0.862。
+// 所以"画布多少物理像素，编码就要多宽"是硬要求，取整必须落在画布上。
+
+console.log("\n取流分辨率按画布精确反算");
+
+const { exactScale, MIN_SCALE } = await import("./lib/stream/scale-plan.js");
+
+await test("画布 532 → scale 0.4926，编码出来正好 532 宽（恒等绘制、零重采样）", () => {
+  const scale = exactScale(532, 1080);
+  assert.equal(scale, 0.4926, `实际 ${scale}`);
+  assert.equal(Math.round(1080 * scale), 532, "编码宽度必须四舍五入回画布宽，否则落进 1.0–1.1× 最坏区间");
+});
+
+await test("画布 800 / 540 / 1080 都能精确命中", () => {
+  assert.equal(Math.round(1080 * exactScale(800, 1080)), 800);
+  assert.equal(Math.round(1080 * exactScale(540, 1080)), 540);
+  assert.equal(exactScale(1080, 1080), 1, "画布等于设备宽 → 原生");
+});
+
+await test("画布比设备还宽 → 原生（不放大、没有 2.0 档）", () => {
+  assert.equal(exactScale(1200, 1080), 1);
+});
+
+await test("极窄画布夹到 MIN_SCALE，而不是继续往下缩成糊", () => {
+  assert.equal(MIN_SCALE, 0.35);
+  assert.equal(exactScale(200, 1080), MIN_SCALE);
+  assert.equal(exactScale(378, 1080), MIN_SCALE);
+  // 378 是恰好命中下限的宽（1080 × 0.35），不该被夹到别的值
+  assert.equal(Math.round(1080 * exactScale(378, 1080)), 378);
+});
+
+await test("信息缺失一律回原生（宁可多解码，也不凭猜测缩小再放大）", () => {
+  assert.equal(exactScale(null, 1080), 1);
+  assert.equal(exactScale(Number.NaN, 1080), 1);
+  assert.equal(exactScale(0, 1080), 1);
+  assert.equal(exactScale(-532, 1080), 1);
+  assert.equal(exactScale(532, null), 1);
+  assert.equal(exactScale(532, 0), 1);
+});
+
+await test("非 1080 设备同样按比例反算（iPhone 1179 宽）", () => {
+  assert.equal(exactScale(393, 1179), MIN_SCALE, "393/1179 低于下限 → 夹取");
+  assert.equal(Math.round(1179 * exactScale(590, 1179)), 590);
+  assert.equal(Math.round(1179 * exactScale(1179, 1179)), 1179);
+});
+
+await test("scale 精度到 4 位小数（mobilecli --scale 的可用精度）", () => {
+  for (const width of [400, 421, 533, 601, 777, 999]) {
+    const scale = exactScale(width, 1080);
+    assert.equal(Number(scale.toFixed(4)), scale, `${width} → ${scale} 不该有更多小数位`);
+    assert.equal(Math.round(1080 * scale), width, `${width} → 编码宽 ${Math.round(1080 * scale)}`);
+  }
 });
 
 console.log(`\n结果：${passed} 通过，${failed} 失败`);

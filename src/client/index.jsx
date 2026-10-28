@@ -397,19 +397,30 @@ window.__ModuleLoader__.load({
      *
      * 抖动风险交给下面三道闸门，而不是靠这个阈值：600ms 的持续判定
      * （REGRANT_UPSCALE_HOLD_MS）+ 5 秒冷却（REGRANT_MIN_INTERVAL_MS）
-     * + Host 侧 3 秒节流。留 1.01 是为了吸收 scale 量化误差（Host 会把
-     * scale 截到 3 位小数、编码器再按宏块对齐，回包宽度可能比请求小 1-2px）
-     * 与亚像素布局抖动，不至于为 1px 反复重建。
+     * + Host 侧 3 秒节流。留 2% 是为了吸收量化回差 —— Host 现在按 exactScale
+     * 取 4 位小数、编码器再按宏块对齐（16 的倍数），回包宽度可能比请求小 1–2px；
+     * 而 1px 的差就重建一次流要等一个 IDR（约 0.5s 黑场），代价远大于那 1px。
      */
-    const REGRANT_UPSCALE_RATIO = 1.01;
+    const REGRANT_UPSCALE_RATIO = 1.02;
     /**
-     * 帧宽比需要的大 60% 以上才算"该降档"。
+     * 帧宽比需要的**大 5% 以上**才算"该降档"。
      *
-     * 与上面的 1.15 一起构成滞环：升档要 over 15% 才动、降档要 over 60% 才动，
-     * 中间这一大段是死区。没有这段死区的话，用户把侧边栏拖宽一格又拖回来，
-     * 就会升一次降一次地反复重建流（每次都闪一下）。
+     * 原来是 1.6（"大 60% 才算浪费"），与 1.15 的升档阈值一起构成一大段死区。
+     * 现在两端都收紧到个位数百分比，理由来自实测（task-7 的画质表）：
+     *
+     *   重采样倍率 → Sobel 边缘能量比（1.0 = 与理想同锐）
+     *   恒等 1.00×  → 0.967
+     *   1.01×       → 0.854   ← 最坏区间
+     *   1.52×       → 0.924
+     *
+     * 也就是说 1.0–1.1× 的缩小**比大倍率缩小更糊**：canvas 在近乎 1:1 时走的
+     * 是廉价采样，掉 11–14% 的边缘能量。而 Host 现在能按画布宽精确反算 scale，
+     * 5% 以内的偏差没有意义；超过就说明流确实多余。
+     *
+     * 另外 1.6× 过采样等于白解码 2.5 倍像素（1080×2376 对 532×1170 是 4.1 倍
+     * 面积），而解码是每帧都要付的固定开销 —— 省下来的正是帧预算的余量。
      */
-    const REGRANT_DOWNSCALE_RATIO = 1.6;
+    const REGRANT_DOWNSCALE_RATIO = 1.05;
     /** 升档要持续多久才动手：拖拽时宽度连续变化，必须 debounce。 */
     const REGRANT_UPSCALE_HOLD_MS = 600;
     /**
@@ -444,6 +455,13 @@ window.__ModuleLoader__.load({
     const REGRANT_COOLDOWN_MAX_MS = 60000;
     /** 判定节拍。250ms 足够让 600ms 的 debounce 有 2 次以上采样。 */
     const REGRANT_TICK_MS = 250;
+    /**
+     * 相邻两拍 needPx 相差多少就认为"宽度还在变"。
+     *
+     * 1px：亚像素布局 + DPR 取整本身就有 1px 级回差，把它当成"在变化"会让
+     * 判定永远等不到稳定（也就永远不升档）。2px 起才认为是人拖的。
+     */
+    const REGRANT_STABLE_PX = 1;
     /**
      * 拿不到设备宽度时按 1080 兜底（iPhone 15 Pro 等主流机型的逻辑宽）。
      *
@@ -557,6 +575,47 @@ window.__ModuleLoader__.load({
     function shouldAttemptRegrant({ fixed, streak, needPx, framePx, now, lastAt, cooldown }) {
       if (fixed === true) return false;
       return decideRegrant(streak, needPx, framePx, now, lastAt, cooldown);
+    }
+
+    /**
+     * 画布宽度是否**还在变**（用户正在拖侧边栏，或布局尚未收敛）。
+     *
+     * 只差 1px 不算变（亚像素布局与 DPR 取整会有 1px 回差）。
+     *
+     * @param {number} prevPx 上一拍的 needPx（0 = 还没有上一拍）
+     * @param {number} needPx 这一拍的 needPx
+     * @returns {boolean}
+     */
+    function widthIsUnsettled(prevPx, needPx) {
+      return prevPx > 0 && Math.abs(needPx - prevPx) > REGRANT_STABLE_PX;
+    }
+
+    /**
+     * 自适应节拍的一次采样：这一拍要不要重新申请流（纯函数，无 DOM、无副作用）。
+     *
+     * 单独抽出来的原因：真实面板里这段逻辑跑在 setInterval 里，靠"渲染组件 +
+     * 伪造 60 秒时间线"去验证既慢又脆；而它决定的是"每隔几秒要不要黑一下画面"
+     * 这种用户直接看得见的行为，必须能逐拍测。
+     *
+     * ── 为什么不稳定时连计时都不做 ──────────────────────────────────
+     * 重建一次流要杀掉旧编码进程、spawn 新的、再等一个 IDR —— 约 0.5s 的花屏。
+     * 拖拽时宽度每 16ms 就在变，若允许累计 hold，用户拖 600ms 就必然触发一次
+     * 重建，拖得越久闪得越多；而且拖到一半时的宽度**不是**最终宽度，按它取流
+     * 紧接着又要再改一次。所以：宽度不稳定 = 直接重置游标、不判定、不计时，
+     * 只有松手稳定后才从零开始累计 600ms / 3s。
+     *
+     * @param {{fixed: boolean, streak: object, prevPx: number, needPx: number,
+     *   framePx: number, now: number, lastAt: number, cooldown: number}} state
+     * @returns {boolean} true = 应该重新 grant
+     */
+    function tickRegrant({ fixed, streak, prevPx, needPx, framePx, now, lastAt, cooldown }) {
+      if (widthIsUnsettled(prevPx, needPx)) {
+        // 重置持续时间游标（就地清，避免调用方两次赋值）
+        streak.direction = "none";
+        streak.since = 0;
+        return false;
+      }
+      return shouldAttemptRegrant({ fixed, streak, needPx, framePx, now, lastAt, cooldown });
     }
 
     /**
@@ -2245,6 +2304,13 @@ window.__ModuleLoader__.load({
        * 每次 grant 都按最新回包更新：换设备/换策略后可能又变回可变。
        */
       const fixedScaleRef = useRef(false);
+      /**
+       * 上一拍算出的 needPx（0 = 还没有上一拍）。
+       *
+       * 用来判断"宽度是不是还在变"（见 tickRegrant）：拖拽时每拍都在变，
+       * 这种时候不计时也不判定 —— 否则拖 600ms 就必然重建一次流，白闪。
+       */
+      const lastNeedPxRef = useRef(0);
 
       /**
        * 面板该按多宽的**物理像素**取流（= 后备存储宽度），0 表示还没法确定。
@@ -2446,8 +2512,9 @@ window.__ModuleLoader__.load({
        * spawn 时给，Host 侧 `#planForSession` 也是按会话里那条流的真实 scale
        * 对齐的 —— 想让 scale 变，只能重新走一次 grant（会重建流）。
        *
-       * 判定节拍 250ms、纯算术（不碰 DOM）：拖拽时宽度连续变化，靠 decideRegrant
-       * 里的"持续 600ms"debounce 兜住，不会每动一像素就重建一次流。
+       * 判定节拍 250ms、纯算术（不碰 DOM）。拖拽过程中宽度每拍都在变，这种时候
+       * 连计时都不做（见 tickRegrant）：重建一次流要等一个 IDR，途中闪一下很难看，
+       * 而且拖到一半的宽度并不是最终宽度。只有松手稳定后才开始累计 600ms / 3s。
        */
       useEffect(() => {
         if (activeId === null) return undefined;
@@ -2460,10 +2527,15 @@ window.__ModuleLoader__.load({
           // 不再发 grant。理由与实测数字见 shouldAttemptRegrant 的注释。
           const now = performance.now();
           const needPx = preferredStreamWidth();
+          // 上一拍的宽度要在喂给判定后立刻更新（下一拍拿它做比较），
+          // 而判定本身要用"上一拍"的值，所以先取出来、再写回。
+          const prevPx = lastNeedPxRef.current;
+          lastNeedPxRef.current = needPx;
           const framePx = frameSizeRef.current.width;
-          if (!shouldAttemptRegrant({
+          if (!tickRegrant({
             fixed: fixedScaleRef.current,
             streak: regrantStreakRef.current,
+            prevPx,
             needPx,
             framePx,
             now,
@@ -2826,8 +2898,12 @@ window.__ModuleLoader__.load({
        */
       __test: {
         decideRegrant,
-        /** fixed（Host 钉死原生分辨率）感知的判定入口，节拍里实际调用的就是它。 */
+        /** fixed（Host 钉死原生分辨率）感知的判定入口。 */
         shouldAttemptRegrant,
+        /** 节拍里实际调用的入口：多了"宽度还在变就不计时"这道闸门。 */
+        tickRegrant,
+        /** 宽度是否还在变（拖拽中）。 */
+        widthIsUnsettled,
         newRegrantStreak,
         neededPixelWidth,
         maxMediaCssWidth,
@@ -2847,6 +2923,7 @@ window.__ModuleLoader__.load({
           minIntervalMs: REGRANT_MIN_INTERVAL_MS,
           cooldownMaxMs: REGRANT_COOLDOWN_MAX_MS,
           tickMs: REGRANT_TICK_MS,
+          stablePx: REGRANT_STABLE_PX,
           deviceWidthFallback: DEVICE_WIDTH_FALLBACK,
         },
       },
